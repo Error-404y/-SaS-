@@ -7,7 +7,7 @@ Python 3.11+ Discord bot for a small community. All data is saved automatically 
 1. New members receive Verify-Progress. Previously accepted members get Member restored when they return. Revoked members do not regain Member.
 2. The public panel offers English through **Verify** or German through **Deutsch**.
 3. Applicants read the configured rules and explicitly click the agreement button.
-4. A form asks for their game username, preferred patrol times/timezone, and experience.
+4. A short form asks only for the game username by default. Set `EXTRA_QUESTIONS=true` to also collect patrol times/timezone and experience.
 5. The bot saves the application, sends a submission DM, and posts the staff review embed.
 6. Staff may claim the request, ask questions, accept with an optional note, or reject using an editable template/custom reason.
 7. Acceptance gives Member and removes Verify-Progress. The acceptance DM includes welcome instructions after role updates succeed.
@@ -25,11 +25,12 @@ Use **My application / Mein Antrag** on the public panel to view the latest appl
 
 ## Staff controls
 
-All staff actions require role `1562535759276417065` and must take place in `verify-check`. Self-review is blocked. Staff access is checked again when submitting a modal.
+All staff actions require Discord Administrator permission or role `1562535759276417065` and must take place in `verify-check`. Authorized reviewers can accept their own applications. Ordinary applicants cannot approve themselves. Staff access is checked again when applying an action. Already verified members do not need to submit again.
 
 | Control | Behavior |
 | --- | --- |
-| Accept | Opens an optional acceptance-note form, then grants verification. |
+| Accept | Accepts immediately, without an extra form. |
+| Accept with note | Opens an optional note form before acceptance. |
 | Reject | Offers custom, incorrect-username, insufficient-detail and rules templates, then an editable required-reason form. |
 | Claim / Release | Claims a pending request or releases your own claim. Only its claimant can ask questions or decide while claimed. |
 | Request information | Sends a question to the applicant and displays it under My application. Asking also claims the request. |
@@ -60,7 +61,9 @@ A queue limit of `0` means unlimited. The default is 40 pending applications. Cl
 | verify-check channel | `1562539651229683732` |
 | verified-log channel | `1562546382772899910` |
 
-Private log embeds record submissions, claims/releases, questions/answers, decisions, cancellations, role application and settings changes. Records include event/application IDs, actor, time and explanation. Failed log delivery retries without preventing role updates or applicant notifications.
+Private log embeds record actual submissions, claims/releases, questions/answers, decisions, cancellations, confirmed role changes and settings changes. Unchanged role checks do not send messages. The bot fetches Discord roles before and after updates; only confirmed additions/removals are logged, including the successful part of a partial update. Log entries use member/role mentions and omit missing application fields.
+
+All displayed event/submission timestamps and console log times use `Europe/Zurich`, automatically switching between CET and CEST. Stored UTC timestamps remain unchanged for compatibility. Existing messages are not rewritten. Legacy queued role logs without confirmation evidence are retained in the file but are not sent. Failed log delivery retries without preventing role updates or applicant notifications.
 
 ## Discord setup
 
@@ -74,7 +77,7 @@ Private log embeds record submissions, claims/releases, questions/answers, decis
 
 The default log channel ID is already configured. If you deliberately set `LOG_CHANNEL_ID=0`, the bot can instead create a private `verification-logs` channel under High-Rank; this optional mode requires Manage Channels. Existing channel permissions are not rewritten. Startup checks report missing channels, roles or permissions.
 
-Guild commands are synced on startup. If Discord hides `/verification-settings` from your staff, check the application's command permissions under Server Settings > Integrations. The command always enforces High-Rank membership in code.
+Guild commands are synced on startup. If Discord hides `/verification-settings` from your staff, check the application's command permissions under Server Settings > Integrations. The command always enforces Administrator permission or High-Rank membership in code.
 
 API behavior follows [discord.py interactions documentation](https://discordpy.readthedocs.io/en/stable/interactions/api.html) and [Discord's member-intent documentation](https://github.com/discord/discord-api-docs/blob/main/developers/events/gateway.mdx).
 
@@ -134,7 +137,7 @@ If you still have the original SQLite version, that file is not imported automat
 
 ## Recovery behavior and limits
 
-- On startup, human members are reconciled. Saved approval/revocation takes precedence; members with Member and no saved state keep verified access. Other members receive Verify-Progress.
+- On startup, human members are checked without unconditional role writes or log entries. Saved approval/revocation takes precedence; members with Member and no saved state keep verified access. Other members receive Verify-Progress.
 - Accepted returning members regain Member. Role failures retry every 30 seconds. Users who have left remain saved, allowing role updates when they return.
 - Role changes use the latest saved member state. Undo and revocation replace earlier pending role work.
 - Existing public and review buttons are restored on startup. Deleted review messages are recreated when detected or on restart. The public panel is recreated when its deletion is detected or on restart.
@@ -150,6 +153,6 @@ If you still have the original SQLite version, that file is not imported automat
 python -m unittest discover -s tests -v
 ```
 
-Tests use real temporary JSON files and mocked Discord calls. They cover persistence and legacy migration, failed writes, claims, cancellation, questions, stale forms, undo/revocation, queue limits, duplicate usernames, authorization, notifications, role recovery and comment/emoji-free source. CI runs Python 3.11 through 3.14.
+Tests use real temporary JSON files, Discord interaction serialization, and mocked network calls with role-state changes. They cover persistence and legacy migration, failed writes, claims, cancellation, questions, stale forms, undo/revocation, queue limits, duplicate usernames, authorization, self-review permissions, notifications, confirmed-only role logs, Zurich summer/winter time, status replies, role recovery and comment/emoji-free source. CI runs Python 3.11 through 3.14.
 
 Before opening applications, use separate applicant and staff accounts to test rules agreement, submission, a question/answer, cancellation, template rejection, acceptance with a note, undo, revocation and rejoining. Repeat with DMs closed, and check that the log channel is visible only to intended staff and the bot.
