@@ -41,7 +41,7 @@ class DatabaseTests(unittest.TestCase):
         self.db.decide(row['id'], 3, 'accepted')
         self.db.close()
         self.db = Database(self.path)
-        self.assertEqual(self.db.work()[0]['status'], 'accepted')
+        self.assertEqual(self.db.get(row['id'])['status'], 'accepted')
 
 
     def test_failed_write_preserves_disk_and_memory(self):
@@ -68,7 +68,6 @@ class DatabaseTests(unittest.TestCase):
         self.db = Database(self.path)
         self.assertEqual(self.db.setting('panel_message'), 123)
         self.assertEqual(self.db.by_message(456)['submission_dm'], 'sent')
-        self.assertEqual(self.db.work(), [])
 
     def test_returned_rows_do_not_mutate_saved_data(self):
         row = self.db.create(1, 2, 'Player')
@@ -76,7 +75,7 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(self.db.get(row['id'])['status'], 'pending')
 
 
-class BotTests(unittest.IsolatedAsyncioTestCase):
+class BotFixture:
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
         with patch.dict(os.environ, {'DATABASE_PATH': self.temp.name + '/test.json'}):
@@ -86,6 +85,9 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.member.add_roles = AsyncMock()
         self.member.remove_roles = AsyncMock()
         self.bot.guild.fetch_member = AsyncMock(return_value=self.member)
+        self.bot.log_channel = MagicMock()
+        self.bot.log_channel.send = AsyncMock()
+        self.bot.guild.get_role.side_effect = lambda role_id: role_id
         self.bot.review_channel = MagicMock()
         self.message = MagicMock(id=50)
         self.message.edit = AsyncMock()
@@ -99,6 +101,8 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         await self.bot.close()
         self.temp.cleanup()
 
+
+class BotTests(BotFixture, unittest.IsolatedAsyncioTestCase):
     async def test_persistent_buttons(self):
         self.assertTrue(VerifyView(self.bot).is_persistent())
         self.assertTrue(ReviewView(self.bot).is_persistent())
@@ -111,13 +115,13 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.member.add_roles.assert_awaited_once()
         self.member.remove_roles.assert_awaited_once()
         self.assertEqual(self.user.send.await_count, 2)
-        self.assertEqual(self.bot.db.work(), [])
+        self.assertTrue(all(e['dm_done'] and e['audit_done'] for e in self.bot.db.events()))
 
-    async def test_reject_includes_reason_without_changing_roles(self):
+    async def test_reject_includes_reason_and_keeps_progress_role(self):
         row = self.bot.db.create(1, 2, 'Player')
         self.bot.db.decide(row['id'], 3, 'rejected', 'Wrong username')
         await self.bot.process(row['id'])
-        self.member.add_roles.assert_not_awaited()
+        self.assertEqual(self.member.add_roles.call_args.args[0], self.bot.ids['PROGRESS_ROLE_ID'])
         self.assertIn('Wrong username', self.user.send.call_args.kwargs['embed'].description)
 
     async def test_closed_dms_do_not_block_acceptance(self):
@@ -128,9 +132,9 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         await self.bot.process(row['id'])
         result = self.bot.db.get(row['id'])
         self.assertEqual(result['roles_done'], 1)
-        self.assertEqual(result['decision_dm'], 'blocked')
+        self.assertTrue(all(e['dm_done'] for e in self.bot.db.events()))
 
-    async def test_partial_role_failure_recovers_after_restart(self):
+    async def test_partial_role_failure_recovers_on_retry(self):
         response = MagicMock(status=403, reason='Forbidden')
         self.member.remove_roles.side_effect = discord.Forbidden(response, 'Missing permissions')
         row = self.bot.db.create(1, 2, 'Player')

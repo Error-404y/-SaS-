@@ -1,0 +1,46 @@
+TEXT = {
+    'en': {
+        'title': 'Police Simulator verification', 'verify': 'Verify', 'status': 'My application',
+        'agree': 'I agree and continue', 'rules': 'Read the server rules below. Continue only if you agree.',
+        'username': 'In-game username', 'patrol': 'Preferred patrol times and timezone',
+        'experience': 'Your experience', 'submitted': 'Your request has been submitted. Please wait for staff review.',
+        'accepted': 'Your verification was accepted. You now have the Member role.',
+        'rejected': 'Your application was rejected. You may apply again.',
+        'cancelled': 'Your application was withdrawn.', 'revoked': 'Your verification was revoked.',
+        'undo': 'The previous decision was undone. Your application is pending again.',
+        'question': 'Staff need more information. Open My application in the verification channel to answer.',
+        'answer': 'Your answer was saved.', 'cancel': 'Cancel application', 'respond': 'Answer staff',
+        'none': 'You have no application.', 'saved': 'Saved', 'error': 'Unable to complete action',
+        'retry': 'Please try again. If this continues, contact staff.', 'reason': 'Reason or note',
+        'pending': 'Pending', 'welcome': 'Welcome', 'reply': 'Your answer',
+        'invalid': 'Use 1 to 100 characters with at least one letter or number. Control characters, links and mentions are not allowed.',
+        'closed_dm': 'If DMs are disabled, use My application to check updates.',
+        'paused': 'Applications are paused.', 'full': 'The application queue is full. Please try again later.',
+        'verified': 'You are already verified.', 'duplicate': 'You already have a pending application.',
+        'stale': 'This application changed. Open My application again.',
+    },
+    'de': {
+        'title': 'Police Simulator Verifizierung', 'verify': 'Verifizieren', 'status': 'Mein Antrag',
+        'agree': 'Ich stimme zu und fahre fort', 'rules': 'Lies die Serverregeln unten. Fahre nur fort, wenn du zustimmst.',
+        'username': 'Benutzername im Spiel', 'patrol': 'Bevorzugte Streifenzeiten und Zeitzone',
+        'experience': 'Deine Erfahrung', 'submitted': 'Dein Antrag wurde eingereicht. Bitte warte auf die Pruefung durch das Team.',
+        'accepted': 'Deine Verifizierung wurde angenommen. Du hast jetzt die Member-Rolle.',
+        'rejected': 'Dein Antrag wurde abgelehnt. Du kannst dich erneut bewerben.',
+        'cancelled': 'Dein Antrag wurde zurueckgezogen.', 'revoked': 'Deine Verifizierung wurde entzogen.',
+        'undo': 'Die letzte Entscheidung wurde aufgehoben. Dein Antrag wartet erneut auf Pruefung.',
+        'question': 'Das Team braucht weitere Informationen. Antworte ueber Mein Antrag im Verifizierungskanal.',
+        'answer': 'Deine Antwort wurde gespeichert.', 'cancel': 'Antrag zurueckziehen', 'respond': 'Dem Team antworten',
+        'none': 'Du hast noch keinen Antrag.', 'saved': 'Gespeichert', 'error': 'Aktion nicht moeglich',
+        'retry': 'Bitte versuche es erneut. Falls das Problem bleibt, kontaktiere das Team.', 'reason': 'Grund oder Hinweis',
+        'pending': 'Ausstehend', 'welcome': 'Willkommen', 'reply': 'Deine Antwort',
+        'invalid': 'Nutze 1 bis 100 Zeichen mit mindestens einem Buchstaben oder einer Zahl. Steuerzeichen, Links und Erwaehnungen sind nicht erlaubt.',
+        'closed_dm': 'Falls Direktnachrichten deaktiviert sind, findest du Neuigkeiten unter Mein Antrag.',
+        'paused': 'Antraege sind pausiert.', 'full': 'Die Warteschlange ist voll. Bitte versuche es spaeter erneut.',
+        'verified': 'Du bist bereits verifiziert.', 'duplicate': 'Du hast bereits einen offenen Antrag.',
+        'stale': 'Dieser Antrag wurde geaendert. Oeffne Mein Antrag erneut.',
+    },
+}
+
+
+def tr(language, key):
+    return TEXT.get(language, TEXT['en']).get(key, key)
