@@ -13,7 +13,9 @@ def embed(title, description=''):
 
 
 async def reply(interaction, title, description='', view=None):
-    kwargs = dict(embed=embed(title, description), ephemeral=True, view=view)
+    kwargs = dict(embed=embed(title, description), ephemeral=True)
+    if view is not None:
+        kwargs['view'] = view
     if interaction.response.is_done():
         await interaction.followup.send(**kwargs)
     else:
