@@ -140,7 +140,7 @@ class VerificationBot(discord.Client):
         intents.members = True
         super().__init__(intents=intents, allowed_mentions=discord.AllowedMentions.none())
         self.ids = {key: int(os.getenv(key, value)) for key, value in DEFAULTS.items()}
-        self.db = Database(os.getenv('DATABASE_PATH', 'data/verification.sqlite3'))
+        self.db = Database(os.getenv('DATABASE_PATH', 'data/verification.json'))
         self.lock = asyncio.Lock()
         self.guild = None
         self.configured = False
