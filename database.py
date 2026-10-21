@@ -263,9 +263,9 @@ class Database:
         if row:
             data['applications'][str(row['id'])]['roles_done'] = 1
             data['applications'][str(row['id'])]['review_done'] = 0
-            self._event(data, row['id'], 'roles', 0,
-                        'Member granted; Verify-Progress removed' if data['members'][f'{guild_id}:{user_id}']['verified']
-                        else 'Verify-Progress granted; Member removed')
+        detail = ('Member granted; Verify-Progress removed' if data['members'][f'{guild_id}:{user_id}']['verified']
+                  else 'Verify-Progress granted; Member removed')
+        self._event(data, row['id'] if row else None, 'roles', 0, f'User {user_id}: {detail}')
         self._save(data)
 
     def configure(self, actor, paused, reason, queue_limit):
