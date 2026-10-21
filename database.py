@@ -7,37 +7,75 @@ import tempfile
 
 
 def timestamp():
-    return datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+    return datetime.now(timezone.utc).isoformat(timespec='seconds')
+
+
+def user_key(guild_id, user_id):
+    return f'{guild_id}:{user_id}'
 
 
 class Database:
     def __init__(self, path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        if self.path.exists():
-            try:
-                self.data = json.loads(self.path.read_text(encoding='utf-8'))
-                self._validate(self.data)
-                self._upgrade()
-                self._validate_extensions()
-            except (ValueError, KeyError, TypeError, UnicodeError) as error:
-                raise ValueError(f'Invalid JSON data file: {self.path}. Restore a backup; the file has not been changed.') from error
-        else:
-            self._save({'version': 1, 'next_id': 1, 'settings': {}, 'applications': {}, 'events': [], 'members': {}})
+        if not self.path.exists():
+            self._save(dict(version=2, next_id=1, panel_message=None, applications={}, verified={}, histories={}, joins={}))
+            return
+        try:
+            original = self.path.read_text(encoding='utf-8')
+            data = json.loads(original)
+            migrated = data.get('version') == 1
+            if migrated:
+                data = self._migrate(data)
+            self._validate(data)
+        except (ValueError, KeyError, TypeError, AttributeError, UnicodeError) as error:
+            raise ValueError(f'Invalid data in {self.path}; the file was not changed.') from error
+        self.data = data
+        if migrated:
+            backup = self.path.with_name(self.path.name + '.v1.bak')
+            if not backup.exists():
+                with backup.open('x', encoding='utf-8') as handle:
+                    handle.write(original)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            self._save(data)
+
+    @staticmethod
+    def _migrate(old):
+        data = dict(version=2, next_id=old['next_id'], panel_message=old['settings'].get('panel_message'),
+                    applications={}, verified={}, histories={}, joins={})
+        for key, source in old['applications'].items():
+            deleted = source['message_id'] is None
+            status = 'cancelled' if deleted and source['status'] == 'pending' else source['status']
+            row = dict(id=source['id'], guild_id=source['guild_id'], user_id=source['user_id'],
+                       username=source['username'], status=status, created_at=source['created_at'],
+                       decided_at=source['decided_at'], reviewer_id=source['reviewer_id'], reason=source['reason'] or '',
+                       message_id=source['message_id'], review_deleted=deleted, review_dirty=not deleted,
+                       roles_done=bool(source['roles_done']), transfer_started=False, transfer_eligible=False,
+                       submission_dm='done', decision_dm='done')
+            if status == 'accepted' and not row['roles_done']:
+                row['decision_dm'] = 'pending'
+            data['applications'][key] = row
+        latest = {}
+        for row in data['applications'].values():
+            key = user_key(row['guild_id'], row['user_id'])
+            if key not in latest or row['id'] > latest[key]['id']:
+                latest[key] = row
+        for key, row in latest.items():
+            if row['status'] == 'accepted':
+                data['verified'][key] = True
+        return data
 
     @staticmethod
     def _validate(data):
-        if not isinstance(data, dict) or data.get('version') != 1:
-            raise ValueError('Unsupported storage format')
-        if not isinstance(data.get('events', []), list) or not isinstance(data.get('members', {}), dict):
-            raise ValueError('Invalid events or member state')
-        if not isinstance(data['settings'], dict) or not isinstance(data['applications'], dict):
-            raise ValueError('Invalid storage structure')
-        if type(data['next_id']) is not int or data['next_id'] < 1:
-            raise ValueError('Invalid next ID')
-        required = {'id', 'guild_id', 'user_id', 'username', 'status', 'reviewer_id',
-                    'reason', 'created_at', 'decided_at', 'message_id', 'roles_done',
-                    'review_done', 'submission_dm', 'decision_dm'}
+        if not isinstance(data, dict) or data['version'] != 2 or type(data['next_id']) is not int or data['next_id'] < 1:
+            raise ValueError('Invalid data version or sequence')
+        for key in ('applications', 'verified', 'histories', 'joins'):
+            if not isinstance(data[key], dict):
+                raise ValueError('Invalid data structure')
+        required = {'id', 'guild_id', 'user_id', 'username', 'status', 'created_at', 'decided_at',
+                    'reviewer_id', 'reason', 'message_id', 'review_deleted', 'review_dirty', 'roles_done',
+                    'transfer_started', 'transfer_eligible', 'submission_dm', 'decision_dm'}
         for key, row in data['applications'].items():
             if not isinstance(row, dict) or not required <= row.keys():
                 raise ValueError('Incomplete application')
@@ -45,15 +83,29 @@ class Database:
                 raise ValueError('Invalid application ID')
             if row['status'] not in ('pending', 'accepted', 'rejected', 'cancelled', 'revoked'):
                 raise ValueError('Invalid application status')
+            if not isinstance(row['username'], str) or not isinstance(row['reason'], str):
+                raise ValueError('Invalid application text')
+            for field in ('review_deleted', 'review_dirty', 'roles_done', 'transfer_started', 'transfer_eligible'):
+                if type(row[field]) is not bool:
+                    raise ValueError('Invalid application state')
+            for field in ('submission_dm', 'decision_dm'):
+                if row[field] not in ('pending', 'done', 'blocked'):
+                    raise ValueError('Invalid delivery state')
+        for history in data['histories'].values():
+            if not isinstance(history['entries'], list) or type(history['dirty']) is not bool or type(history['deleted']) is not bool:
+                raise ValueError('Invalid verification history')
+            for entry in history['entries']:
+                if str(entry['application_id']) not in data['applications']:
+                    raise ValueError('Unknown history application')
+                datetime.fromisoformat(entry['at'])
 
     def _save(self, data):
         temporary = None
         try:
-            with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8',
-                                             dir=self.path.parent, prefix='.verification-',
-                                             suffix='.tmp', delete=False) as handle:
+            with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=self.path.parent,
+                                             prefix='.verification-', suffix='.tmp', delete=False) as handle:
                 temporary = Path(handle.name)
-                json.dump(data, handle, indent=2, ensure_ascii=False)
+                json.dump(data, handle, ensure_ascii=False, indent=2)
                 handle.write('\n')
                 handle.flush()
                 os.fsync(handle.fileno())
@@ -63,258 +115,112 @@ class Database:
                 temporary.unlink(missing_ok=True)
         self.data = data
 
-    def create(self, guild_id, user_id, username, language='en', answers=None, rules=None):
-        if any(row['guild_id'] == guild_id and row['user_id'] == user_id and row['status'] == 'pending'
-               for row in self.data['applications'].values()):
-            return None
-        latest = self.latest(guild_id, user_id)
-        if latest and latest['status'] == 'accepted':
-            raise ValueError('Already verified')
-        if self.setting('paused'):
-            raise ValueError('Applications are paused')
-        limit = self.setting('queue_limit') or 0
-        if limit and sum(r['status'] == 'pending' and r['guild_id'] == guild_id for r in self.data['applications'].values()) >= limit:
-            raise ValueError('Application queue is full')
-        data = deepcopy(self.data)
-        application_id = data['next_id']
-        data['next_id'] += 1
-        data['applications'][str(application_id)] = {
-            'id': application_id, 'guild_id': guild_id, 'user_id': user_id,
-            'username': username, 'status': 'pending', 'reviewer_id': None,
-            'reason': None, 'created_at': timestamp(), 'decided_at': None,
-            'message_id': None, 'roles_done': 0, 'review_done': 0,
-            'submission_dm': 'pending', 'decision_dm': 'pending',
-            'language': language, 'answers': answers or {}, 'rules': rules,
-            'revision': 0, 'claimed_by': None, 'question': None, 'answer': None,
-            'note': None,
-        }
-        self._event(data, application_id, 'submitted', user_id)
-        self._save(data)
-        return self.get(application_id)
+    def applications(self):
+        return deepcopy(list(self.data['applications'].values()))
 
     def get(self, application_id):
         return deepcopy(self.data['applications'].get(str(application_id)))
 
+    def pending(self, guild_id, user_id):
+        return next((row for row in self.applications() if row['guild_id'] == guild_id
+                     and row['user_id'] == user_id and row['status'] == 'pending'), None)
+
     def by_message(self, message_id):
-        return next((deepcopy(row) for row in self.data['applications'].values()
-                     if row['message_id'] == message_id), None)
+        return next((row for row in self.applications() if row['message_id'] == message_id), None)
+
+    def is_verified(self, guild_id, user_id):
+        return self.data['verified'].get(user_key(guild_id, user_id), False)
+
+    def create(self, guild_id, user_id, username):
+        if self.pending(guild_id, user_id):
+            return None
+        if self.is_verified(guild_id, user_id):
+            raise ValueError('You are already verified.')
+        data = deepcopy(self.data)
+        application_id = data['next_id']
+        data['next_id'] += 1
+        data['applications'][str(application_id)] = dict(
+            id=application_id, guild_id=guild_id, user_id=user_id, username=username,
+            status='pending', created_at=timestamp(), decided_at=None, reviewer_id=None, reason='',
+            message_id=None, review_deleted=False, review_dirty=True, roles_done=False,
+            transfer_started=False, transfer_eligible=False, submission_dm='pending', decision_dm='done')
+        self._save(data)
+        return self.get(application_id)
 
     def update(self, application_id, **fields):
-        allowed = {'message_id', 'roles_done', 'review_done', 'submission_dm', 'decision_dm'}
+        allowed = {'message_id', 'review_dirty', 'transfer_started', 'transfer_eligible', 'submission_dm', 'decision_dm'}
         if not fields or not fields.keys() <= allowed:
-            raise ValueError('Invalid storage fields')
+            raise ValueError('Invalid update fields')
         data = deepcopy(self.data)
         data['applications'][str(application_id)].update(fields)
         self._save(data)
 
-    def decide(self, application_id, reviewer_id, status, reason=None):
+    def decide(self, application_id, reviewer_id, status, reason=''):
+        if status not in ('accepted', 'rejected') or (status == 'rejected' and not reason.strip()):
+            raise ValueError('A rejection requires a reason.')
         row = self.get(application_id)
-        if not row or row['status'] != 'pending':
+        if not row or row['status'] != 'pending' or row['review_deleted']:
             return False
-        self.transition(application_id, reviewer_id, status, row['revision'], reason or '')
+        data = deepcopy(self.data)
+        data['applications'][str(application_id)].update(status=status, reviewer_id=reviewer_id,
+            decided_at=timestamp(), reason=reason.strip(), review_dirty=True, decision_dm='pending',
+            roles_done=status == 'rejected')
+        if status == 'accepted':
+            data['verified'][user_key(row['guild_id'], row['user_id'])] = True
+        self._save(data)
         return True
 
-    def setting(self, key):
-        return self.data['settings'].get(key)
-
-    def set_setting(self, key, value):
-        data = deepcopy(self.data)
-        data['settings'][key] = value
-        self._save(data)
-
-    def close(self):
-        pass
-
-    def _upgrade(self):
-        self.data.setdefault('events', [])
-        self.data.setdefault('members', {})
-        for event in self.data['events']:
-            if event['action'] == 'roles' and not event.get('confirmed'):
-                event['audit_done'] = True
-        for row in self.data['applications'].values():
-            defaults = dict(language='en', answers={}, rules=None, revision=0,
-                            claimed_by=None, question=None, answer=None, note=None)
-            for key, value in defaults.items():
-                row.setdefault(key, value)
-        for row in self.data['applications'].values():
-            latest = self.latest(row['guild_id'], row['user_id'])
-            if latest['id'] == row['id'] and row['status'] == 'accepted':
-                key = f"{row['guild_id']}:{row['user_id']}"
-                self.data['members'].setdefault(key, dict(guild_id=row['guild_id'], user_id=row['user_id'],
-                    verified=True, dirty=not bool(row['roles_done'])))
-
-        for row in self.data['applications'].values():
-            if not any(e['application_id'] == row['id'] for e in self.data['events']):
-                if row['submission_dm'] == 'pending':
-                    self._event(self.data, row['id'], 'submitted', row['user_id'])
-                if row['status'] in ('accepted', 'rejected') and row['decision_dm'] == 'pending':
-                    self._event(self.data, row['id'], row['status'], row['reviewer_id'], row['reason'] or '')
-
-    def latest(self, guild_id, user_id):
-        rows = [r for r in self.data['applications'].values()
-                if r['guild_id'] == guild_id and r['user_id'] == user_id]
-        return deepcopy(max(rows, key=lambda r: r['id'])) if rows else None
-
-    def duplicates(self, row):
-        import unicodedata
-        normalize = lambda value: unicodedata.normalize('NFKC', value).casefold().strip()
-        return [r['user_id'] for r in self.data['applications'].values()
-                if r['guild_id'] == row['guild_id'] and r['user_id'] != row['user_id']
-                and r['status'] in ('accepted', 'pending')
-                and normalize(r['username']) == normalize(row['username'])]
-
-    def _event(self, data, application_id, action, actor, detail=''):
-        data['events'].append(dict(id=len(data['events']) + 1, application_id=application_id,
-            action=action, actor=actor, detail=detail, at=timestamp(), audit_done=False, dm_done=False,
-            revision=data['applications'][str(application_id)]['revision'] if application_id else None))
-
-    def transition(self, application_id, actor, action, revision, detail=''):
+    def delete_review(self, application_id):
         data = deepcopy(self.data)
         row = data['applications'][str(application_id)]
-        if row['revision'] != revision:
-            raise ValueError('This application changed. Refresh and try again.')
-        latest = self.latest(row['guild_id'], row['user_id'])
-        if latest['id'] != application_id:
-            raise ValueError('Only the latest application can be changed.')
-        if action in ('cancelled', 'answer'):
-            if actor != row['user_id']:
-                raise ValueError('Only the applicant can do this.')
-        if action in ('claim', 'release', 'question', 'accepted', 'rejected', 'cancelled', 'answer'):
-            if row['status'] != 'pending':
-                raise ValueError('This application is no longer pending.')
-        if action in ('question', 'accepted', 'rejected', 'release') and row['claimed_by'] not in (None, actor):
-            raise ValueError('Another staff member has claimed this application.')
-        if action == 'claim':
-            if row['claimed_by'] not in (None, actor):
-                raise ValueError('Another staff member has claimed this application.')
-            if row['claimed_by'] == actor:
-                return deepcopy(row)
-            row['claimed_by'] = actor
-        elif action == 'release':
-            if row['claimed_by'] is None:
-                return deepcopy(row)
-            row['claimed_by'] = None
-        elif action == 'question':
-            if not detail.strip():
-                raise ValueError('A question is required.')
-            if row['question'] == detail and row['answer'] is None and row['claimed_by'] == actor:
-                return deepcopy(row)
-            row.update(question=detail, answer=None, claimed_by=actor)
-        elif action == 'answer':
-            if not row['question'] or row['answer'] is not None or not detail.strip():
-                raise ValueError('There is no unanswered question or the answer is empty.')
-            row['answer'] = detail
-        elif action in ('accepted', 'rejected', 'cancelled', 'revoked', 'undo'):
-            if action in ('rejected', 'revoked', 'undo') and not detail.strip():
-                raise ValueError('A reason is required.')
-            if action == 'revoked' and row['status'] != 'accepted':
-                raise ValueError('Only accepted verification can be revoked.')
-            if action == 'undo' and row['status'] not in ('accepted', 'rejected'):
-                raise ValueError('Only an acceptance or rejection can be reopened.')
-            if action == 'undo':
-                limit = data['settings'].get('queue_limit', 0)
-                count = sum(r['status'] == 'pending' and r['guild_id'] == row['guild_id'] for r in data['applications'].values())
-                if limit and count >= limit:
-                    raise ValueError('Queue full. Increase the limit before reopening.')
-            row.update(status='pending' if action == 'undo' else action,
-                       reviewer_id=actor, decided_at=timestamp(), reason=detail,
-                       note=detail if action == 'accepted' else None,
-                       roles_done=0, decision_dm='pending')
-            if action == 'undo':
-                row.update(claimed_by=None, question=None, answer=None)
-            key = f"{row['guild_id']}:{row['user_id']}"
-            data['members'][key] = dict(guild_id=row['guild_id'], user_id=row['user_id'],
-                verified=action == 'accepted', dirty=True)
-        else:
-            raise ValueError('Unknown action')
-        row['revision'] += 1
-        row['review_done'] = 0
-        self._event(data, application_id, action, actor, detail)
-        self._save(data)
-        return self.get(application_id)
-
-    def events(self):
-        return deepcopy(self.data['events'])
-
-    def event_done(self, event_id, field):
-        if field not in ('dm_done', 'audit_done'):
-            raise ValueError('Invalid event field')
-        data = deepcopy(self.data)
-        event = data['events'][event_id - 1]
-        event[field] = True
-        if field == 'dm_done' and event['application_id']:
-            row = data['applications'][str(event['application_id'])]
-            if event['action'] == 'submitted':
-                row['submission_dm'] = 'complete'
-            elif event['action'] in ('accepted', 'rejected', 'cancelled', 'revoked', 'undo') and event['revision'] == row['revision']:
-                row['decision_dm'] = 'complete'
+        row.update(review_deleted=True, review_dirty=False)
+        if row['status'] == 'pending':
+            row.update(status='cancelled', decided_at=timestamp(), decision_dm='pending', submission_dm='done',
+                       reason='The pending request was removed by staff. You may submit again.')
         self._save(data)
 
-    def members(self):
-        return deepcopy(list(self.data['members'].values()))
-
-    def member_state(self, guild_id, user_id):
-        return deepcopy(self.data['members'].get(f'{guild_id}:{user_id}'))
-
-    def track_member(self, guild_id, user_id, verified=False):
+    def finish_acceptance(self, application_id):
         data = deepcopy(self.data)
-        key = f'{guild_id}:{user_id}'
-        state = data['members'].setdefault(key, dict(guild_id=guild_id, user_id=user_id, verified=verified))
-        state['dirty'] = True
-        self._save(data)
-
-    def roles_applied(self, guild_id, user_id):
-        data = deepcopy(self.data)
-        data['members'][f'{guild_id}:{user_id}']['dirty'] = False
-        row = self.latest(guild_id, user_id)
-        if row:
-            data['applications'][str(row['id'])]['roles_done'] = 1
-            data['applications'][str(row['id'])]['review_done'] = 0
-        self._save(data)
-
-    def configure(self, actor, paused, reason, queue_limit):
-        if queue_limit < 0 or queue_limit > 1000:
-            raise ValueError('Queue limit must be between 0 and 1000.')
-        if paused and not reason.strip():
-            raise ValueError('Provide an explanation when pausing applications.')
-        data = deepcopy(self.data)
-        if all(data['settings'].get(k) == v for k, v in dict(paused=paused, pause_reason=reason, queue_limit=queue_limit).items()):
+        row = data['applications'][str(application_id)]
+        if row['roles_done'] or row['status'] != 'accepted':
             return
-        data['settings'].update(paused=paused, pause_reason=reason, queue_limit=queue_limit)
-        self._event(data, None, 'configuration', actor, f'Paused: {paused}; limit: {queue_limit}; {reason}')
+        row.update(roles_done=True, review_dirty=not row['review_deleted'])
+        if row['transfer_eligible']:
+            key = user_key(row['guild_id'], row['user_id'])
+            history = data['histories'].setdefault(key, dict(guild_id=row['guild_id'], user_id=row['user_id'],
+                message_id=None, deleted=False, dirty=False, entries=[]))
+            if not any(e['application_id'] == application_id for e in history['entries']):
+                history['entries'].append(dict(application_id=application_id, username=row['username'],
+                    reviewer_id=row['reviewer_id'], at=timestamp()))
+                history['dirty'] = not history['deleted']
         self._save(data)
 
-    def _validate_extensions(self):
-        if not isinstance(self.data['events'], list) or not isinstance(self.data['members'], dict):
-            raise ValueError('Invalid events or member state')
-        for index, event in enumerate(self.data['events'], 1):
-            if not isinstance(event, dict) or event['id'] != index:
-                raise ValueError('Invalid event ID')
-            for key in ('action', 'detail', 'at'):
-                if not isinstance(event[key], str):
-                    raise ValueError('Invalid event text')
-            if event['application_id'] is not None and str(event['application_id']) not in self.data['applications']:
-                raise ValueError('Event application missing')
-            for key in ('dm_done', 'audit_done'):
-                if type(event[key]) is not bool:
-                    raise ValueError('Invalid delivery state')
-        for key, state in self.data['members'].items():
-            if not isinstance(state, dict) or key != f"{state['guild_id']}:{state['user_id']}":
-                raise ValueError('Invalid member state')
-            if type(state['verified']) is not bool or type(state['dirty']) is not bool:
-                raise ValueError('Invalid role state')
-        for row in self.data['applications'].values():
-            if row['language'] not in ('en', 'de') or type(row['revision']) is not int or row['revision'] < 0:
-                raise ValueError('Invalid application preferences')
-            if not isinstance(row['answers'], dict) or not isinstance(row['username'], str):
-                raise ValueError('Invalid application answers')
+    def histories(self):
+        return deepcopy(list(self.data['histories'].values()))
 
-    def record_role_changes(self, guild_id, user_id, added, removed):
-        if not added and not removed:
-            return
+    def update_history(self, guild_id, user_id, **fields):
+        if not fields or not fields.keys() <= {'message_id', 'dirty', 'deleted'}:
+            raise ValueError('Invalid history fields')
         data = deepcopy(self.data)
-        row = self.latest(guild_id, user_id)
-        self._event(data, row['id'] if row else None, 'roles', 0)
-        data['events'][-1].update(confirmed=True, guild_id=guild_id, subject_user_id=user_id,
-                                  added=sorted(added), removed=sorted(removed))
+        data['histories'][user_key(guild_id, user_id)].update(fields)
         self._save(data)
+
+    def queue_join(self, guild_id, user_id):
+        data = deepcopy(self.data)
+        data['joins'][user_key(guild_id, user_id)] = dict(guild_id=guild_id, user_id=user_id)
+        self._save(data)
+
+    def finish_join(self, guild_id, user_id):
+        data = deepcopy(self.data)
+        data['joins'].pop(user_key(guild_id, user_id), None)
+        self._save(data)
+
+    def joins(self):
+        return deepcopy(list(self.data['joins'].values()))
+
+    def panel(self, message_id=None):
+        if message_id is not None:
+            data = deepcopy(self.data)
+            data['panel_message'] = message_id
+            self._save(data)
+        return self.data['panel_message']

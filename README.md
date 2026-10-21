@@ -1,87 +1,68 @@
-# SaS Police Simulator verification bot
+# SaS verification bot
 
-Python 3.11+ Discord bot for a small community. All data is saved automatically in `data/verification.json`. No SQL or database installation is needed. Messages use embeds, and the Python source contains no comments, docstrings or emojis.
+A small Discord verification bot using Python and one local JSON file. No SQL or database server. All messages use embeds. No comments, docstrings or emojis in the Python source.
 
-## Application workflow
+## How it works
 
-1. New members receive Verify-Progress. Previously accepted members get Member restored when they return. Revoked members do not regain Member.
-2. The public panel offers English through **Verify** or German through **Deutsch**.
-3. Applicants read the configured rules and explicitly click the agreement button.
-4. A short form asks only for the game username by default. Set `EXTRA_QUESTIONS=true` to also collect patrol times/timezone and experience.
-5. The bot saves the application, sends a submission DM, and posts the staff review embed.
-6. Staff may claim the request, ask questions, accept with an optional note, or reject using an editable template/custom reason.
-7. Acceptance gives Member and removes Verify-Progress. The acceptance DM includes welcome instructions after role updates succeed.
+1. New members receive Verify-Process.
+2. They click **Verify** and enter their Police Simulator username.
+3. An embed appears in `verify-check` with exactly two buttons: **Accept** and **Reject**.
+4. Accept adds Member and removes Verify-Process. Reject asks for a reason and leaves roles unchanged.
+5. Applicants receive submission and result DMs. Closed DMs do not block verification.
+6. The staff embed is updated with the result, reviewer and Zurich time. Completed requests have no buttons.
 
-The in-game username is self-reported, not proof of ownership. Validation permits platform-neutral names, including spaces and punctuation, but rejects empty names, control characters, links and Discord mention syntax. A matching username on another pending/accepted application produces a staff warning rather than automatic rejection.
+Administrators and High-Rank staff can review requests, including their own. The bot rechecks permissions when a decision is submitted. Ordinary members cannot approve themselves. Only one pending application per user is allowed, and a second reviewer cannot overwrite a decision.
 
-## Applicant controls
+There are no claims, extra questions, rules prompts, language controls, cancellation/status buttons, undo/revoke buttons, rejection-template menus, or settings commands. The old verification-settings command is removed on startup. To reject a request, enter a plain reason. To apply again after rejection, click Verify again.
 
-Use **My application / Mein Antrag** on the public panel to view the latest application. This works even with DMs disabled.
+## Quiet verification history
 
-- **Cancel application** withdraws a pending request. A new application can then be submitted.
-- **Answer staff** appears when staff have asked an unanswered question. The applicant replies through a form; the answer appears on the staff embed and in the private log.
-- The saved language controls applicant forms, status messages, system notifications, rejection templates and welcome text. Staff-written text is delivered as written, without automatic translation.
-- Rules agreement text, application answers, decisions and explanations are retained locally.
+The `verified-log` channel receives a history embed only when an accepted application completes **both** changes:
 
-## Staff controls
+- Member was absent and is now present.
+- Verify-Process was present and is now absent.
 
-All staff actions require Discord Administrator permission or role `1562535759276417065` and must take place in `verify-check`. Authorized reviewers can accept their own applications. Ordinary applicants cannot approve themselves. Staff access is checked again when applying an action. Already verified members do not need to submit again.
+The bot checks Discord before and after the role update. If an update partially fails, it saves the original state and waits until the remaining change is confirmed. The successful transfer is recorded once, including across restarts.
 
-| Control | Behavior |
-| --- | --- |
-| Accept | Accepts immediately, without an extra form. |
-| Accept with note | Opens an optional note form before acceptance. |
-| Reject | Offers custom, incorrect-username, insufficient-detail and rules templates, then an editable required-reason form. |
-| Claim / Release | Claims a pending request or releases your own claim. Only its claimant can ask questions or decide while claimed. |
-| Request information | Sends a question to the applicant and displays it under My application. Asking also claims the request. |
-| Undo decision | Requires a reason and reopens the latest accepted/rejected application. Undoing acceptance removes Member and restores Verify-Progress. |
-| Revoke verification | Requires a reason, changes an accepted request to revoked, removes Member and restores Verify-Progress. |
+There is **one history embed per user**, which is edited when another qualifying transfer is recorded. It shows username, accepting staff member and Zurich time. The latest eight entries are displayed; all entries remain in the JSON file. Submissions, rejections, joins, unchanged roles and partial changes do not generate log messages. Zurich time automatically switches between CET and CEST.
 
-Claims persist across restarts. The claimant should release a request before handing it to another reviewer. Old applications cannot be reopened after a newer application is submitted. Cancelled and revoked requests cannot be undone; the applicant can submit again. Every action checks the saved revision so an outdated form cannot overwrite a later action.
+Old log messages are not automatically deleted or replayed. You can delete them yourself. Deleting a history embed suppresses further posting for that saved history; its data stays in JSON.
 
-Use this slash command **inside verify-check** to pause/resume submissions or change capacity:
+## Deleted staff messages stay deleted
 
-```text
-/verification-settings paused:True queue_limit:40 reason:Staff are catching up on current applications
-/verification-settings paused:False queue_limit:40
-```
+The bot never recreates a known deleted message in `verify-check`, whether deletion happens while running, during downtime, or in a bulk deletion.
 
-A queue limit of `0` means unlimited. The default is 40 pending applications. Claimed requests and requests awaiting information count toward the limit. Pausing blocks new submissions, including already-open forms, while existing applications can still be reviewed, answered or cancelled. Undo respects the queue limit; increase it before reopening if necessary. Saved command settings persist across restarts; `QUEUE_LIMIT` initializes a new store only.
+- A deleted completed request stays completed and is never posted again.
+- A deleted pending request is closed, so its applicant can submit a new request. A one-time DM explains this.
+- Deleting an accepted request does not undo acceptance or cancel an already-saved role update.
+- New requests are still posted normally. Failed initial delivery is retried; the bot checks for an already-sent matching message before posting to reduce duplicates after a crash.
 
-## Existing server IDs
+## Roles and restarts
 
-| Resource | ID |
+There is no server-wide role reassignment on startup. Existing Member roles are never removed by this version. Startup resumes unfinished accepted applications and queued join-role work only.
+
+New joiners get Verify-Process. Previously accepted users get Member restored when they return. A member who joined while the bot was offline can click Verify; the bot adds Verify-Process when they submit. Existing Member holders do not need to apply and keep their roles.
+
+If earlier versions removed Member from someone incorrectly, restore Member manually once. This version will preserve it. Returning-member restoration uses saved accepted applications; it does not treat every historical role assignment as an acceptance.
+
+## Server configuration
+
+| Resource | Default ID |
 | --- | --- |
 | Verification category | `1562540102394060840` |
-| verify-please channel | `1562540152276910093` |
+| verify-please | `1562540152276910093` |
 | High-Rank role | `1562535759276417065` |
-| Verify-Progress role | `1562535216050864209` |
+| Verify-Process role | `1562535216050864209` |
 | Member role | `1562535352290250842` |
 | High-Rank category | `1562539595474927637` |
-| verify-check channel | `1562539651229683732` |
-| verified-log channel | `1562546382772899910` |
+| verify-check | `1562539651229683732` |
+| verified-log | `1562546382772899910` |
 
-Private log embeds record actual submissions, claims/releases, questions/answers, decisions, cancellations, confirmed role changes and settings changes. Unchanged role checks do not send messages. The bot fetches Discord roles before and after updates; only confirmed additions/removals are logged, including the successful part of a partial update. Log entries use member/role mentions and omit missing application fields.
+Create a bot in the [Discord Developer Portal](https://discord.com/developers/applications). Enable **Server Members Intent**. Invite it with the `bot` scope and **Manage Roles**, **View Channels**, **Send Messages**, **Embed Links** and **Read Message History** permissions. Move the bot role above Member and Verify-Process. Message Content Intent and Administrator permission are not required for the bot.
 
-All displayed event/submission timestamps and console log times use `Europe/Zurich`, automatically switching between CET and CEST. Stored UTC timestamps remain unchanged for compatibility. Existing messages are not rewritten. Legacy queued role logs without confirmation evidence are retained in the file but are not sent. Failed log delivery retries without preventing role updates or applicant notifications.
+Allow new users to view `verify-please`. Keep `verify-check` and `verified-log` private to intended staff and the bot. Deny @everyone View Channel and inspect other role/member overrides. Allow the bot to read message history and send embeds in all three channels. Keep the verification channels inside their configured categories.
 
-## Discord setup
-
-1. Create an application in the [Discord Developer Portal](https://discord.com/developers/applications), create its bot and copy its token to a local `.env` file.
-2. Enable **Server Members Intent**. Message Content Intent is not required.
-3. Invite the bot with OAuth2 scopes `bot` and `applications.commands`. Grant **Manage Roles**, **View Channels**, **Send Messages**, **Embed Links** and **Read Message History**.
-4. Move the bot's highest role above both Member and Verify-Progress. Administrator permission is not required.
-5. Allow new members to view `verify-please` and read its message history. They do not need Send Messages to use buttons.
-6. Deny @everyone View Channel for `verify-check` and `verified-log`. Allow High-Rank and the bot to view them. Check other role/member overrides too, so applicants cannot see private applications or logs. Allow the bot to send embeds and read history in these channels.
-7. Keep both verification channels in their configured categories. The log channel must be a separate text channel in the same server.
-
-The default log channel ID is already configured. If you deliberately set `LOG_CHANNEL_ID=0`, the bot can instead create a private `verification-logs` channel under High-Rank; this optional mode requires Manage Channels. Existing channel permissions are not rewritten. Startup checks report missing channels, roles or permissions.
-
-Guild commands are synced on startup. If Discord hides `/verification-settings` from your staff, check the application's command permissions under Server Settings > Integrations. The command always enforces Administrator permission or High-Rank membership in code.
-
-API behavior follows [discord.py interactions documentation](https://discordpy.readthedocs.io/en/stable/interactions/api.html) and [Discord's member-intent documentation](https://github.com/discord/discord-api-docs/blob/main/developers/events/gateway.mdx).
-
-## Install and start
+## Install and run
 
 macOS / Linux:
 
@@ -92,12 +73,6 @@ python -m pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Edit `.env` and set `DISCORD_TOKEN`, then run:
-
-```sh
-python main.py
-```
-
 Windows PowerShell:
 
 ```powershell
@@ -106,53 +81,35 @@ py -m venv .venv
 Copy-Item .env.example .env
 ```
 
-Edit `.env`, then run:
+Edit `.env` and set `DISCORD_TOKEN`, then run `python main.py` with the virtual environment active. On Windows you can also use `.\.venv\Scripts\python.exe main.py` directly.
 
-```powershell
-.\.venv\Scripts\python.exe main.py
-```
+For the hosting panel, set **STARTUP_FILE** to `main.py`. `bot.py` also works. Keep `data/verification.json` across deployments. Never put the token in GitHub.
 
-For your hosting panel, set **Startup File / STARTUP_FILE** to `main.py`. `bot.py` also remains a supported entry point. The host must keep the data directory between restarts and deployments. Never put a real token in GitHub.
-
-Set `RULES_EN`, `RULES_DE`, `WELCOME_EN` and `WELCOME_DE` in `.env` to your server-specific text. Rules can include a link to the rules channel. Defaults provide a short rules acknowledgement and instructions to read announcements and contact High-Rank for a first patrol. English and German are available by default.
-
-## Docker
-
-Create `.env`, then:
+Docker:
 
 ```sh
 docker compose up -d --build
 docker compose logs -f
 ```
 
-The named volume preserves the JSON file. Run exactly one instance per file. Do not delete the volume when updating.
+The named Docker volume preserves JSON data. Run only one bot instance per file.
 
-## Upgrade and data safety
+## Updating from the previous bot
 
-Stop the previous version, back up `data/verification.json`, deploy the new files, and restart. Existing JSON applications and the panel ID are retained. Missing fields are initialized automatically; existing accepted applications become the source for returning-member recognition. Legacy applications default to English and show no rules agreement if none was previously collected.
+Stop the bot and back up `data/verification.json`, then deploy and restart. The first run converts version 1 JSON to version 2 and also saves the original as `data/verification.json.v1.bak`. Applications and the public panel ID are preserved. Old question/claim/event data remains in that backup but no longer drives the bot.
 
-Each write uses a separate temporary file, flushes it, and atomically replaces the data file. Failed writes preserve the current file and in-memory state. Invalid data stops startup without overwriting the file. Keep regular backups; atomic replacement does not replace backups. Do not edit JSON while the bot is running.
+Old completed requests are simplified in place if their messages still exist. Missing messages stay deleted. Legacy pending records without a message ID are closed conservatively so the bot cannot accidentally recreate a deleted request; those users may apply again. Existing successful applications do not create a burst of history posts during migration.
 
-If you still have the original SQLite version, that file is not imported automatically. Retain it as a backup and set `DATABASE_PATH=data/verification.json` before starting a fresh JSON store.
+The active configuration now contains only the token, JSON path, channel IDs, category IDs and role IDs. Old rules, language, queue and extra-question settings are ignored and may be removed from `.env`.
 
-## Recovery behavior and limits
+## Reliability and tests
 
-- On startup, human members are checked without unconditional role writes or log entries. Saved approval/revocation takes precedence; members with Member and no saved state keep verified access. Other members receive Verify-Progress.
-- Accepted returning members regain Member. Role failures retry every 30 seconds. Users who have left remain saved, allowing role updates when they return.
-- Role changes use the latest saved member state. Undo and revocation replace earlier pending role work.
-- Existing public and review buttons are restored on startup. Deleted review messages are recreated when detected or on restart. The public panel is recreated when its deletion is detected or on restart.
-- DMs blocked by Discord are not retried indefinitely. Applicants can use My application instead. Transient Discord failures retry.
-- Discord delivery and local file writes are separate operations. A crash after sending a message but before saving success may produce a duplicate DM or log. Untracked duplicate review messages cannot change application state.
-- Staff-written questions and previous answers are retained in the event log even when a new question replaces the latest question on the application embed.
-- A departed claimant must return and release their claim before another staff member can decide that request. The applicant can also cancel and resubmit.
-- Live Discord permissions, hosting availability and successful token login cannot be verified by the offline tests.
+Writes use a flushed temporary file and atomic replacement. Invalid data is not overwritten. Keep backups; atomic writes are not a substitute for backups. Discord and the JSON file cannot share a transaction: an interrupted send can still have an ambiguous result. Review/history discovery reduces duplicate posts, but an interrupted DM may be sent twice.
 
-## Tests
+Role updates, initial review delivery, DMs and history edits retry every 30 seconds. Permanent DM denial is recorded rather than repeatedly retried. A deleted history or review message is not retried as a new post. If an accepted applicant leaves, role completion waits until they return.
 
 ```sh
 python -m unittest discover -s tests -v
 ```
 
-Tests use real temporary JSON files, Discord interaction serialization, and mocked network calls with role-state changes. They cover persistence and legacy migration, failed writes, claims, cancellation, questions, stale forms, undo/revocation, queue limits, duplicate usernames, authorization, self-review permissions, notifications, confirmed-only role logs, Zurich summer/winter time, status replies, role recovery and comment/emoji-free source. CI runs Python 3.11 through 3.14.
-
-Before opening applications, use separate applicant and staff accounts to test rules agreement, submission, a question/answer, cancellation, template rejection, acceptance with a note, undo, revocation and rejoining. Repeat with DMs closed, and check that the log channel is visible only to intended staff and the bot.
+Tests exercise real temporary JSON files, migration/backups, role-state changes, complete versus partial transfers, deletion across restarts, staff permissions and self-review, duplicate decisions, DM failures, history deduplication, actual Discord interaction serialization, Zurich time and comment/emoji-free source. Live testing still requires your bot token and server permissions.

@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timedelta, timezone
 import logging
 import os
 
@@ -8,9 +9,8 @@ from discord.ext import tasks
 from dotenv import load_dotenv
 
 from database import Database
-from language import tr
 from time_utils import zurich_time, ZurichFormatter
-from views import VerifyView, ReviewView, embed, reply
+from views import VerifyView, ReviewView, embed, reply, valid_username
 
 load_dotenv()
 log = logging.getLogger('verification')
@@ -22,11 +22,12 @@ DEFAULTS = {
     'MEMBER_ROLE_ID': 1562535352290250842,
     'STAFF_CATEGORY_ID': 1562539595474927637,
     'REVIEW_CHANNEL_ID': 1562539651229683732,
+    'LOG_CHANNEL_ID': 1562546382772899910,
 }
 
 
 def safe(value, limit=1024):
-    return discord.utils.escape_markdown(str(value))[:limit] or '-'
+    return discord.utils.escape_markdown(str(value))[:limit]
 
 
 class VerificationBot(discord.Client):
@@ -36,44 +37,9 @@ class VerificationBot(discord.Client):
         super().__init__(intents=intents, allowed_mentions=discord.AllowedMentions.none())
         self.ids = {key: int(os.getenv(key, value)) for key, value in DEFAULTS.items()}
         self.db = Database(os.getenv('DATABASE_PATH', 'data/verification.json'))
-        if self.db.setting('queue_limit') is None:
-            self.db.set_setting('queue_limit', max(0, int(os.getenv('QUEUE_LIMIT', '40'))))
-        self.extra_questions = os.getenv('EXTRA_QUESTIONS', 'false').lower() == 'true'
         self.lock = asyncio.Lock()
         self.guild = None
         self.configured = False
-        self.tree = app_commands.CommandTree(self)
-
-        @self.tree.command(name='verification-settings', description='Pause or resume applications and set the queue limit')
-        @app_commands.guild_only()
-        async def settings(interaction: discord.Interaction, paused: bool, queue_limit: app_commands.Range[int, 0, 1000], reason: str = ''):
-            await interaction.response.defer(ephemeral=True, thinking=True)
-            if not await self.staff_allowed(interaction):
-                return
-            async with self.lock:
-                try:
-                    self.db.configure(interaction.user.id, paused, reason[:800], queue_limit)
-                except ValueError as error:
-                    return await reply(interaction, 'Invalid settings', str(error))
-                await self.ensure_panel()
-            await reply(interaction, 'Settings saved', f'Paused: {paused}\nQueue limit: {queue_limit} (0 means unlimited)')
-
-        @self.tree.error
-        async def command_error(interaction, error):
-            log.error('Command failed', exc_info=(type(error), error, error.__traceback__))
-            await reply(interaction, 'Unable to complete action', 'Check your permissions and try again.')
-
-    def rules(self, language):
-        default = ('Follow the server rules, treat others respectfully, and provide accurate application information.'
-                   if language == 'en' else
-                   'Befolge die Serverregeln, behandle andere respektvoll und mache korrekte Angaben im Antrag.')
-        return os.getenv(f'RULES_{language.upper()}', default)[:3500]
-
-    def welcome(self, language):
-        default = ('Welcome to the community. Read the server announcements and ask High-Rank staff how to join your first patrol.'
-                   if language == 'en' else
-                   'Willkommen in der Community. Lies die Ankuendigungen und frage das High-Rank-Team nach deiner ersten Streife.')
-        return os.getenv(f'WELCOME_{language.upper()}', default)[:1500]
 
     async def setup_hook(self):
         self.add_view(VerifyView(self))
@@ -83,65 +49,59 @@ class VerificationBot(discord.Client):
         return bool(self.configured and self.guild and interaction.guild_id == self.guild.id
                     and interaction.channel_id == self.ids['VERIFY_CHANNEL_ID'])
 
-    def staff_context(self, interaction):
-        return bool(self.configured and self.guild and interaction.guild_id == self.guild.id
-                    and interaction.channel_id == self.ids['REVIEW_CHANNEL_ID']
-                    and isinstance(interaction.user, discord.Member)
-                    and self.is_reviewer(interaction.user))
-
     def is_reviewer(self, member):
         return member.guild_permissions.administrator is True or any(r.id == self.ids['STAFF_ROLE_ID'] for r in member.roles)
 
-    async def staff_allowed(self, interaction):
-        if not self.configured or interaction.guild_id != self.guild.id or interaction.channel_id != self.ids['REVIEW_CHANNEL_ID']:
-            await reply(interaction, 'Not allowed', 'Use this action in verify-check.')
-            return False
-        member = await self.guild.fetch_member(interaction.user.id)
-        if not self.is_reviewer(member):
-            await reply(interaction, 'Not allowed', 'Only administrators or High-Rank staff may review applications.')
-            return False
-        return True
+    def staff_context(self, interaction):
+        return bool(self.configured and self.guild and interaction.guild_id == self.guild.id
+                    and interaction.channel_id == self.ids['REVIEW_CHANNEL_ID']
+                    and isinstance(interaction.user, discord.Member) and self.is_reviewer(interaction.user))
 
-    async def applicant_allowed(self, interaction, language='en'):
-        if not self.public_context(interaction):
-            await reply(interaction, tr(language, 'error'), tr(language, 'retry'))
-            return False
-        member = await self.guild.fetch_member(interaction.user.id)
-        latest = self.db.latest(interaction.guild_id, member.id)
-        error = None
-        if any(r.id == self.ids['MEMBER_ROLE_ID'] for r in member.roles) or (latest and latest['status'] == 'accepted'):
-            error = tr(language, 'verified')
-        elif latest and latest['status'] == 'pending':
-            error = tr(language, 'duplicate')
-        elif self.db.setting('paused'):
-            error = tr(language, 'paused') + '\n' + safe(self.db.setting('pause_reason'), 800)
-        else:
-            limit = self.db.setting('queue_limit') or 0
-            count = sum(r['status'] == 'pending' and r['guild_id'] == self.guild.id for r in self.db.data['applications'].values())
-            if limit and count >= limit:
-                error = tr(language, 'full')
-        if error:
-            await reply(interaction, tr(language, 'error'), error)
-        return error is None
-
-    async def apply_action(self, interaction, row, action, detail='', applicant=False):
+    async def submit(self, interaction, username):
         await interaction.response.defer(ephemeral=True, thinking=True)
-        language = row['language'] if applicant else 'en'
+        if not self.public_context(interaction):
+            return await reply(interaction, 'Not available', 'Use the Verify button in the verification channel.')
+        if not valid_username(username):
+            return await reply(interaction, 'Invalid username', 'Enter your game username, without links or mentions.')
         async with self.lock:
-            if applicant:
-                if not self.public_context(interaction) or interaction.user.id != row['user_id']:
-                    return await reply(interaction, tr(language, 'error'), tr(language, 'retry'))
-            elif not await self.staff_allowed(interaction):
-                return
-            if row['guild_id'] != interaction.guild_id:
-                return await reply(interaction, 'Not allowed')
+            member = await self.guild.fetch_member(interaction.user.id)
+            if any(r.id == self.ids['MEMBER_ROLE_ID'] for r in member.roles) or self.db.is_verified(self.guild.id, member.id):
+                await self.prepare_member(member)
+                return await reply(interaction, 'Already verified', 'You already have verified access.')
+            await self.prepare_member(member)
+            row = self.db.create(self.guild.id, member.id, username)
+            if row is None:
+                return await reply(interaction, 'Application pending', 'Your request is already waiting for staff review.')
+            await self.process(row['id'])
+        await reply(interaction, 'Application submitted', 'Your request is saved. Please wait for staff to review it. If DMs are disabled, your request still counts.')
+
+    async def decide(self, interaction, application_id, status, reason=''):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if not self.configured or interaction.guild_id != self.guild.id or interaction.channel_id != self.ids['REVIEW_CHANNEL_ID']:
+            return await reply(interaction, 'Not allowed', 'Review requests in verify-check.')
+        async with self.lock:
+            member = await self.guild.fetch_member(interaction.user.id)
+            if not self.is_reviewer(member):
+                return await reply(interaction, 'Not allowed', 'Only administrators or High-Rank staff can review requests.')
+            row = self.db.get(application_id)
+            if not row or row['guild_id'] != self.guild.id:
+                return await reply(interaction, 'Application unavailable')
+            if not row['review_deleted'] and row['message_id']:
+                try:
+                    await self.review_channel.fetch_message(row['message_id'])
+                except discord.NotFound:
+                    self.db.delete_review(application_id)
             try:
-                self.db.transition(row['id'], interaction.user.id, action, row['revision'], detail)
+                if not self.db.decide(application_id, member.id, status, reason):
+                    return await reply(interaction, 'Already handled', 'This application was already decided or removed.')
             except ValueError as error:
-                return await reply(interaction, tr(language, 'error'), tr(language, 'stale') if applicant else str(error))
-            await self.try_process(row['id'])
-        await reply(interaction, tr(language, 'saved'),
-                    tr(language, action) if applicant else 'The action is saved. Any unfinished role or message updates will retry automatically.')
+                return await reply(interaction, 'Reason required', str(error))
+            await self.process(application_id)
+            row = self.db.get(application_id)
+        description = 'The applicant has been notified, or their DMs are unavailable.'
+        if row['decision_dm'] == 'pending':
+            description = 'The decision is saved. The remaining updates will retry automatically.'
+        await reply(interaction, 'Accepted' if status == 'accepted' else 'Rejected', description)
     async def validate(self):
         self.verify_channel = await self.fetch_channel(self.ids['VERIFY_CHANNEL_ID'])
         self.review_channel = await self.fetch_channel(self.ids['REVIEW_CHANNEL_ID'])
@@ -167,55 +127,31 @@ class VerificationBot(discord.Client):
             if role.managed or role.is_default() or role >= self.guild.me.top_role:
                 raise RuntimeError(f'Move the bot role above {role.name}; target roles must be ordinary roles.')
 
-    async def setup_logs(self):
-        channel_id = int(os.getenv('LOG_CHANNEL_ID', '1562546382772899910')) or self.db.setting('log_channel')
-        channel = None
-        if channel_id:
-            try:
-                channel = await self.fetch_channel(channel_id)
-            except discord.NotFound:
-                if int(os.getenv('LOG_CHANNEL_ID', '1562546382772899910')):
-                    raise RuntimeError('Configured LOG_CHANNEL_ID does not exist.')
-        if channel is None:
-            if not self.guild.me.guild_permissions.manage_channels:
-                raise RuntimeError('Set LOG_CHANNEL_ID to a private text channel or grant Manage Channels to create verification-logs.')
-            overwrites = {
-                self.guild.default_role: discord.PermissionOverwrite(view_channel=False),
-                self.guild.get_role(self.ids['STAFF_ROLE_ID']): discord.PermissionOverwrite(view_channel=True, read_message_history=True),
-                self.guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, embed_links=True, read_message_history=True),
-            }
-            channel = await self.guild.create_text_channel('verification-logs',
-                category=self.guild.get_channel(self.ids['STAFF_CATEGORY_ID']), overwrites=overwrites,
-                reason='Private verification audit log')
-            self.db.set_setting('log_channel', channel.id)
+    async def validate_log_channel(self):
+        self.log_channel = await self.fetch_channel(self.ids['LOG_CHANNEL_ID'])
+        channel = self.log_channel
         if not isinstance(channel, discord.TextChannel) or channel.guild.id != self.guild.id:
-            raise RuntimeError('LOG_CHANNEL_ID must be a text channel in this server.')
+            raise RuntimeError('LOG_CHANNEL_ID must be a text channel in the same server.')
         if channel.id in (self.ids['VERIFY_CHANNEL_ID'], self.ids['REVIEW_CHANNEL_ID']):
-            raise RuntimeError('Use a dedicated channel for verification logs.')
+            raise RuntimeError('Use a separate log channel.')
         if channel.permissions_for(self.guild.default_role).view_channel:
-            raise RuntimeError('Verification log channel must deny View Channel to @everyone.')
+            raise RuntimeError('The log channel must deny View Channel to @everyone.')
         permissions = channel.permissions_for(self.guild.me)
-        if not all((permissions.view_channel, permissions.send_messages, permissions.embed_links)):
-            raise RuntimeError('Bot cannot send embeds in the log channel.')
-        self.log_channel = channel
+        if not all((permissions.view_channel, permissions.send_messages, permissions.embed_links, permissions.read_message_history)):
+            raise RuntimeError('The bot needs View Channel, Send Messages, Embed Links and Read Message History in verified-log.')
 
     async def ensure_panel(self):
-        description = ('Click Verify for English or Deutsch for German.\n'
-                       'Read the rules, submit your game username and wait for staff review.\n'
-                       'Use My application to check updates, answer questions or withdraw.')
-        if self.db.setting('paused'):
-            description += '\n\nApplications paused / Antraege pausiert:\n' + safe(self.db.setting('pause_reason'), 800)
-        panel = embed('Police Simulator verification', description)
-        panel_id = self.db.setting('panel_message')
-        if panel_id:
+        panel = embed('Police Simulator verification', 'Click Verify and enter your in-game username. Staff will accept or reject your request.')
+        message_id = self.db.panel()
+        if message_id:
             try:
-                message = await self.verify_channel.fetch_message(panel_id)
+                message = await self.verify_channel.fetch_message(message_id)
                 await message.edit(embed=panel, view=VerifyView(self))
                 return
             except discord.NotFound:
                 pass
         message = await self.verify_channel.send(embed=panel, view=VerifyView(self))
-        self.db.set_setting('panel_message', message.id)
+        self.db.panel(message.id)
 
     async def on_ready(self):
         async with self.lock:
@@ -223,236 +159,244 @@ class VerificationBot(discord.Client):
                 return
             try:
                 await self.validate()
-                await self.setup_logs()
+                await self.validate_log_channel()
                 await self.ensure_panel()
-                self.tree.copy_global_to(guild=self.guild)
-                await self.tree.sync(guild=self.guild)
-                for row in list(self.db.data['applications'].values()):
-                    if row['guild_id'] == self.guild.id:
-                        self.db.update(row['id'], review_done=0)
+                tree = app_commands.CommandTree(self)
+                try:
+                    for command in await tree.fetch_commands(guild=self.guild):
+                        if command.name == 'verification-settings':
+                            await command.delete()
+                except discord.HTTPException:
+                    log.warning('Could not remove the retired settings command; verification can still run.')
+                for row in self.db.applications():
+                    if row['guild_id'] == self.guild.id and not row['review_deleted']:
+                        self.db.update(row['id'], review_dirty=True)
                 self.configured = True
-                async for member in self.guild.fetch_members(limit=None):
-                    if not member.bot:
-                        self.db.track_member(self.guild.id, member.id,
-                            any(r.id == self.ids['MEMBER_ROLE_ID'] for r in member.roles))
                 self.recover.start()
                 log.info('Ready as %s in %s', self.user, self.guild.name)
             except Exception:
-                log.exception('Startup failed. Correct configuration and restart.')
+                log.exception('Startup failed. Correct the configuration and restart.')
                 await self.close()
 
-    def applicant_embed(self, row):
-        language = row['language']
-        result = embed(tr(language, 'title'), tr(language, row['status']))
-        result.add_field(name=tr(language, 'username'), value=safe(row['username']), inline=False)
-        if row['reason']:
-            result.add_field(name=tr(language, 'reason'), value=safe(row['reason']), inline=False)
-        if row['question']:
-            result.add_field(name=tr(language, 'question')[:256], value=safe(row['question']), inline=False)
-        if row['answer']:
-            result.add_field(name=tr(language, 'reply'), value=safe(row['answer']), inline=False)
-        if row['status'] == 'accepted' and row['roles_done']:
-            result.add_field(name=tr(language, 'welcome'), value=self.welcome(language)[:1024], inline=False)
+    def review_embed(self, row):
+        result = embed(f"Verification - {row['status'].title()}", f"<@{row['user_id']}>\n**Game username:** {safe(row['username'])}")
+        result.add_field(name='Submitted', value=zurich_time(row['created_at']), inline=False)
+        if row['reviewer_id']:
+            result.add_field(name='Reviewed by', value=f"<@{row['reviewer_id']}>")
+        if row['decided_at']:
+            result.add_field(name='Decision time', value=zurich_time(row['decided_at']))
+        if row['status'] == 'rejected' and row['reason']:
+            result.add_field(name='Reason', value=safe(row['reason']), inline=False)
         if row['status'] == 'accepted' and not row['roles_done']:
-            result.description = ('Accepted. Role assignment is pending.' if language == 'en'
-                                  else 'Angenommen. Die Rollenzuweisung steht noch aus.')
+            result.add_field(name='Roles', value='Updating roles. The bot will retry if necessary.', inline=False)
         result.set_footer(text=f"Application {row['id']}")
         return result
 
-    def review_embed(self, row):
-        result = embed(f"Verification {row['id']} - {row['status'].title()}", f"Applicant: <@{row['user_id']}>\nDiscord ID: {row['user_id']}")
-        for name, value in [('Game username', row['username']), ('Language', row['language']),
-                            ('Submitted (Zurich)', zurich_time(row['created_at'])), ('Claimed by', row['claimed_by']),
-                            ('Rules agreed', row['rules']), ('Patrol availability', row['answers'].get('patrol')),
-                            ('Experience', row['answers'].get('experience')), ('Staff question', row['question']),
-                            ('Applicant answer', row['answer']), ('Reason / note', row['reason']),
-                            ('Reviewer', row['reviewer_id'])]:
-            if value is not None:
-                result.add_field(name=name, value=safe(value, 450), inline=False)
-        duplicates = self.db.duplicates(row)
-        if duplicates:
-            result.add_field(name='Duplicate username warning', value=safe(', '.join(map(str, sorted(set(duplicates)))), 500), inline=False)
-        result.set_footer(text=f"Revision {row['revision']} | Role update {'complete' if row['roles_done'] else 'pending'}")
-        return result
+    async def find_message(self, channel, marker, after=None):
+        async for message in channel.history(limit=None, after=after):
+            if message.author.id == self.user.id and any(e.footer.text == marker for e in message.embeds):
+                return message
+        return None
 
     async def sync_review(self, application_id):
         row = self.db.get(application_id)
-        if row['review_done'] and row['message_id']:
+        if row['review_deleted'] or not row['review_dirty']:
             return
         message = None
         if row['message_id']:
             try:
                 message = await self.review_channel.fetch_message(row['message_id'])
             except discord.NotFound:
-                pass
-        if message:
-            await message.edit(embed=self.review_embed(row), view=ReviewView(self, row['status']))
+                self.db.delete_review(application_id)
+                return
         else:
-            message = await self.review_channel.send(embed=self.review_embed(row), view=ReviewView(self, row['status']))
-        self.db.update(application_id, message_id=message.id, review_done=1)
+            created = datetime.fromisoformat(row['created_at'])
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            message = await self.find_message(self.review_channel, f"Application {row['id']}", created - timedelta(seconds=1))
+        view = ReviewView(self) if row['status'] == 'pending' else None
+        if message:
+            await message.edit(embed=self.review_embed(row), view=view)
+        else:
+            kwargs = dict(embed=self.review_embed(row))
+            if view is not None:
+                kwargs['view'] = view
+            message = await self.review_channel.send(**kwargs)
+        self.db.update(application_id, message_id=message.id, review_dirty=False)
 
-    async def sync_roles(self, state):
-        if state['guild_id'] != self.guild.id or not state['dirty']:
+    async def apply_acceptance(self, application_id):
+        row = self.db.get(application_id)
+        if row['status'] != 'accepted' or row['roles_done']:
             return
-        member = await self.guild.fetch_member(state['user_id'])
-        grant = self.ids['MEMBER_ROLE_ID' if state['verified'] else 'PROGRESS_ROLE_ID']
-        remove = self.ids['PROGRESS_ROLE_ID' if state['verified'] else 'MEMBER_ROLE_ID']
-        before = {role.id for role in member.roles}
-        if grant in before and remove not in before:
-            self.db.roles_applied(self.guild.id, state['user_id'])
-            return
+        member = await self.guild.fetch_member(row['user_id'])
+        before = {r.id for r in member.roles}
+        member_role = self.ids['MEMBER_ROLE_ID']
+        progress_role = self.ids['PROGRESS_ROLE_ID']
+        if not row['transfer_started']:
+            self.db.update(application_id, transfer_started=True,
+                           transfer_eligible=member_role not in before and progress_role in before)
         failure = None
         try:
-            if grant not in before:
-                await member.add_roles(self.guild.get_role(grant), reason='Verification state update')
-            if remove in before:
-                await member.remove_roles(self.guild.get_role(remove), reason='Verification state update')
+            if member_role not in before:
+                await member.add_roles(self.guild.get_role(member_role), reason='Verification accepted')
+            if progress_role in before:
+                await member.remove_roles(self.guild.get_role(progress_role), reason='Verification accepted')
         except discord.HTTPException as error:
             failure = error
-        current = await self.guild.fetch_member(state['user_id'])
-        after = {role.id for role in current.roles}
-        added = {grant} if grant not in before and grant in after else set()
-        removed = {remove} if remove in before and remove not in after else set()
-        self.db.record_role_changes(self.guild.id, state['user_id'], added, removed)
-        if grant in after and remove not in after:
-            self.db.roles_applied(self.guild.id, state['user_id'])
-        else:
-            log.warning('Discord has not confirmed the intended roles for %s; will retry', state['user_id'])
-        if failure:
+        current = await self.guild.fetch_member(row['user_id'])
+        after = {r.id for r in current.roles}
+        if member_role in after and progress_role not in after:
+            self.db.finish_acceptance(application_id)
+        elif failure:
             raise failure
+        else:
+            log.warning('Roles not yet confirmed for application %s; will retry', application_id)
 
-    def audit_embed(self, event, row):
-        titles = {'submitted': 'Application submitted', 'accepted': 'Application accepted',
-                  'rejected': 'Application rejected', 'cancelled': 'Application withdrawn',
-                  'revoked': 'Verification revoked', 'undo': 'Decision reopened', 'claim': 'Application claimed',
-                  'release': 'Claim released', 'question': 'Information requested', 'answer': 'Applicant replied',
-                  'roles': 'Roles updated', 'configuration': 'Verification settings changed'}
-        result = embed(titles.get(event['action'], 'Verification updated'))
-        user_id = row['user_id'] if row else event.get('subject_user_id')
-        if user_id:
-            result.add_field(name='Member', value=f'<@{user_id}>', inline=False)
-        if row:
-            result.add_field(name='Application', value=str(row['id']))
-        if event['action'] == 'roles':
-            for name, key in (('Added', 'added'), ('Removed', 'removed')):
-                if event.get(key):
-                    result.add_field(name=name, value=' '.join(f'<@&{role_id}>' for role_id in event[key]), inline=False)
-        if event['detail']:
-            result.add_field(name='Details', value=safe(event['detail'], 1024), inline=False)
-        result.add_field(name='By', value=f"<@{event['actor']}>" if event['actor'] else 'Bot')
-        result.add_field(name='Time (Zurich)', value=zurich_time(event['at']), inline=False)
-        result.set_footer(text=f"Event {event['id']}")
+    async def prepare_member(self, member):
+        unfinished = next((row for row in self.db.applications() if row['guild_id'] == self.guild.id
+                           and row['user_id'] == member.id and row['status'] == 'accepted' and not row['roles_done']), None)
+        if unfinished:
+            await self.apply_acceptance(unfinished['id'])
+            return
+        roles = {r.id for r in member.roles}
+        member_role = self.ids['MEMBER_ROLE_ID']
+        progress_role = self.ids['PROGRESS_ROLE_ID']
+        verified = member_role in roles or self.db.is_verified(self.guild.id, member.id)
+        if verified:
+            if member_role not in roles:
+                await member.add_roles(self.guild.get_role(member_role), reason='Restore verified access')
+            if progress_role in roles:
+                await member.remove_roles(self.guild.get_role(progress_role), reason='Already verified')
+        elif progress_role not in roles:
+            await member.add_roles(self.guild.get_role(progress_role), reason='Awaiting verification')
+
+    async def send_dm(self, application_id, field):
+        row = self.db.get(application_id)
+        if row[field] != 'pending':
+            return
+        if field == 'submission_dm':
+            text = 'Your request has been successfully submitted. Please wait until staff verify it.'
+        elif row['status'] == 'accepted':
+            if not row['roles_done']:
+                return
+            text = 'Your verification has been accepted. You now have the Member role. Welcome!'
+        elif row['status'] == 'rejected':
+            text = f"Your verification was rejected.\n\n**Reason:** {safe(row['reason'])}\n\nYou may submit again."
+        elif row['status'] == 'cancelled':
+            text = 'Your pending request was removed by staff. You may submit a new request.'
+        else:
+            return
+        try:
+            user = await self.fetch_user(row['user_id'])
+            await user.send(embed=embed('Police Simulator verification', text))
+        except (discord.Forbidden, discord.NotFound):
+            self.db.update(application_id, **{field: 'blocked'})
+        else:
+            self.db.update(application_id, **{field: 'done'})
+
+    def history_embed(self, history):
+        result = embed('Verification history', f"<@{history['user_id']}>\nVerify-Process removed and Member added.")
+        entries = history['entries'][-8:]
+        for entry in entries:
+            result.add_field(name=zurich_time(entry['at']),
+                value=f"**Username:** {safe(entry['username'], 200)}\n**Accepted by:** <@{entry['reviewer_id']}>", inline=False)
+        result.set_footer(text=f"Verification history {history['user_id']} | {len(history['entries'])} completed")
         return result
 
-    async def deliver_event(self, event):
-        row = self.db.get(event['application_id']) if event['application_id'] else None
-        if (row and row['guild_id'] != self.guild.id) or event.get('guild_id', self.guild.id) != self.guild.id:
+    async def sync_history(self, history):
+        if history['guild_id'] != self.guild.id or not history['dirty'] or history['deleted']:
             return
-        action = event['action']
-        if not event['audit_done']:
+        message = None
+        if history['message_id']:
             try:
-                await self.log_channel.send(embed=self.audit_embed(event, row))
-                self.db.event_done(event['id'], 'audit_done')
-            except discord.HTTPException:
-                log.exception('Audit delivery failed; will retry')
-        if event['dm_done']:
-            return
-        notify = action in ('submitted', 'accepted', 'rejected', 'cancelled', 'revoked', 'undo', 'question')
-        if row:
-            expected = {'undo': 'pending', 'question': 'pending', 'accepted': 'accepted',
-                        'rejected': 'rejected', 'cancelled': 'cancelled', 'revoked': 'revoked'}
-            if action in expected and (row['status'] != expected[action] or event.get('revision') != row['revision']):
-                notify = False
-            if action == 'question' and (row['question'] != event['detail'] or row['answer'] is not None):
-                notify = False
-            if action == 'accepted' and notify and not row['roles_done']:
+                message = await self.log_channel.fetch_message(history['message_id'])
+            except discord.NotFound:
+                self.db.update_history(self.guild.id, history['user_id'], deleted=True, dirty=False)
                 return
-        if notify and row:
-            language = row['language']
-            description = tr(language, action)
-            if event['detail']:
-                description += '\n\n' + safe(event['detail'], 1600)
-            if action == 'accepted':
-                description += '\n\n' + self.welcome(language)
-            description += f"\n\n<#{self.ids['VERIFY_CHANNEL_ID']}>"
-            try:
-                user = await self.fetch_user(row['user_id'])
-                await user.send(embed=embed(tr(language, 'title'), description))
-            except (discord.Forbidden, discord.NotFound):
-                log.warning('DM unavailable for application %s', row['id'])
-            except discord.HTTPException:
-                log.exception('DM failed; will retry')
-                return
-        self.db.event_done(event['id'], 'dm_done')
+        else:
+            async for candidate in self.log_channel.history(limit=None):
+                if candidate.author.id == self.user.id and any(
+                    (e.footer.text or '').startswith(f"Verification history {history['user_id']} |") for e in candidate.embeds):
+                    message = candidate
+                    break
+        if message:
+            await message.edit(embed=self.history_embed(history))
+        else:
+            message = await self.log_channel.send(embed=self.history_embed(history))
+        self.db.update_history(self.guild.id, history['user_id'], message_id=message.id, dirty=False)
+
+    async def attempt(self, action, *args):
+        try:
+            await action(*args)
+        except (discord.HTTPException, OSError):
+            log.exception('%s failed; saved work will retry', action.__name__)
 
     async def process(self, application_id):
         row = self.db.get(application_id)
         if row['guild_id'] != self.guild.id:
             return
-        state = self.db.member_state(row['guild_id'], row['user_id'])
-        if state:
-            try:
-                await self.sync_roles(state)
-            except discord.HTTPException:
-                log.exception('Role update failed; will retry')
-        await self.sync_review(application_id)
-        for event in self.db.events():
-            if event['application_id'] == application_id and (not event['audit_done'] or not event['dm_done']):
-                await self.deliver_event(event)
-
-    async def try_process(self, application_id):
-        try:
-            await self.process(application_id)
-        except discord.HTTPException:
-            log.exception('Application delivery failed; will retry')
+        await self.attempt(self.sync_review, application_id)
+        await self.attempt(self.apply_acceptance, application_id)
+        await self.attempt(self.sync_review, application_id)
+        await self.attempt(self.send_dm, application_id, 'submission_dm')
+        await self.attempt(self.send_dm, application_id, 'decision_dm')
 
     @tasks.loop(seconds=30)
     async def recover(self):
         async with self.lock:
-            for state in self.db.members():
-                if state['dirty'] and state['guild_id'] == self.guild.id:
+            for row in self.db.applications():
+                if row['guild_id'] == self.guild.id:
                     try:
-                        await self.sync_roles(state)
+                        await self.process(row['id'])
                     except Exception:
-                        log.exception('Role recovery failed for %s', state['user_id'])
-            for row in list(self.db.data['applications'].values()):
-                if row['guild_id'] == self.guild.id and not row['review_done']:
-                    try:
-                        await self.sync_review(row['id'])
-                    except Exception:
-                        log.exception('Review recovery failed for %s', row['id'])
-            for event in self.db.events():
-                if not event['audit_done'] or not event['dm_done']:
-                    try:
-                        await self.deliver_event(event)
-                    except Exception:
-                        log.exception('Event recovery failed for %s', event['id'])
+                        log.exception('Recovery failed for application %s', row['id'])
+            for history in self.db.histories():
+                await self.attempt(self.sync_history, history)
+            for job in self.db.joins():
+                if job['guild_id'] != self.guild.id:
+                    continue
+                try:
+                    member = await self.guild.fetch_member(job['user_id'])
+                    await self.prepare_member(member)
+                except discord.NotFound:
+                    pass
+                except discord.HTTPException:
+                    log.exception('Join role failed; will retry')
+                    continue
+                self.db.finish_join(job['guild_id'], job['user_id'])
 
     async def on_member_join(self, member):
         if member.bot or not self.configured or member.guild.id != self.guild.id:
             return
         async with self.lock:
-            self.db.track_member(member.guild.id, member.id)
+            self.db.queue_join(self.guild.id, member.id)
             try:
-                await self.sync_roles(self.db.member_state(member.guild.id, member.id))
+                await self.prepare_member(member)
+                self.db.finish_join(self.guild.id, member.id)
             except discord.HTTPException:
-                log.exception('Join role update failed; will retry')
+                log.exception('Join role failed; will retry')
 
-    async def on_raw_message_delete(self, payload):
-        if not self.configured or payload.guild_id != self.guild.id:
+    async def delete_messages(self, guild_id, message_ids):
+        if not self.configured or guild_id != self.guild.id:
             return
         async with self.lock:
-            if payload.message_id == self.db.setting('panel_message'):
-                await self.ensure_panel()
-            row = self.db.by_message(payload.message_id)
-            if row:
-                self.db.update(row['id'], message_id=None, review_done=0)
+            for row in self.db.applications():
+                if row['guild_id'] == guild_id and row['message_id'] in message_ids and not row['review_deleted']:
+                    self.db.delete_review(row['id'])
+            for history in self.db.histories():
+                if history['guild_id'] == guild_id and history['message_id'] in message_ids:
+                    self.db.update_history(guild_id, history['user_id'], deleted=True, dirty=False)
+
+    async def on_raw_message_delete(self, payload):
+        await self.delete_messages(payload.guild_id, {payload.message_id})
+
+    async def on_raw_bulk_message_delete(self, payload):
+        await self.delete_messages(payload.guild_id, payload.message_ids)
 
     async def close(self):
         if self.recover.is_running():
             self.recover.cancel()
         await super().close()
-        self.db.close()
 
 
 def main():
