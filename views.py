@@ -12,14 +12,30 @@ def embed(title, description=''):
     return discord.Embed(title=title[:256], description=description[:4096], color=discord.Color.blurple())
 
 
-async def reply(interaction, title, description='', view=None):
-    kwargs = dict(embed=embed(title, description), ephemeral=True)
+async def send_embed(interaction, message, view=None):
+    kwargs = dict(embed=message, ephemeral=True)
     if view is not None:
         kwargs['view'] = view
     if interaction.response.is_done():
         await interaction.followup.send(**kwargs)
-    else:
+        return
+    try:
         await interaction.response.send_message(**kwargs)
+    except discord.HTTPException as error:
+        if error.code != 40060:
+            raise
+        await interaction.followup.send(**kwargs)
+
+
+async def reply(interaction, title, description='', view=None):
+    await send_embed(interaction, embed(title, description), view)
+
+
+async def report_error(interaction):
+    try:
+        await reply(interaction, 'Unable to complete action', 'Please try again or contact staff.')
+    except discord.HTTPException:
+        log.exception('Could not deliver interaction error')
 
 
 def valid_username(value):
@@ -31,13 +47,13 @@ def valid_username(value):
 class SafeView(discord.ui.View):
     async def on_error(self, interaction, error, item):
         log.error('View action failed', exc_info=(type(error), error, error.__traceback__))
-        await reply(interaction, 'Unable to complete action', 'Please try again or contact staff.')
+        await report_error(interaction)
 
 
 class SafeModal(discord.ui.Modal):
     async def on_error(self, interaction, error):
         log.error('Modal failed', exc_info=(type(error), error, error.__traceback__))
-        await reply(interaction, 'Unable to complete action', 'Please try again or contact staff.')
+        await report_error(interaction)
 
 
 class ApplicationModal(SafeModal):
@@ -47,7 +63,8 @@ class ApplicationModal(SafeModal):
         self.username = discord.ui.TextInput(label=tr(language, 'username'), max_length=100)
         self.patrol = discord.ui.TextInput(label=tr(language, 'patrol'), max_length=300)
         self.experience = discord.ui.TextInput(label=tr(language, 'experience'), style=discord.TextStyle.paragraph, max_length=600)
-        for item in (self.username, self.patrol, self.experience):
+        items = (self.username, self.patrol, self.experience) if bot.extra_questions else (self.username,)
+        for item in items:
             self.add_item(item)
 
     async def on_submit(self, interaction):
@@ -56,7 +73,7 @@ class ApplicationModal(SafeModal):
         if not valid_username(name):
             await reply(interaction, tr(self.language, 'error'), tr(self.language, 'invalid'))
             return
-        if not str(self.patrol).strip() or not str(self.experience).strip():
+        if self.bot.extra_questions and (not str(self.patrol).strip() or not str(self.experience).strip()):
             await reply(interaction, tr(self.language, 'error'), tr(self.language, 'retry'))
             return
         async with self.bot.lock:
@@ -118,7 +135,7 @@ class VerifyView(SafeView):
         if not row:
             return await reply(interaction, tr(language, 'status'), tr(language, 'none'))
         view = ApplicantView(self.bot, row) if row['status'] == 'pending' else None
-        await interaction.response.send_message(embed=self.bot.applicant_embed(row), view=view, ephemeral=True)
+        await send_embed(interaction, self.bot.applicant_embed(row), view)
 
 
 class ApplicantView(SafeView):
@@ -183,17 +200,25 @@ class TemplateView(SafeView):
 
 
 class ReviewView(SafeView):
-    def __init__(self, bot):
+    def __init__(self, bot, status=None):
         super().__init__(timeout=None)
         self.bot = bot
+        if status is not None:
+            for item in self.children:
+                if item.custom_id == 'sas:undo:v2':
+                    item.disabled = status not in ('accepted', 'rejected')
+                elif item.custom_id == 'sas:revoke:v2':
+                    item.disabled = status != 'accepted'
+                else:
+                    item.disabled = status != 'pending'
 
     async def row(self, interaction):
         if not self.bot.staff_context(interaction):
-            await reply(interaction, 'Not allowed', 'Only High-Rank staff may use this in verify-check.')
+            await reply(interaction, 'Not allowed', 'Only administrators or High-Rank staff may use this in verify-check.')
             return None
         row = self.bot.db.by_message(interaction.message.id)
-        if not row or row['user_id'] == interaction.user.id:
-            await reply(interaction, 'Not allowed', 'Application missing or self-review attempted.')
+        if not row:
+            await reply(interaction, 'Not allowed', 'This application could not be found.')
             return None
         return row
 
@@ -201,7 +226,7 @@ class ReviewView(SafeView):
     async def accept(self, interaction, button):
         row = await self.row(interaction)
         if row:
-            await interaction.response.send_modal(ActionModal(self.bot, row, 'accepted'))
+            await self.bot.apply_action(interaction, row, 'accepted')
 
     @discord.ui.button(label='Reject', style=discord.ButtonStyle.danger, custom_id='sas:reject:v1')
     async def reject(self, interaction, button):
@@ -232,3 +257,9 @@ class ReviewView(SafeView):
         row = await self.row(interaction)
         if row:
             await interaction.response.send_modal(ActionModal(self.bot, row, 'revoked'))
+
+    @discord.ui.button(label='Accept with note', custom_id='sas:accept-note:v3', row=1)
+    async def accept_note(self, interaction, button):
+        row = await self.row(interaction)
+        if row:
+            await interaction.response.send_modal(ActionModal(self.bot, row, 'accepted'))

@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import discord
 from discord.webhook.async_ import async_context
 
-from views import SafeView, reply
+from views import SafeView, VerifyView, reply
 
 
 class ReplyTests(unittest.IsolatedAsyncioTestCase):
@@ -57,3 +57,41 @@ class ReplyTests(unittest.IsolatedAsyncioTestCase):
         self.interaction.response.send_message.assert_awaited_once()
         self.assertNotIn('view', self.interaction.response.send_message.call_args.kwargs)
         self.adapter.execute_webhook.assert_not_awaited()
+
+    async def test_acknowledged_initial_response_falls_back_to_followup(self):
+        self.interaction.response.is_done.return_value = False
+        self.interaction.response.send_message.side_effect = discord.HTTPException(
+            MagicMock(status=400, reason='Bad Request'), {'code': 40060, 'message': 'Already acknowledged'})
+        await reply(self.interaction, 'Saved')
+        self.adapter.execute_webhook.assert_awaited_once()
+
+    async def test_finished_status_uses_real_initial_response_validation(self):
+        bot = MagicMock()
+        bot.public_context.return_value = True
+        bot.db.latest.return_value = {'status': 'accepted', 'language': 'en'}
+        bot.applicant_embed.return_value = discord.Embed(title='Accepted')
+        self.interaction._state = self.state
+        self.interaction._session = MagicMock()
+        self.interaction.type = discord.InteractionType.component
+        self.interaction.response = discord.InteractionResponse(self.interaction)
+        self.adapter.create_interaction_response = AsyncMock(return_value={})
+        with patch('discord.interactions.InteractionCallbackResponse'):
+            await VerifyView(bot).status.callback(self.interaction)
+        self.assertTrue(self.interaction.response.is_done())
+        self.adapter.create_interaction_response.assert_awaited_once()
+        self.adapter.execute_webhook.assert_not_awaited()
+
+    async def test_pending_status_preserves_buttons_with_real_response(self):
+        bot = MagicMock()
+        bot.public_context.return_value = True
+        bot.db.latest.return_value = {'id': 1, 'status': 'pending', 'language': 'en', 'question': None}
+        bot.applicant_embed.return_value = discord.Embed(title='Pending')
+        self.interaction._state = self.state
+        self.interaction._session = MagicMock()
+        self.interaction.type = discord.InteractionType.component
+        self.interaction.response = discord.InteractionResponse(self.interaction)
+        self.adapter.create_interaction_response = AsyncMock(return_value={})
+        with patch('discord.interactions.InteractionCallbackResponse'):
+            await VerifyView(bot).status.callback(self.interaction)
+        params = self.adapter.create_interaction_response.call_args.kwargs['params']
+        self.assertEqual(params.payload['data']['components'][0]['components'][0]['label'], 'Cancel application')

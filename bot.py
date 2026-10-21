@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 
 from database import Database
 from language import tr
+from time_utils import zurich_time, ZurichFormatter
 from views import VerifyView, ReviewView, embed, reply
 
 load_dotenv()
@@ -37,6 +38,7 @@ class VerificationBot(discord.Client):
         self.db = Database(os.getenv('DATABASE_PATH', 'data/verification.json'))
         if self.db.setting('queue_limit') is None:
             self.db.set_setting('queue_limit', max(0, int(os.getenv('QUEUE_LIMIT', '40'))))
+        self.extra_questions = os.getenv('EXTRA_QUESTIONS', 'false').lower() == 'true'
         self.lock = asyncio.Lock()
         self.guild = None
         self.configured = False
@@ -85,15 +87,18 @@ class VerificationBot(discord.Client):
         return bool(self.configured and self.guild and interaction.guild_id == self.guild.id
                     and interaction.channel_id == self.ids['REVIEW_CHANNEL_ID']
                     and isinstance(interaction.user, discord.Member)
-                    and any(r.id == self.ids['STAFF_ROLE_ID'] for r in interaction.user.roles))
+                    and self.is_reviewer(interaction.user))
+
+    def is_reviewer(self, member):
+        return member.guild_permissions.administrator is True or any(r.id == self.ids['STAFF_ROLE_ID'] for r in member.roles)
 
     async def staff_allowed(self, interaction):
         if not self.configured or interaction.guild_id != self.guild.id or interaction.channel_id != self.ids['REVIEW_CHANNEL_ID']:
             await reply(interaction, 'Not allowed', 'Use this action in verify-check.')
             return False
         member = await self.guild.fetch_member(interaction.user.id)
-        if not any(r.id == self.ids['STAFF_ROLE_ID'] for r in member.roles):
-            await reply(interaction, 'Not allowed', 'Only the configured High-Rank role may review applications.')
+        if not self.is_reviewer(member):
+            await reply(interaction, 'Not allowed', 'Only administrators or High-Rank staff may review applications.')
             return False
         return True
 
@@ -257,7 +262,7 @@ class VerificationBot(discord.Client):
     def review_embed(self, row):
         result = embed(f"Verification {row['id']} - {row['status'].title()}", f"Applicant: <@{row['user_id']}>\nDiscord ID: {row['user_id']}")
         for name, value in [('Game username', row['username']), ('Language', row['language']),
-                            ('Submitted UTC', row['created_at']), ('Claimed by', row['claimed_by']),
+                            ('Submitted (Zurich)', zurich_time(row['created_at'])), ('Claimed by', row['claimed_by']),
                             ('Rules agreed', row['rules']), ('Patrol availability', row['answers'].get('patrol')),
                             ('Experience', row['answers'].get('experience')), ('Staff question', row['question']),
                             ('Applicant answer', row['answer']), ('Reason / note', row['reason']),
@@ -281,30 +286,72 @@ class VerificationBot(discord.Client):
             except discord.NotFound:
                 pass
         if message:
-            await message.edit(embed=self.review_embed(row), view=ReviewView(self))
+            await message.edit(embed=self.review_embed(row), view=ReviewView(self, row['status']))
         else:
-            message = await self.review_channel.send(embed=self.review_embed(row), view=ReviewView(self))
+            message = await self.review_channel.send(embed=self.review_embed(row), view=ReviewView(self, row['status']))
         self.db.update(application_id, message_id=message.id, review_done=1)
 
     async def sync_roles(self, state):
         if state['guild_id'] != self.guild.id or not state['dirty']:
             return
         member = await self.guild.fetch_member(state['user_id'])
-        grant = 'MEMBER_ROLE_ID' if state['verified'] else 'PROGRESS_ROLE_ID'
-        remove = 'PROGRESS_ROLE_ID' if state['verified'] else 'MEMBER_ROLE_ID'
-        await member.add_roles(self.guild.get_role(self.ids[grant]), reason='Verification state update')
-        await member.remove_roles(self.guild.get_role(self.ids[remove]), reason='Verification state update')
-        self.db.roles_applied(self.guild.id, state['user_id'])
+        grant = self.ids['MEMBER_ROLE_ID' if state['verified'] else 'PROGRESS_ROLE_ID']
+        remove = self.ids['PROGRESS_ROLE_ID' if state['verified'] else 'MEMBER_ROLE_ID']
+        before = {role.id for role in member.roles}
+        if grant in before and remove not in before:
+            self.db.roles_applied(self.guild.id, state['user_id'])
+            return
+        failure = None
+        try:
+            if grant not in before:
+                await member.add_roles(self.guild.get_role(grant), reason='Verification state update')
+            if remove in before:
+                await member.remove_roles(self.guild.get_role(remove), reason='Verification state update')
+        except discord.HTTPException as error:
+            failure = error
+        current = await self.guild.fetch_member(state['user_id'])
+        after = {role.id for role in current.roles}
+        added = {grant} if grant not in before and grant in after else set()
+        removed = {remove} if remove in before and remove not in after else set()
+        self.db.record_role_changes(self.guild.id, state['user_id'], added, removed)
+        if grant in after and remove not in after:
+            self.db.roles_applied(self.guild.id, state['user_id'])
+        else:
+            log.warning('Discord has not confirmed the intended roles for %s; will retry', state['user_id'])
+        if failure:
+            raise failure
+
+    def audit_embed(self, event, row):
+        titles = {'submitted': 'Application submitted', 'accepted': 'Application accepted',
+                  'rejected': 'Application rejected', 'cancelled': 'Application withdrawn',
+                  'revoked': 'Verification revoked', 'undo': 'Decision reopened', 'claim': 'Application claimed',
+                  'release': 'Claim released', 'question': 'Information requested', 'answer': 'Applicant replied',
+                  'roles': 'Roles updated', 'configuration': 'Verification settings changed'}
+        result = embed(titles.get(event['action'], 'Verification updated'))
+        user_id = row['user_id'] if row else event.get('subject_user_id')
+        if user_id:
+            result.add_field(name='Member', value=f'<@{user_id}>', inline=False)
+        if row:
+            result.add_field(name='Application', value=str(row['id']))
+        if event['action'] == 'roles':
+            for name, key in (('Added', 'added'), ('Removed', 'removed')):
+                if event.get(key):
+                    result.add_field(name=name, value=' '.join(f'<@&{role_id}>' for role_id in event[key]), inline=False)
+        if event['detail']:
+            result.add_field(name='Details', value=safe(event['detail'], 1024), inline=False)
+        result.add_field(name='By', value=f"<@{event['actor']}>" if event['actor'] else 'Bot')
+        result.add_field(name='Time (Zurich)', value=zurich_time(event['at']), inline=False)
+        result.set_footer(text=f"Event {event['id']}")
+        return result
 
     async def deliver_event(self, event):
         row = self.db.get(event['application_id']) if event['application_id'] else None
-        if row and row['guild_id'] != self.guild.id:
+        if (row and row['guild_id'] != self.guild.id) or event.get('guild_id', self.guild.id) != self.guild.id:
             return
         action = event['action']
         if not event['audit_done']:
             try:
-                await self.log_channel.send(embed=embed(f"Verification event {event['id']}: {action}",
-                    f"Application: {event['application_id']}\nApplicant: {row['user_id'] if row else '-'}\nActor: {event['actor'] or 'Bot'}\nUTC: {event['at']}\n{safe(event['detail'], 1800)}"))
+                await self.log_channel.send(embed=self.audit_embed(event, row))
                 self.db.event_done(event['id'], 'audit_done')
             except discord.HTTPException:
                 log.exception('Audit delivery failed; will retry')
@@ -409,7 +456,9 @@ class VerificationBot(discord.Client):
 
 
 def main():
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
+    handler = logging.StreamHandler()
+    handler.setFormatter(ZurichFormatter('%(asctime)s %(levelname)s %(name)s: %(message)s'))
+    logging.basicConfig(level=logging.INFO, handlers=[handler], force=True)
     token = os.getenv('DISCORD_TOKEN', '').strip()
     if not token or token == 'replace_with_your_bot_token':
         raise SystemExit('Set DISCORD_TOKEN in .env first. See README.md.')

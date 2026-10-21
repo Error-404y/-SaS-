@@ -82,8 +82,17 @@ class BotFixture:
             self.bot = VerificationBot()
         self.bot.guild = MagicMock(id=1)
         self.member = MagicMock()
-        self.member.add_roles = AsyncMock()
-        self.member.remove_roles = AsyncMock()
+        self.member.roles = [MagicMock(id=self.bot.ids['PROGRESS_ROLE_ID'])]
+        self.member.guild_permissions.administrator = False
+        async def add_role(role, **kwargs):
+            if not any(r.id == role for r in self.member.roles):
+                self.member.roles.append(MagicMock(id=role))
+        async def remove_role(role, **kwargs):
+            self.member.roles = [r for r in self.member.roles if r.id != role]
+        self.add_role = add_role
+        self.remove_role = remove_role
+        self.member.add_roles = AsyncMock(side_effect=add_role)
+        self.member.remove_roles = AsyncMock(side_effect=remove_role)
         self.bot.guild.fetch_member = AsyncMock(return_value=self.member)
         self.bot.log_channel = MagicMock()
         self.bot.log_channel.send = AsyncMock()
@@ -121,7 +130,8 @@ class BotTests(BotFixture, unittest.IsolatedAsyncioTestCase):
         row = self.bot.db.create(1, 2, 'Player')
         self.bot.db.decide(row['id'], 3, 'rejected', 'Wrong username')
         await self.bot.process(row['id'])
-        self.assertEqual(self.member.add_roles.call_args.args[0], self.bot.ids['PROGRESS_ROLE_ID'])
+        self.member.add_roles.assert_not_awaited()
+        self.member.remove_roles.assert_not_awaited()
         self.assertIn('Wrong username', self.user.send.call_args.kwargs['embed'].description)
 
     async def test_closed_dms_do_not_block_acceptance(self):
@@ -141,7 +151,7 @@ class BotTests(BotFixture, unittest.IsolatedAsyncioTestCase):
         self.bot.db.decide(row['id'], 3, 'accepted')
         await self.bot.try_process(row['id'])
         self.assertEqual(self.bot.db.get(row['id'])['roles_done'], 0)
-        self.member.remove_roles.side_effect = None
+        self.member.remove_roles.side_effect = self.remove_role
         await self.bot.process(row['id'])
         self.assertEqual(self.bot.db.get(row['id'])['roles_done'], 1)
 

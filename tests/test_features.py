@@ -111,9 +111,7 @@ class TransitionTests(unittest.TestCase):
         self.act('cancelled', 2)
         self.assertEqual(self.db.duplicates(other), [])
 
-    def test_self_review_and_blank_reasons_are_rejected(self):
-        with self.assertRaises(ValueError):
-            self.act('accepted', 2)
+    def test_blank_reasons_are_rejected(self):
         for action in ('rejected', 'question'):
             with self.assertRaises(ValueError):
                 self.act(action, detail='  ')
@@ -140,6 +138,29 @@ class TransitionTests(unittest.TestCase):
         for value in ('', '   ', 'x' * 101, 'test\nname', 'https://example.com', '<@123>', 'name\u200b'):
             self.assertFalse(valid_username(value))
 
+    def test_unchanged_claim_question_and_settings_do_not_create_events(self):
+        self.act('claim')
+        before = len(self.db.events())
+        self.act('claim')
+        self.assertEqual(len(self.db.events()), before)
+        self.act('question', detail='Your timezone?')
+        before = len(self.db.events())
+        self.act('question', detail='Your timezone?')
+        self.assertEqual(len(self.db.events()), before)
+        self.db.configure(3, False, '', 40)
+        before = len(self.db.events())
+        self.db.configure(3, False, '', 40)
+        self.assertEqual(len(self.db.events()), before)
+
+    def test_unconfirmed_legacy_role_logs_are_not_replayed(self):
+        data = json.loads(Path(self.path).read_text())
+        data['events'].append(dict(id=2, application_id=1, action='roles', actor=0,
+            detail='Old unchecked role message', at='2026-10-21 19:36:32', audit_done=False, dm_done=False, revision=0))
+        Path(self.path).write_text(json.dumps(data))
+        restored = Database(self.path)
+        self.assertTrue(restored.events()[1]['audit_done'])
+        self.assertEqual(restored.events()[1]['detail'], 'Old unchecked role message')
+
 
 class WorkflowTests(test_bot.BotFixture, unittest.IsolatedAsyncioTestCase):
     async def test_undo_after_partial_acceptance_restores_progress(self):
@@ -148,9 +169,9 @@ class WorkflowTests(test_bot.BotFixture, unittest.IsolatedAsyncioTestCase):
         self.member.remove_roles.side_effect = discord.Forbidden(MagicMock(status=403, reason='Forbidden'), 'Denied')
         await self.bot.process(row['id'])
         self.bot.db.transition(row['id'], 3, 'undo', 1, 'Mistake')
-        self.member.remove_roles.side_effect = None
+        self.member.remove_roles.side_effect = self.remove_role
         await self.bot.process(row['id'])
-        self.assertEqual(self.member.add_roles.call_args.args[0], self.bot.ids['PROGRESS_ROLE_ID'])
+        self.assertTrue(any(r.id == self.bot.ids['PROGRESS_ROLE_ID'] for r in self.member.roles))
         self.assertEqual(self.member.remove_roles.call_args.args[0], self.bot.ids['MEMBER_ROLE_ID'])
         messages = [c.kwargs['embed'].description for c in self.user.send.call_args_list]
         self.assertFalse(any('now have the Member role' in text for text in messages))
@@ -192,6 +213,7 @@ class WorkflowTests(test_bot.BotFixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.member.add_roles.call_args.args[0], self.bot.ids['MEMBER_ROLE_ID'])
 
     async def test_rules_and_questions_fit_discord_forms(self):
+        self.bot.extra_questions = True
         modal = ApplicationModal(self.bot, 'de', 'Rules')
         self.assertEqual(len(modal.children), 3)
         self.assertTrue(all(item.required for item in modal.children))

@@ -128,6 +128,9 @@ class Database:
     def _upgrade(self):
         self.data.setdefault('events', [])
         self.data.setdefault('members', {})
+        for event in self.data['events']:
+            if event['action'] == 'roles' and not event.get('confirmed'):
+                event['audit_done'] = True
         for row in self.data['applications'].values():
             defaults = dict(language='en', answers={}, rules=None, revision=0,
                             claimed_by=None, question=None, answer=None, note=None)
@@ -176,8 +179,6 @@ class Database:
         if action in ('cancelled', 'answer'):
             if actor != row['user_id']:
                 raise ValueError('Only the applicant can do this.')
-        elif actor == row['user_id']:
-            raise ValueError('You cannot review your own application.')
         if action in ('claim', 'release', 'question', 'accepted', 'rejected', 'cancelled', 'answer'):
             if row['status'] != 'pending':
                 raise ValueError('This application is no longer pending.')
@@ -186,12 +187,18 @@ class Database:
         if action == 'claim':
             if row['claimed_by'] not in (None, actor):
                 raise ValueError('Another staff member has claimed this application.')
+            if row['claimed_by'] == actor:
+                return deepcopy(row)
             row['claimed_by'] = actor
         elif action == 'release':
+            if row['claimed_by'] is None:
+                return deepcopy(row)
             row['claimed_by'] = None
         elif action == 'question':
             if not detail.strip():
                 raise ValueError('A question is required.')
+            if row['question'] == detail and row['answer'] is None and row['claimed_by'] == actor:
+                return deepcopy(row)
             row.update(question=detail, answer=None, claimed_by=actor)
         elif action == 'answer':
             if not row['question'] or row['answer'] is not None or not detail.strip():
@@ -263,9 +270,6 @@ class Database:
         if row:
             data['applications'][str(row['id'])]['roles_done'] = 1
             data['applications'][str(row['id'])]['review_done'] = 0
-        detail = ('Member granted; Verify-Progress removed' if data['members'][f'{guild_id}:{user_id}']['verified']
-                  else 'Verify-Progress granted; Member removed')
-        self._event(data, row['id'] if row else None, 'roles', 0, f'User {user_id}: {detail}')
         self._save(data)
 
     def configure(self, actor, paused, reason, queue_limit):
@@ -274,6 +278,8 @@ class Database:
         if paused and not reason.strip():
             raise ValueError('Provide an explanation when pausing applications.')
         data = deepcopy(self.data)
+        if all(data['settings'].get(k) == v for k, v in dict(paused=paused, pause_reason=reason, queue_limit=queue_limit).items()):
+            return
         data['settings'].update(paused=paused, pause_reason=reason, queue_limit=queue_limit)
         self._event(data, None, 'configuration', actor, f'Paused: {paused}; limit: {queue_limit}; {reason}')
         self._save(data)
@@ -302,3 +308,13 @@ class Database:
                 raise ValueError('Invalid application preferences')
             if not isinstance(row['answers'], dict) or not isinstance(row['username'], str):
                 raise ValueError('Invalid application answers')
+
+    def record_role_changes(self, guild_id, user_id, added, removed):
+        if not added and not removed:
+            return
+        data = deepcopy(self.data)
+        row = self.latest(guild_id, user_id)
+        self._event(data, row['id'] if row else None, 'roles', 0)
+        data['events'][-1].update(confirmed=True, guild_id=guild_id, subject_user_id=user_id,
+                                  added=sorted(added), removed=sorted(removed))
+        self._save(data)
