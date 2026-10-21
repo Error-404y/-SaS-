@@ -1,5 +1,6 @@
 import asyncio
 import os
+from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -12,7 +13,7 @@ from bot import VerificationBot, VerifyView, ReviewView
 class DatabaseTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
-        self.path = self.temp.name + '/test.sqlite3'
+        self.path = self.temp.name + '/test.json'
         self.db = Database(self.path)
 
     def tearDown(self):
@@ -43,10 +44,42 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(self.db.work()[0]['status'], 'accepted')
 
 
+    def test_failed_write_preserves_disk_and_memory(self):
+        row = self.db.create(1, 2, 'Player')
+        original = Path(self.path).read_bytes()
+        with patch('database.os.replace', side_effect=OSError('Disk error')):
+            with self.assertRaises(OSError):
+                self.db.decide(row['id'], 3, 'accepted')
+        self.assertEqual(Path(self.path).read_bytes(), original)
+        self.assertEqual(self.db.get(row['id'])['status'], 'pending')
+        self.assertEqual(list(Path(self.temp.name).glob('*.tmp')), [])
+
+    def test_invalid_file_is_not_overwritten(self):
+        Path(self.path).write_text('{broken')
+        with self.assertRaisesRegex(ValueError, 'has not been changed'):
+            Database(self.path)
+        self.assertEqual(Path(self.path).read_text(), '{broken')
+
+    def test_settings_and_delivery_state_survive_restart(self):
+        row = self.db.create(1, 2, 'Player')
+        self.db.set_setting('panel_message', 123)
+        self.db.update(row['id'], message_id=456, submission_dm='sent')
+        self.db.close()
+        self.db = Database(self.path)
+        self.assertEqual(self.db.setting('panel_message'), 123)
+        self.assertEqual(self.db.by_message(456)['submission_dm'], 'sent')
+        self.assertEqual(self.db.work(), [])
+
+    def test_returned_rows_do_not_mutate_saved_data(self):
+        row = self.db.create(1, 2, 'Player')
+        row['status'] = 'accepted'
+        self.assertEqual(self.db.get(row['id'])['status'], 'pending')
+
+
 class BotTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
-        with patch.dict(os.environ, {'DATABASE_PATH': self.temp.name + '/test.sqlite3'}):
+        with patch.dict(os.environ, {'DATABASE_PATH': self.temp.name + '/test.json'}):
             self.bot = VerificationBot()
         self.bot.guild = MagicMock(id=1)
         self.member = MagicMock()

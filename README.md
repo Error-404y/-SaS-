@@ -1,6 +1,6 @@
 # SaS Police Simulator verification bot
 
-Python 3.11+ Discord bot with SQLite storage. No paid database or external database server required.
+Python 3.11+ Discord bot with a local JSON data file. Suitable for a small community of around 40 users; no SQL, database installation or database server required.
 
 ## What it does
 
@@ -12,7 +12,7 @@ Python 3.11+ Discord bot with SQLite storage. No paid database or external datab
 - Reject opens a required explanation modal. The applicant receives the explanation and may reapply.
 - Acceptance gives **Member**, removes **Verify-Progress**, and sends an acceptance DM.
 - Sends submission DMs and ephemeral embed confirmations. Closed DMs do not cancel applications.
-- Keeps application history, reviewer, timestamps, reasons, message IDs and delivery state in SQLite.
+- Keeps application history, reviewer, timestamps, reasons, message IDs and delivery state in a local JSON file.
 - Buttons survive restarts; interrupted application delivery and accepted-role updates retry every 30 seconds.
 - Simultaneous reviews cannot overwrite a decision; only one pending application per user/server is allowed.
 
@@ -75,7 +75,7 @@ Copy-Item .env.example .env
 .\.venv\Scripts\python.exe bot.py
 ```
 
-SQLite is created automatically in `data/verification.sqlite3`. The bot logs startup errors with the relevant configuration/permission problem. When ready, the Verify panel appears automatically. Existing panels are reused; a deleted panel is replaced on the next restart. A bot token and a running host are required; installing the code alone does not keep the bot online.
+The local file `data/verification.json` is created automatically. Every change is saved immediately using a temporary file and atomic replacement to avoid partial writes. The bot logs startup errors with the relevant configuration/permission problem. When ready, the Verify panel appears automatically. Existing panels are reused; a deleted panel is replaced on the next restart. A bot token and a running host are required; installing the code alone does not keep the bot online.
 
 ## Docker (optional, for a server that stays online)
 
@@ -86,7 +86,7 @@ docker compose up -d --build
 docker compose logs -f
 ```
 
-The named volume retains SQLite across container replacement. Run only **one bot instance** against this database. Do not use `docker compose down -v` unless you intend to delete application data.
+The named volume retains the JSON data file across container replacement. Run only **one bot instance** against this file. Do not use `docker compose down -v` unless you intend to delete application data.
 
 ## Tests and live smoke test
 
@@ -94,7 +94,7 @@ The named volume retains SQLite across container replacement. Run only **one bot
 python -m unittest discover -s tests -v
 ```
 
-Automated tests use mocked Discord calls and a real temporary SQLite database. They cover duplicate applications, concurrent decision protection, persistent views, acceptance/rejection, closed DMs, role failure recovery and authorization. CI runs them on Python 3.11–3.13.
+Automated tests use mocked Discord calls and real temporary JSON files. They cover duplicate applications, concurrent decision protection, persistent views, acceptance/rejection, closed DMs, role failure recovery and authorization. CI runs them on Python 3.11–3.13.
 
 Before using with your community, test with a separate non-staff account:
 
@@ -111,7 +111,9 @@ Before using with your community, test with a separate non-staff account:
 - Keep the process running for join-role assignment. Joins while offline are not backfilled. Join-role permission failures are logged; correct the permission issue and assign that member's role manually.
 - If an accepted applicant leaves before roles are applied, the stored decision remains and role application retries when they return. Acceptance DM is sent only after role changes succeed.
 - An applicant who has already received their roles and later leaves/rejoins follows the verification flow again.
-- Discord and SQLite cannot share a transaction. A process crash immediately after sending a message but before saving its ID can result in a duplicate DM or staff message. An untracked duplicate review cannot change a decision. Keep one instance running.
-- Deleted pending staff messages are not automatically recreated. Restore access/review messages before deleting them; the database retains their application history. Restarting restores the public Verify panel if deleted.
-- Back up SQLite with the bot stopped (including `-wal`/`-shm` files if present), or use SQLite's backup API. Protect the database: it contains Discord IDs, game usernames and rejection reasons. Decide your own retention policy.
+- Discord and the local JSON file cannot be updated as one atomic operation. A process crash immediately after sending a message but before saving its ID can result in a duplicate DM or staff message. An untracked duplicate review cannot change a decision. Keep one instance running.
+- Deleted pending staff messages are not automatically recreated. Restore access/review messages before deleting them; the JSON file retains their application history. Restarting restores the public Verify panel if deleted.
+- Back up `data/verification.json` with the bot stopped. Restore it to the same path before restarting. Do not manually edit it while the bot is running. An invalid file stops startup instead of overwriting existing data. Protect the file: it contains Discord IDs, game usernames and rejection reasons. Decide your own retention policy.
 - Permission errors after startup are logged and application delivery is retried. Fix channel access or role hierarchy and wait for retry. A closed-DM result is recorded as blocked and is not repeatedly retried.
+
+If you previously ran the SQLite version, keep the old file as a backup. This version starts a new JSON store and does not automatically import old SQLite applications. Update `DATABASE_PATH` in any existing `.env` to `data/verification.json`.

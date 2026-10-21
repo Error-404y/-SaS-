@@ -4,7 +4,7 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
-      DATABASE_PATH: /app/data/verification.sqlite3
+      DATABASE_PATH: /app/data/verification.json
     volumes:
       - verification-data:/app/data
 volumes:
