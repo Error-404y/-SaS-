@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import tempfile
 import unittest
@@ -32,7 +33,13 @@ class StorageTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.db.decide(row['id'], 3, 'rejected', ' ')
         self.db.decide(row['id'], 3, 'rejected', 'Wrong username')
-        self.assertIsNotNone(self.db.create(1, 2, 'Correct name'))
+        with self.assertRaises(ValueError):
+            self.db.create(1, 2, 'Correct name')
+        later = (datetime.now(timezone.utc) + timedelta(minutes=11)).isoformat()
+        with patch('database.datetime') as clock:
+            clock.now.return_value = datetime.fromisoformat(later)
+            clock.fromisoformat = datetime.fromisoformat
+            self.assertIsNotNone(self.db.create(1, 2, 'Correct name'))
 
     def test_deleted_pending_request_can_be_resubmitted_after_restart(self):
         row = self.db.create(1, 2, 'Player')
@@ -112,3 +119,34 @@ class StorageTests(unittest.TestCase):
         row = self.db.create(1, 2, 'Player')
         row['status'] = 'accepted'
         self.assertEqual(self.db.get(row['id'])['status'], 'pending')
+
+    def test_cooldown_survives_deletion_restart_and_alternate_type(self):
+        row = self.db.create(1, 2, 'Player')
+        self.db.decide(row['id'], 3, 'rejected', 'Wrong name')
+        self.db.delete_review(row['id'])
+        restored = Database(self.path)
+        self.assertIsNotNone(restored.cooldown_until(1, 2))
+        with self.assertRaises(ValueError):
+            restored.create(1, 2, 'Other', 'allies')
+
+    def test_duplicate_normalization_across_types_excludes_self_and_pending(self):
+        row = self.db.create(1, 2, 'Player   ONE', 'allies')
+        self.db.decide(row['id'], 3, 'accepted')
+        self.assertEqual(self.db.duplicates(dict(guild_id=1, user_id=4, username='player one')), [])
+        self.db.finish_acceptance(row['id'])
+        self.assertEqual(self.db.duplicates(dict(guild_id=1, user_id=4, username='player one')), [2])
+        self.assertEqual(self.db.duplicates(row), [])
+        self.assertEqual(self.db.duplicates(dict(guild_id=99, user_id=4, username='player one')), [])
+
+    def test_version_two_upgrade_preserves_completed_nicknames(self):
+        row = self.db.create(1, 2, 'Player')
+        self.db.decide(row['id'], 3, 'accepted')
+        self.db.finish_acceptance(row['id'])
+        data = json.loads(self.path.read_text())
+        for field in ('kind', 'nickname_state', 'retry_after'):
+            del data['applications']['1'][field]
+        self.path.write_text(json.dumps(data))
+        restored = Database(self.path)
+        self.assertEqual(restored.get(1)['kind'], 'member')
+        self.assertEqual(restored.get(1)['nickname_state'], 'legacy')
+        self.assertTrue(restored.is_verified(1, 2))

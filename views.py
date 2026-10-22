@@ -7,7 +7,10 @@ log = logging.getLogger('verification')
 
 
 def embed(title, description=''):
-    return discord.Embed(title=title[:256], description=description[:4096], color=discord.Color.blurple())
+    result = discord.Embed(title=title[:256], description=description[:4096], color=0x243B53)
+    result.set_author(name='SaS / POLICE SIMULATOR')
+    result.set_footer(text='Verification service | Europe/Zurich')
+    return result
 
 
 async def send_embed(interaction, message, view=None):
@@ -56,12 +59,13 @@ class SafeModal(discord.ui.Modal):
 class ApplicationModal(SafeModal, title='Verify your account'):
     username = discord.ui.TextInput(label='Police Simulator username', max_length=100)
 
-    def __init__(self, bot):
-        super().__init__(timeout=300)
+    def __init__(self, bot, kind='member'):
+        super().__init__(timeout=300, title=f'Verify - {kind.title()}')
         self.bot = bot
+        self.kind = kind
 
     async def on_submit(self, interaction):
-        await self.bot.submit(interaction, str(self.username).strip())
+        await self.bot.submit(interaction, str(self.username).strip(), self.kind)
 
 
 class RejectModal(SafeModal, title='Reject application'):
@@ -80,17 +84,27 @@ class VerifyView(SafeView):
         super().__init__(timeout=None)
         self.bot = bot
 
-    @discord.ui.button(label='Verify', style=discord.ButtonStyle.success, custom_id='sas:verify:v1')
+    @discord.ui.button(label='Verify - Member', style=discord.ButtonStyle.primary, custom_id='sas:verify:v1')
     async def verify(self, interaction, button):
+        await self.open_application(interaction, 'member')
+
+    @discord.ui.button(label='Verify - Allies', style=discord.ButtonStyle.secondary, custom_id='sas:verify:allies:v1')
+    async def allies(self, interaction, button):
+        await self.open_application(interaction, 'allies')
+
+    async def open_application(self, interaction, kind):
         if not self.bot.public_context(interaction):
             return await reply(interaction, 'Not available', 'Use the verification channel.')
         if self.bot.db.is_verified(interaction.guild_id, interaction.user.id):
             return await reply(interaction, 'Already accepted', 'Your verification is accepted. Any remaining role update will finish automatically.')
-        if any(r.id == self.bot.ids['MEMBER_ROLE_ID'] for r in getattr(interaction.user, 'roles', [])):
-            return await reply(interaction, 'Already verified', 'You already have the Member role.')
+        if any(r.id in self.bot.verified_role_ids() for r in getattr(interaction.user, 'roles', [])):
+            return await reply(interaction, 'Already verified', 'You already have Member or Allies access.')
         if self.bot.db.pending(interaction.guild_id, interaction.user.id):
             return await reply(interaction, 'Application pending', 'Your request is already waiting for staff review.')
-        await interaction.response.send_modal(ApplicationModal(self.bot))
+        until = self.bot.db.cooldown_until(interaction.guild_id, interaction.user.id)
+        if until:
+            return await reply(interaction, 'Please wait before reapplying', f'You can submit another request <t:{int(until.timestamp())}:R>.')
+        await interaction.response.send_modal(ApplicationModal(self.bot, kind))
 
 
 class ReviewView(SafeView):
