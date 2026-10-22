@@ -22,6 +22,11 @@ class BotFixture:
         self.member = MagicMock(id=2)
         self.member.roles = [MagicMock(id=self.bot.ids['PROGRESS_ROLE_ID'])]
         self.member.guild_permissions.administrator = False
+        self.member.nick = None
+        async def edit_member(**kwargs):
+            self.member.nick = kwargs['nick']
+            return self.member
+        self.member.edit = AsyncMock(side_effect=edit_member)
         self.member.bot = False
         self.member.guild.id = 1
         self.role_ids = lambda: {r.id for r in self.member.roles}
@@ -85,7 +90,7 @@ class BotFixture:
 
 class WorkflowTests(BotFixture, unittest.IsolatedAsyncioTestCase):
     async def test_only_verify_and_accept_reject_controls_exist(self):
-        self.assertEqual([c.label for c in VerifyView(self.bot).children], ['Verify'])
+        self.assertEqual([c.label for c in VerifyView(self.bot).children], ['Verify - Member', 'Verify - Allies'])
         self.assertEqual([c.label for c in ReviewView(self.bot).children], ['Accept', 'Reject'])
         self.assertEqual(len(ApplicationModal(self.bot).children), 1)
         self.assertTrue(ReviewView(self.bot).is_persistent())
@@ -343,3 +348,87 @@ class WorkflowTests(BotFixture, unittest.IsolatedAsyncioTestCase):
         await self.bot.on_member_join(self.member)
         self.assertTrue(self.bot.db.get(application_id)['roles_done'])
         self.assertEqual(len(self.bot.db.histories()), 1)
+
+    async def test_allies_acceptance_nickname_and_history_survive_restart(self):
+        row = self.bot.db.create(1, 2, 'Ally Player', 'allies')
+        self.bot.db.decide(row['id'], 3, 'accepted')
+        self.bot.db = Database(self.bot.db.path)
+        await self.bot.process(row['id'])
+        await self.bot.recover()
+        self.assertIn(self.bot.ids['ALLIES_ROLE_ID'], self.role_ids())
+        self.assertNotIn(self.bot.ids['MEMBER_ROLE_ID'], self.role_ids())
+        self.assertNotIn(self.bot.ids['PROGRESS_ROLE_ID'], self.role_ids())
+        self.assertEqual(self.member.nick, 'Ally Player')
+        self.member.edit.assert_awaited_once()
+        self.assertIn('Allies added', str(self.bot.history_embed(self.bot.db.histories()[0]).to_dict()))
+        self.member.roles = []
+        await self.bot.on_member_join(self.member)
+        self.assertIn(self.bot.ids['ALLIES_ROLE_ID'], self.role_ids())
+        self.assertNotIn(self.bot.ids['MEMBER_ROLE_ID'], self.role_ids())
+
+    async def test_nickname_forbidden_does_not_block_acceptance_or_retry_forever(self):
+        self.member.edit.side_effect = self.denied()
+        identifier = self.accepted()
+        await self.bot.process(identifier)
+        await self.bot.recover()
+        self.member.edit.assert_awaited_once()
+        row = self.bot.db.get(identifier)
+        self.assertTrue(row['roles_done'])
+        self.assertEqual(row['nickname_state'], 'blocked')
+        self.assertEqual(row['decision_dm'], 'done')
+        self.assertIn('Could not change nickname', str(self.bot.review_embed(row).to_dict()))
+
+    async def test_long_game_name_kept_and_nickname_limited(self):
+        row = self.bot.db.create(1, 2, 'A' * 100)
+        self.bot.db.decide(row['id'], 3, 'accepted')
+        await self.bot.process(row['id'])
+        self.assertEqual(self.member.nick, 'A' * 32)
+        self.assertEqual(self.bot.db.get(row['id'])['username'], 'A' * 100)
+
+    async def test_nickname_transient_failure_retries_without_repeating_roles(self):
+        identifier = self.accepted()
+        original = self.member.edit.side_effect
+        self.member.edit.side_effect = discord.HTTPException(MagicMock(status=503, reason='Unavailable'), 'Retry')
+        await self.bot.process(identifier)
+        self.assertEqual(self.bot.db.get(identifier)['nickname_state'], 'pending')
+        self.member.edit.side_effect = original
+        await self.bot.process(identifier)
+        self.assertEqual(self.member.nick, 'Player')
+        self.member.add_roles.assert_awaited_once()
+
+    async def test_both_buttons_open_correct_modal(self):
+        for button, kind in ((VerifyView(self.bot).verify, 'member'), (VerifyView(self.bot).allies, 'allies')):
+            interaction = self.interaction(public=True)
+            await button.callback(interaction)
+            self.assertEqual(interaction.response.send_modal.call_args.args[0].kind, kind)
+
+    async def test_cooldown_blocks_both_button_and_open_modal_submission(self):
+        row = self.bot.db.create(1, 2, 'Player')
+        self.bot.db.decide(row['id'], 3, 'rejected', 'Check name')
+        self.bot.db = Database(self.bot.db.path)
+        for button in (VerifyView(self.bot).verify, VerifyView(self.bot).allies):
+            interaction = self.interaction(public=True)
+            await button.callback(interaction)
+            interaction.response.send_modal.assert_not_awaited()
+        await self.bot.submit(self.interaction(public=True), 'Another name', 'allies')
+        self.assertEqual(len(self.bot.db.applications()), 1)
+        self.member.add_roles.assert_not_awaited()
+
+    async def test_existing_allies_role_is_preserved_without_member_role(self):
+        self.member.roles = [MagicMock(id=self.bot.ids['ALLIES_ROLE_ID'])]
+        await self.bot.on_member_join(self.member)
+        await self.bot.submit(self.interaction(public=True), 'Player', 'member')
+        self.member.add_roles.assert_not_awaited()
+        self.member.remove_roles.assert_not_awaited()
+        self.assertEqual(self.bot.db.applications(), [])
+
+    async def test_duplicate_warning_refreshes_existing_pending_review(self):
+        other = self.bot.db.create(1, 3, 'player', 'allies')
+        await self.bot.sync_review(other['id'])
+        identifier = self.accepted()
+        await self.bot.process(identifier)
+        self.assertTrue(self.bot.db.get(other['id'])['review_dirty'])
+        result = self.bot.review_embed(self.bot.db.get(other['id']))
+        self.assertIn('DUPLICATE USERNAME', [f.name for f in result.fields])
+        self.assertEqual(self.bot.db.get(other['id'])['status'], 'pending')
+        self.assertLess(len(result), 6000)

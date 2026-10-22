@@ -19,6 +19,7 @@ DEFAULTS = {
     'VERIFY_CHANNEL_ID': 1562540152276910093,
     'STAFF_ROLE_ID': 1562535759276417065,
     'PROGRESS_ROLE_ID': 1562535216050864209,
+    'ALLIES_ROLE_ID': 1562903902662168587,
     'MEMBER_ROLE_ID': 1562535352290250842,
     'STAFF_CATEGORY_ID': 1562539595474927637,
     'REVIEW_CHANNEL_ID': 1562539651229683732,
@@ -36,7 +37,7 @@ class VerificationBot(discord.Client):
         intents.members = True
         super().__init__(intents=intents, allowed_mentions=discord.AllowedMentions.none())
         self.ids = {key: int(os.getenv(key, value)) for key, value in DEFAULTS.items()}
-        self.db = Database(os.getenv('DATABASE_PATH', 'data/verification.json'))
+        self.db = Database(os.getenv('DATABASE_PATH', 'data/verification.json'), os.getenv('REJECTION_COOLDOWN_SECONDS', '600'))
         self.lock = asyncio.Lock()
         self.guild = None
         self.configured = False
@@ -57,21 +58,32 @@ class VerificationBot(discord.Client):
                     and interaction.channel_id == self.ids['REVIEW_CHANNEL_ID']
                     and isinstance(interaction.user, discord.Member) and self.is_reviewer(interaction.user))
 
-    async def submit(self, interaction, username):
+    def verified_role_ids(self):
+        return {self.ids['MEMBER_ROLE_ID'], self.ids['ALLIES_ROLE_ID']}
+
+    def target_role(self, row):
+        return self.ids['ALLIES_ROLE_ID' if row.get('kind') == 'allies' else 'MEMBER_ROLE_ID']
+
+    async def submit(self, interaction, username, kind='member'):
         await interaction.response.defer(ephemeral=True, thinking=True)
         if not self.public_context(interaction):
             return await reply(interaction, 'Not available', 'Use the Verify button in the verification channel.')
+        if kind not in ('member', 'allies'):
+            return await reply(interaction, 'Invalid selection', 'Choose Member or Allies.')
         if not valid_username(username):
             return await reply(interaction, 'Invalid username', 'Enter your game username, without links or mentions.')
         async with self.lock:
             member = await self.guild.fetch_member(interaction.user.id)
-            if any(r.id == self.ids['MEMBER_ROLE_ID'] for r in member.roles) or self.db.is_verified(self.guild.id, member.id):
+            if any(r.id in self.verified_role_ids() for r in member.roles) or self.db.is_verified(self.guild.id, member.id):
                 await self.prepare_member(member)
                 return await reply(interaction, 'Already verified', 'You already have verified access.')
-            await self.prepare_member(member)
-            row = self.db.create(self.guild.id, member.id, username)
+            until = self.db.cooldown_until(self.guild.id, member.id)
+            if until:
+                return await reply(interaction, 'Please wait before reapplying', f'You can submit another request at {zurich_time(until.isoformat())}.')
+            row = self.db.create(self.guild.id, member.id, username, kind)
             if row is None:
                 return await reply(interaction, 'Application pending', 'Your request is already waiting for staff review.')
+            await self.attempt(self.prepare_member, member)
             await self.process(row['id'])
         await reply(interaction, 'Application submitted', 'Your request is saved. Please wait for staff to review it. If DMs are disabled, your request still counts.')
 
@@ -101,7 +113,11 @@ class VerificationBot(discord.Client):
         description = 'The applicant has been notified, or their DMs are unavailable.'
         if row['decision_dm'] == 'pending':
             description = 'The decision is saved. The remaining updates will retry automatically.'
+        duplicates = self.db.duplicates(row)
+        if duplicates:
+            description += '\n\nDuplicate game name on file for: ' + ', '.join(f'<@{identifier}>' for identifier in duplicates[:15])
         await reply(interaction, 'Accepted' if status == 'accepted' else 'Rejected', description)
+
     async def validate(self):
         self.verify_channel = await self.fetch_channel(self.ids['VERIFY_CHANNEL_ID'])
         self.review_channel = await self.fetch_channel(self.ids['REVIEW_CHANNEL_ID'])
@@ -116,13 +132,17 @@ class VerificationBot(discord.Client):
             permissions = channel.permissions_for(self.guild.me)
             if not all((permissions.view_channel, permissions.send_messages, permissions.embed_links, permissions.read_message_history)):
                 raise RuntimeError(f'Missing View Channel, Send Messages, Embed Links or Read Message History in {channel.name}.')
+        if len({self.ids[k] for k in ('PROGRESS_ROLE_ID', 'MEMBER_ROLE_ID', 'ALLIES_ROLE_ID')}) != 3:
+            raise RuntimeError('Progress, Member and Allies must be different roles.')
+        if not self.guild.me.guild_permissions.manage_nicknames:
+            log.warning('Manage Nicknames is missing; acceptance will work but nickname changes may fail.')
         roles = {role.id: role for role in await self.guild.fetch_roles()}
-        for key in ('STAFF_ROLE_ID', 'PROGRESS_ROLE_ID', 'MEMBER_ROLE_ID'):
+        for key in ('STAFF_ROLE_ID', 'PROGRESS_ROLE_ID', 'MEMBER_ROLE_ID', 'ALLIES_ROLE_ID'):
             if self.ids[key] not in roles:
                 raise RuntimeError(f'Role {key} does not exist.')
         if not self.guild.me.guild_permissions.manage_roles:
             raise RuntimeError('The bot needs Manage Roles permission.')
-        for key in ('PROGRESS_ROLE_ID', 'MEMBER_ROLE_ID'):
+        for key in ('PROGRESS_ROLE_ID', 'MEMBER_ROLE_ID', 'ALLIES_ROLE_ID'):
             role = roles[self.ids[key]]
             if role.managed or role.is_default() or role >= self.guild.me.top_role:
                 raise RuntimeError(f'Move the bot role above {role.name}; target roles must be ordinary roles.')
@@ -141,7 +161,11 @@ class VerificationBot(discord.Client):
             raise RuntimeError('The bot needs View Channel, Send Messages, Embed Links and Read Message History in verified-log.')
 
     async def ensure_panel(self):
-        panel = embed('Police Simulator verification', 'Click Verify and enter your in-game username. Staff will accept or reject your request.')
+        panel = embed('Your place in SaS starts here', 'Choose your verification type below and enter your **Police Simulator username**. Our staff will review your request.')
+        panel.add_field(name='CLAN MEMBERS', value=f"Choose **Verify - Member** to apply for <@&{self.ids['MEMBER_ROLE_ID']}> access.", inline=True)
+        panel.add_field(name='ALLIES', value=f"Choose **Verify - Allies** to apply for <@&{self.ids['ALLIES_ROLE_ID']}> access.", inline=True)
+        panel.add_field(name='WHAT HAPPENS NEXT', value='Submit your game name. Wait for staff review. Receive your result by DM.\nAfter approval, your server nickname is set to your game name (up to 32 characters).', inline=False)
+        panel.set_footer(text='One application at a time | Results by direct message')
         message_id = self.db.panel()
         if message_id:
             try:
@@ -179,16 +203,34 @@ class VerificationBot(discord.Client):
                 await self.close()
 
     def review_embed(self, row):
-        result = embed(f"Verification - {row['status'].title()}", f"<@{row['user_id']}>\n**Game username:** {safe(row['username'])}")
-        result.add_field(name='Submitted', value=zurich_time(row['created_at']), inline=False)
+        status = row['status']
+        colors = {'pending': 0xD69E2E, 'accepted': 0x258568, 'rejected': 0xBF4545, 'cancelled': 0x64748B}
+        result = embed(f"{row['kind'].title()} verification / {status.title()}",
+                       f"<@{row['user_id']}>\nApplication **{row['id']:04d}**")
+        result.color = colors.get(status, 0x64748B)
+        result.add_field(name='GAME USERNAME', value=safe(row['username']), inline=True)
+        result.add_field(name='ACCESS REQUESTED', value=f"<@&{self.target_role(row)}>", inline=True)
+        result.add_field(name='SUBMITTED / ZURICH', value=zurich_time(row['created_at']), inline=False)
+        duplicates = self.db.duplicates(row)
+        if duplicates:
+            names = ', '.join(f'<@{identifier}>' for identifier in duplicates[:15])
+            result.add_field(name='DUPLICATE USERNAME', value=f'This name is already registered to: {names}. Staff should check before accepting.', inline=False)
+        if status == 'pending':
+            result.add_field(name='STAFF REVIEW', value='Check the game name and requested access, then accept or reject below. Rejection requires a reason.', inline=False)
         if row['reviewer_id']:
-            result.add_field(name='Reviewed by', value=f"<@{row['reviewer_id']}>")
+            result.add_field(name='REVIEWED BY', value=f"<@{row['reviewer_id']}>")
         if row['decided_at']:
-            result.add_field(name='Decision time', value=zurich_time(row['decided_at']))
-        if row['status'] == 'rejected' and row['reason']:
-            result.add_field(name='Reason', value=safe(row['reason']), inline=False)
-        if row['status'] == 'accepted' and not row['roles_done']:
-            result.add_field(name='Roles', value='Updating roles. The bot will retry if necessary.', inline=False)
+            result.add_field(name='DECISION / ZURICH', value=zurich_time(row['decided_at']))
+        if status == 'rejected':
+            result.add_field(name='REASON', value=safe(row['reason']), inline=False)
+            if row.get('retry_after'):
+                result.add_field(name='CAN REAPPLY / ZURICH', value=zurich_time(row['retry_after']), inline=False)
+        if status == 'accepted':
+            result.add_field(name='ACCESS', value='Role update confirmed.' if row['roles_done'] else 'Updating roles. Unfinished changes retry automatically.', inline=False)
+            notes = {'done': f"Set to **{safe(row['username'][:32])}**.",
+                     'blocked': 'Could not change nickname. Staff can set it manually; check Manage Nicknames and role hierarchy.',
+                     'pending': 'Nickname update pending.', 'legacy': 'Existing verification; nickname preserved.'}
+            result.add_field(name='SERVER NICKNAME', value=notes[row['nickname_state']], inline=False)
         result.set_footer(text=f"Application {row['id']}")
         return result
 
@@ -230,7 +272,7 @@ class VerificationBot(discord.Client):
             return
         member = await self.guild.fetch_member(row['user_id'])
         before = {r.id for r in member.roles}
-        member_role = self.ids['MEMBER_ROLE_ID']
+        member_role = self.target_role(row)
         progress_role = self.ids['PROGRESS_ROLE_ID']
         if not row['transfer_started']:
             self.db.update(application_id, transfer_started=True,
@@ -252,6 +294,27 @@ class VerificationBot(discord.Client):
         else:
             log.warning('Roles not yet confirmed for application %s; will retry', application_id)
 
+    async def apply_nickname(self, application_id):
+        row = self.db.get(application_id)
+        if row['status'] != 'accepted' or not row['roles_done'] or row['nickname_state'] != 'pending':
+            return
+        member = await self.guild.fetch_member(row['user_id'])
+        nickname = row['username'][:32]
+        state = 'done'
+        try:
+            if member.nick != nickname:
+                await member.edit(nick=nickname, reason='Verification accepted')
+            current = await self.guild.fetch_member(row['user_id'])
+            if current.nick != nickname:
+                return
+        except discord.Forbidden:
+            state = 'blocked'
+        except discord.HTTPException as error:
+            if error.status != 400:
+                raise
+            state = 'blocked'
+        self.db.update(application_id, nickname_state=state, review_dirty=not row['review_deleted'])
+
     async def prepare_member(self, member):
         unfinished = next((row for row in self.db.applications() if row['guild_id'] == self.guild.id
                            and row['user_id'] == member.id and row['status'] == 'accepted' and not row['roles_done']), None)
@@ -259,11 +322,11 @@ class VerificationBot(discord.Client):
             await self.apply_acceptance(unfinished['id'])
             return
         roles = {r.id for r in member.roles}
-        member_role = self.ids['MEMBER_ROLE_ID']
+        member_role = self.target_role({'kind': self.db.verified_kind(self.guild.id, member.id)})
         progress_role = self.ids['PROGRESS_ROLE_ID']
-        verified = member_role in roles or self.db.is_verified(self.guild.id, member.id)
+        verified = bool(roles & self.verified_role_ids()) or self.db.is_verified(self.guild.id, member.id)
         if verified:
-            if member_role not in roles:
+            if not roles & self.verified_role_ids():
                 await member.add_roles(self.guild.get_role(member_role), reason='Restore verified access')
             if progress_role in roles:
                 await member.remove_roles(self.guild.get_role(progress_role), reason='Already verified')
@@ -279,27 +342,33 @@ class VerificationBot(discord.Client):
         elif row['status'] == 'accepted':
             if not row['roles_done']:
                 return
-            text = 'Your verification has been accepted. You now have the Member role. Welcome!'
+            text = f"Your verification has been accepted. You now have **{row['kind'].title()}** access. Welcome to SaS!"
         elif row['status'] == 'rejected':
-            text = f"Your verification was rejected.\n\n**Reason:** {safe(row['reason'])}\n\nYou may submit again."
+            text = f"Your verification was rejected.\n\n**Reason:** {safe(row['reason'])}\n\nYou can reapply at {zurich_time(row['retry_after']) if row.get('retry_after') else 'any time'}."
         elif row['status'] == 'cancelled':
             text = 'Your pending request was removed by staff. You may submit a new request.'
         else:
             return
         try:
             user = await self.fetch_user(row['user_id'])
-            await user.send(embed=embed('Police Simulator verification', text))
+            message = embed('Application submitted' if field == 'submission_dm' else f"Verification {row['status']}", text)
+            message.add_field(name='GAME USERNAME', value=safe(row['username']))
+            message.add_field(name='VERIFICATION TYPE', value=row['kind'].title())
+            message.color = 0x258568 if row['status'] == 'accepted' else 0x243B53
+            message.set_footer(text=f"Application {row['id']} | SaS verification")
+            await user.send(embed=message)
         except (discord.Forbidden, discord.NotFound):
             self.db.update(application_id, **{field: 'blocked'})
         else:
             self.db.update(application_id, **{field: 'done'})
 
     def history_embed(self, history):
-        result = embed('Verification history', f"<@{history['user_id']}>\nVerify-Process removed and Member added.")
+        result = embed('Verification history', f"<@{history['user_id']}>\nConfirmed verification role transfers.")
+        result.color = 0x258568
         entries = history['entries'][-8:]
         for entry in entries:
             result.add_field(name=zurich_time(entry['at']),
-                value=f"**Username:** {safe(entry['username'], 200)}\n**Accepted by:** <@{entry['reviewer_id']}>", inline=False)
+                value=f"**Username:** {safe(entry['username'], 200)}\n**Accepted by:** <@{entry['reviewer_id']}>\n**Roles:** Verify-Process removed; {entry.get('kind', 'member').title()} added.", inline=False)
         result.set_footer(text=f"Verification history {history['user_id']} | {len(history['entries'])} completed")
         return result
 
@@ -337,6 +406,7 @@ class VerificationBot(discord.Client):
             return
         await self.attempt(self.sync_review, application_id)
         await self.attempt(self.apply_acceptance, application_id)
+        await self.attempt(self.apply_nickname, application_id)
         await self.attempt(self.sync_review, application_id)
         await self.attempt(self.send_dm, application_id, 'submission_dm')
         await self.attempt(self.send_dm, application_id, 'decision_dm')

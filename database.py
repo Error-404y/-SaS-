@@ -1,9 +1,10 @@
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
 import tempfile
+import unicodedata
 
 
 def timestamp():
@@ -15,7 +16,8 @@ def user_key(guild_id, user_id):
 
 
 class Database:
-    def __init__(self, path):
+    def __init__(self, path, cooldown_seconds=600):
+        self.cooldown_seconds = max(0, int(cooldown_seconds))
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if not self.path.exists():
@@ -27,6 +29,10 @@ class Database:
             migrated = data.get('version') == 1
             if migrated:
                 data = self._migrate(data)
+            for row in data['applications'].values():
+                row.setdefault('kind', 'member')
+                row.setdefault('nickname_state', 'legacy' if row['status'] == 'accepted' and row['roles_done'] else 'pending')
+                row.setdefault('retry_after', None)
             self._validate(data)
         except (ValueError, KeyError, TypeError, AttributeError, UnicodeError) as error:
             raise ValueError(f'Invalid data in {self.path}; the file was not changed.') from error
@@ -81,6 +87,10 @@ class Database:
                 raise ValueError('Incomplete application')
             if type(row['id']) is not int or str(row['id']) != key or not 0 < row['id'] < data['next_id']:
                 raise ValueError('Invalid application ID')
+            if row['kind'] not in ('member', 'allies') or row['nickname_state'] not in ('pending', 'done', 'blocked', 'legacy'):
+                raise ValueError('Invalid verification type or nickname state')
+            if row['retry_after'] is not None:
+                datetime.fromisoformat(row['retry_after'])
             if row['status'] not in ('pending', 'accepted', 'rejected', 'cancelled', 'revoked'):
                 raise ValueError('Invalid application status')
             if not isinstance(row['username'], str) or not isinstance(row['reason'], str):
@@ -131,7 +141,30 @@ class Database:
     def is_verified(self, guild_id, user_id):
         return self.data['verified'].get(user_key(guild_id, user_id), False)
 
-    def create(self, guild_id, user_id, username):
+    def verified_kind(self, guild_id, user_id):
+        rows = [r for r in self.applications() if r['guild_id'] == guild_id and r['user_id'] == user_id and r['status'] == 'accepted']
+        return max(rows, key=lambda r: r['id'])['kind'] if rows else 'member'
+
+    def cooldown_until(self, guild_id, user_id):
+        dates = [datetime.fromisoformat(r['retry_after']) for r in self.applications()
+                 if r['guild_id'] == guild_id and r['user_id'] == user_id and r.get('retry_after')]
+        until = max(dates) if dates else None
+        return until if until and until > datetime.now(timezone.utc) else None
+
+    def duplicates(self, row):
+        def normalized(value):
+            return ' '.join(unicodedata.normalize('NFKC', value).casefold().split())
+        return sorted({r['user_id'] for r in self.applications()
+                       if r['guild_id'] == row['guild_id'] and r['user_id'] != row['user_id']
+                       and r['status'] == 'accepted' and r['roles_done']
+                       and self.is_verified(r['guild_id'], r['user_id'])
+                       and normalized(r['username']) == normalized(row['username'])})
+
+    def create(self, guild_id, user_id, username, kind='member'):
+        if kind not in ('member', 'allies'):
+            raise ValueError('Choose Member or Allies.')
+        if self.cooldown_until(guild_id, user_id):
+            raise ValueError('Please wait until your rejection cooldown ends before applying again.')
         if self.pending(guild_id, user_id):
             return None
         if self.is_verified(guild_id, user_id):
@@ -141,6 +174,7 @@ class Database:
         data['next_id'] += 1
         data['applications'][str(application_id)] = dict(
             id=application_id, guild_id=guild_id, user_id=user_id, username=username,
+            kind=kind, nickname_state='pending', retry_after=None,
             status='pending', created_at=timestamp(), decided_at=None, reviewer_id=None, reason='',
             message_id=None, review_deleted=False, review_dirty=True, roles_done=False,
             transfer_started=False, transfer_eligible=False, submission_dm='pending', decision_dm='done')
@@ -148,7 +182,7 @@ class Database:
         return self.get(application_id)
 
     def update(self, application_id, **fields):
-        allowed = {'message_id', 'review_dirty', 'transfer_started', 'transfer_eligible', 'submission_dm', 'decision_dm'}
+        allowed = {'nickname_state', 'message_id', 'review_dirty', 'transfer_started', 'transfer_eligible', 'submission_dm', 'decision_dm'}
         if not fields or not fields.keys() <= allowed:
             raise ValueError('Invalid update fields')
         data = deepcopy(self.data)
@@ -165,6 +199,8 @@ class Database:
         data['applications'][str(application_id)].update(status=status, reviewer_id=reviewer_id,
             decided_at=timestamp(), reason=reason.strip(), review_dirty=True, decision_dm='pending',
             roles_done=status == 'rejected')
+        if status == 'rejected':
+            data['applications'][str(application_id)]['retry_after'] = (datetime.now(timezone.utc) + timedelta(seconds=self.cooldown_seconds)).isoformat()
         if status == 'accepted':
             data['verified'][user_key(row['guild_id'], row['user_id'])] = True
         self._save(data)
@@ -185,13 +221,16 @@ class Database:
         if row['roles_done'] or row['status'] != 'accepted':
             return
         row.update(roles_done=True, review_dirty=not row['review_deleted'])
+        for pending in data['applications'].values():
+            if pending['guild_id'] == row['guild_id'] and pending['status'] == 'pending' and not pending['review_deleted']:
+                pending['review_dirty'] = True
         if row['transfer_eligible']:
             key = user_key(row['guild_id'], row['user_id'])
             history = data['histories'].setdefault(key, dict(guild_id=row['guild_id'], user_id=row['user_id'],
                 message_id=None, deleted=False, dirty=False, entries=[]))
             if not any(e['application_id'] == application_id for e in history['entries']):
                 history['entries'].append(dict(application_id=application_id, username=row['username'],
-                    reviewer_id=row['reviewer_id'], at=timestamp()))
+                    reviewer_id=row['reviewer_id'], kind=row['kind'], at=timestamp()))
                 history['dirty'] = not history['deleted']
         self._save(data)
 
