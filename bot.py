@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 
 from database import Database
 from time_utils import zurich_time, ZurichFormatter
-from views import VerifyView, ReviewView, PauseControls, embed, reply, send_embed, valid_username
+from views import VerifyView, ReviewView, PauseControls, embed, reply, valid_username
 from identity import nickname, profile_from_member, clean_clan, valid_clan
 
 load_dotenv()
@@ -24,6 +24,7 @@ DEFAULTS = {
     'MEMBER_ROLE_ID': 1562535352290250842,
     'STAFF_CATEGORY_ID': 1562539595474927637,
     'REVIEW_CHANNEL_ID': 1562539651229683732,
+    'CONTROL_CHANNEL_ID': 1564388402055483533,
     'LOG_CHANNEL_ID': 1562546382772899910,
 }
 
@@ -43,10 +44,13 @@ class VerificationBot(discord.Client):
         self.guild = None
         self.configured = False
         self.prefix_task = None
+        self.edit_locks = {}
+        self.next_edit = {}
 
     async def setup_hook(self):
         self.add_view(VerifyView(self))
         self.add_view(ReviewView(self))
+        self.add_view(PauseControls(self))
 
     def public_context(self, interaction):
         return bool(self.configured and self.guild and interaction.guild_id == self.guild.id
@@ -145,19 +149,15 @@ class VerificationBot(discord.Client):
             await self.process(row['id'])
         await reply(interaction, 'Change request submitted', f"Requested nickname: **{safe(nickname(proposed))}**. Staff must approve before anything changes.")
 
+    def control_context(self, interaction):
+        return bool(self.configured and self.guild and interaction.guild_id == self.guild.id
+                    and interaction.channel_id == self.ids['CONTROL_CHANNEL_ID'])
+
     async def can_pause(self, interaction):
-        if not self.public_context(interaction):
+        if not self.control_context(interaction):
             return False
         member = await self.guild.fetch_member(interaction.user.id)
         return any(role.id == self.ids['STAFF_ROLE_ID'] for role in member.roles)
-
-    async def open_staff_controls(self, interaction):
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        if not await self.can_pause(interaction):
-            return await reply(interaction, 'High-Rank role required', 'Only the configured High-Rank role can pause or resume applications.')
-        pause = self.db.paused()
-        await send_embed(interaction, embed('Verification availability',
-            'Applications are paused.\n' + safe(pause['reason']) if pause['active'] else 'Applications are open.'), PauseControls(self))
 
     async def set_application_pause(self, interaction, active, reason=''):
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -166,10 +166,14 @@ class VerificationBot(discord.Client):
                 return await reply(interaction, 'High-Rank role required', 'Only the configured High-Rank role can pause or resume applications.')
             if active and not reason.strip():
                 return await reply(interaction, 'Explanation required', 'Tell applicants why applications are paused.')
+            current = self.db.paused()
+            if current['active'] == active and (not active or current['reason'] == reason[:500].strip()):
+                return await reply(interaction, 'Already paused' if active else 'Already open', 'The saved setting already matches. Pending panel updates will continue retrying automatically.')
             self.db.set_pause(active, reason[:500], interaction.user.id)
             await self.attempt(self.ensure_panel)
+            await self.attempt(self.ensure_control_panel)
         await reply(interaction, 'Applications paused' if active else 'Applications resumed',
-            'The setting is saved. The public panel will retry updating if Discord is temporarily unavailable.' if self.db.paused()['dirty'] else 'The public panel has been updated.')
+            'The setting is saved. The public panel will retry updating if Discord is temporarily unavailable.' if self.db.paused()['dirty'] or self.db.paused()['control_dirty'] else 'The verification and control panels have been updated.')
 
     async def decide(self, interaction, application_id, status, reason=''):
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -263,13 +267,87 @@ class VerificationBot(discord.Client):
         panel.set_footer(text='SaS community | Staff approval required | No instant role changes')
         return panel
 
+    async def wait_for_edit(self, channel_id):
+        loop = asyncio.get_running_loop()
+        delay = self.next_edit.get(channel_id, 0) - loop.time()
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+    async def edit_message(self, message, result, view=None):
+        def embed_content(value):
+            keys = ('title', 'description', 'color', 'fields', 'author', 'footer', 'thumbnail', 'image')
+            value = {key: item for key, item in value.items() if key in keys}
+            for key in ('author', 'footer', 'thumbnail', 'image'):
+                if key in value:
+                    value[key] = {k: v for k, v in value[key].items() if k not in ('proxy_url', 'proxy_icon_url', 'width', 'height', 'flags')}
+            return value
+        actual_embeds = [embed_content(item.to_dict()) for item in message.embeds]
+        actual_buttons = [(index, button.custom_id, button.label, int(button.style), bool(button.disabled))
+                          for index, row in enumerate(message.components) for button in row.children]
+        expected_buttons = [(item.row or 0, item.custom_id, item.label, int(item.style), bool(item.disabled))
+                            for item in view.children] if view else []
+        if actual_embeds == [embed_content(result.to_dict())] and actual_buttons == expected_buttons:
+            return False
+        channel_id = message.channel.id
+        async with self.edit_locks.setdefault(channel_id, asyncio.Lock()):
+            await self.wait_for_edit(channel_id)
+            try:
+                await message.edit(embed=result, view=view)
+            finally:
+                self.next_edit[channel_id] = asyncio.get_running_loop().time() + 1.2
+        return True
+
+    async def validate_control_channel(self):
+        self.control_channel = await self.fetch_channel(self.ids['CONTROL_CHANNEL_ID'])
+        channel = self.control_channel
+        if not isinstance(channel, discord.TextChannel) or channel.guild.id != self.guild.id:
+            raise RuntimeError('CONTROL_CHANNEL_ID must be a text channel in the same server.')
+        if channel.id in (self.ids['VERIFY_CHANNEL_ID'], self.ids['REVIEW_CHANNEL_ID'], self.ids['LOG_CHANNEL_ID']):
+            raise RuntimeError('Use a separate staff control center channel.')
+        permissions = channel.permissions_for(self.guild.me)
+        if not all((permissions.view_channel, permissions.send_messages, permissions.embed_links, permissions.read_message_history)):
+            raise RuntimeError('Missing View Channel, Send Messages, Embed Links or Read Message History in the staff control center.')
+
+    def control_embed(self):
+        pause = self.db.paused()
+        result = embed('SaS | Staff Control Center',
+            'Manage verification availability here. Controls require the High-Rank role.')
+        result.color = 0xD4A85A if pause['active'] else 0x258568
+        result.add_field(name='APPLICATION STATUS', value='Paused' if pause['active'] else 'Open', inline=False)
+        if pause['active']:
+            result.add_field(name='PUBLIC EXPLANATION', value=safe(pause['reason']), inline=False)
+        result.add_field(name='PAUSE APPLICATIONS', value='Disables new Member, Allies and Join SaS submissions. Existing reviews, name changes and other-clan changes remain available.', inline=False)
+        result.add_field(name='RESUME APPLICATIONS', value='Reopens applications and enables both Verify buttons.', inline=False)
+        result.add_field(name='AUTHORIZED ROLE', value=f"<@&{self.ids['STAFF_ROLE_ID']}>", inline=False)
+        if pause.get('at'):
+            result.add_field(name='LAST CHANGE / ZURICH', value=f"{zurich_time(pause['at'])} by <@{pause['actor_id']}>", inline=False)
+        result.set_footer(text='SaS staff control center')
+        return result
+
+    async def ensure_control_panel(self):
+        saved = self.db.control_panel()
+        message = None
+        if saved and saved['channel_id'] == self.control_channel.id:
+            try:
+                message = await self.control_channel.fetch_message(saved['message_id'])
+            except discord.NotFound:
+                pass
+        if message is None:
+            message = await self.find_message(self.control_channel, 'SaS staff control center')
+        if message is None:
+            message = await self.control_channel.send(embed=self.control_embed(), view=PauseControls(self))
+        else:
+            await self.edit_message(message, self.control_embed(), PauseControls(self))
+        self.db.control_panel(self.control_channel.id, message.id)
+        self.db.panel_synced(control=True)
+
     async def ensure_panel(self):
         panel = self.panel_embed()
         message_id = self.db.panel()
         if message_id:
             try:
                 message = await self.verify_channel.fetch_message(message_id)
-                await message.edit(embed=panel, view=VerifyView(self))
+                await self.edit_message(message, panel, VerifyView(self))
                 self.db.panel_synced()
                 return
             except discord.NotFound:
@@ -285,7 +363,9 @@ class VerificationBot(discord.Client):
             try:
                 await self.validate()
                 await self.validate_log_channel()
+                await self.validate_control_channel()
                 await self.ensure_panel()
+                await self.ensure_control_panel()
                 tree = app_commands.CommandTree(self)
                 try:
                     for command in await tree.fetch_commands(guild=self.guild):
@@ -293,9 +373,6 @@ class VerificationBot(discord.Client):
                             await command.delete()
                 except discord.HTTPException:
                     log.warning('Could not remove the retired settings command; verification can still run.')
-                for row in self.db.applications():
-                    if row['guild_id'] == self.guild.id and not row['review_deleted']:
-                        self.db.update(row['id'], review_dirty=True)
                 self.configured = True
                 self.recover.start()
                 self.prefix_task = asyncio.create_task(self.discover_member_prefixes())
@@ -371,7 +448,7 @@ class VerificationBot(discord.Client):
             message = await self.find_message(self.review_channel, f"Application {row['id']}", created - timedelta(seconds=1))
         view = ReviewView(self) if row['status'] == 'pending' else None
         if message:
-            await message.edit(embed=self.review_embed(row), view=view)
+            await self.edit_message(message, self.review_embed(row), view)
         else:
             kwargs = dict(embed=self.review_embed(row))
             if view is not None:
@@ -511,7 +588,7 @@ class VerificationBot(discord.Client):
                     message = candidate
                     break
         if message:
-            await message.edit(embed=self.history_embed(history))
+            await self.edit_message(message, self.history_embed(history))
         else:
             message = await self.log_channel.send(embed=self.history_embed(history))
         self.db.update_history(self.guild.id, history['user_id'], message_id=message.id, dirty=False)
@@ -526,7 +603,8 @@ class VerificationBot(discord.Client):
         row = self.db.get(application_id)
         if row['guild_id'] != self.guild.id:
             return
-        await self.attempt(self.sync_review, application_id)
+        if row['status'] == 'pending' or row['message_id'] is None:
+            await self.attempt(self.sync_review, application_id)
         await self.attempt(self.apply_acceptance, application_id)
         await self.attempt(self.apply_nickname, application_id)
         self.db.finish_profile(application_id)
@@ -539,6 +617,8 @@ class VerificationBot(discord.Client):
         async with self.lock:
             if self.db.paused()['dirty']:
                 await self.attempt(self.ensure_panel)
+            if self.db.paused()['control_dirty']:
+                await self.attempt(self.ensure_control_panel)
             for job in self.db.nickname_jobs():
                 if job['guild_id'] == self.guild.id:
                     await self.attempt(self.apply_member_prefix, job)

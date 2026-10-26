@@ -20,6 +20,7 @@ class BotFixture:
         self.bot.guild.icon = None
         self.bot.guild.get_role.side_effect = lambda role_id: role_id
         self.bot.configured = True
+        self.bot.wait_for_edit = AsyncMock()
         self.member = MagicMock(id=2)
         self.member.roles = [MagicMock(id=self.bot.ids['PROGRESS_ROLE_ID'])]
         self.member.guild_permissions.administrator = False
@@ -46,6 +47,11 @@ class BotFixture:
         self.bot.review_channel = MagicMock()
         self.bot.review_channel.send = AsyncMock(return_value=self.message)
         self.bot.review_channel.fetch_message = AsyncMock(return_value=self.message)
+        self.bot.control_channel = MagicMock(id=self.bot.ids['CONTROL_CHANNEL_ID'])
+        self.control_message = MagicMock(id=70)
+        self.control_message.edit = AsyncMock()
+        self.bot.control_channel.send = AsyncMock(return_value=self.control_message)
+        self.bot.control_channel.fetch_message = AsyncMock(return_value=self.control_message)
         self.bot.log_channel = MagicMock()
         self.log_message = MagicMock(id=60)
         self.log_message.edit = AsyncMock()
@@ -54,6 +60,7 @@ class BotFixture:
         async def empty_history(**kwargs):
             if False:
                 yield None
+        self.bot.control_channel.history = empty_history
         self.bot.review_channel.history = empty_history
         self.bot.log_channel.history = empty_history
         self.user = MagicMock()
@@ -64,8 +71,8 @@ class BotFixture:
         await self.bot.close()
         self.temp.cleanup()
 
-    def interaction(self, user_id=2, public=False):
-        interaction = MagicMock(guild_id=1, channel_id=self.bot.ids['VERIFY_CHANNEL_ID' if public else 'REVIEW_CHANNEL_ID'])
+    def interaction(self, user_id=2, public=False, control=False):
+        interaction = MagicMock(guild_id=1, channel_id=self.bot.ids['CONTROL_CHANNEL_ID' if control else 'VERIFY_CHANNEL_ID' if public else 'REVIEW_CHANNEL_ID'])
         interaction.user = MagicMock(spec=discord.Member)
         interaction.user.id = user_id
         interaction.user.roles = []
@@ -92,7 +99,7 @@ class BotFixture:
 
 class WorkflowTests(BotFixture, unittest.IsolatedAsyncioTestCase):
     async def test_only_verify_and_accept_reject_controls_exist(self):
-        self.assertEqual([c.label for c in VerifyView(self.bot).children], ['Verify - Member', 'Verify - Allies', 'Name change', 'Clan change', 'Staff controls'])
+        self.assertEqual([c.label for c in VerifyView(self.bot).children], ['Verify - Member', 'Verify - Allies', 'Name change', 'Clan change'])
         self.assertEqual([c.label for c in ReviewView(self.bot).children], ['Accept', 'Reject'])
         self.assertEqual(len(ApplicationModal(self.bot).children), 1)
         self.assertTrue(ReviewView(self.bot).is_persistent())

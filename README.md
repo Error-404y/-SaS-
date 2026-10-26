@@ -13,7 +13,7 @@ A small Discord verification bot using Python and one local JSON file. No SQL or
 
 Administrators and High-Rank staff can review requests, including their own. The bot rechecks permissions when a decision is submitted. Ordinary members cannot approve themselves. Only one pending or unfinished approved request per user is allowed, and a second reviewer cannot overwrite a decision.
 
-Staff reviews keep exactly Accept and Reject. The public panel also provides Name change, Clan change and Staff controls. The old verification-settings command is removed on startup. To reject a request, enter a plain reason. After rejection, wait 10 minutes before applying again. The same cooldown applies to verification and change requests, including already-open forms, and survives restarts and deletion of the rejected review. Set `REJECTION_COOLDOWN_SECONDS` in `.env` to change the duration for future rejections (0 disables it).
+Staff reviews keep exactly Accept and Reject. The public panel also provides Name change and Clan change. Management buttons live in the staff control center. The old verification-settings command is removed on startup. To reject a request, enter a plain reason. After rejection, wait 10 minutes before applying again. The same cooldown applies to verification and change requests, including already-open forms, and survives restarts and deletion of the rejected review. Set `REJECTION_COOLDOWN_SECONDS` in `.env` to change the duration for future rejections (0 disables it).
 
 ## Names and verification types
 
@@ -40,9 +40,9 @@ Jobs persist across restarts. Completed jobs are not repeated on every startup. 
 
 ## Pausing applications
 
-In `verify-please`, select **Staff controls**, then **Pause applications** and enter an explanation, or **Resume applications**. Only role `1562535759276417065` (the configured High-Rank role) can perform either action. Administrator permission alone does not grant this control. The bot fetches current roles when the control is opened and again when the setting is submitted.
+In `staff-control-center` (`1564388402055483533`), use the persistent **Pause applications** button and enter an explanation, or select **Resume applications**. The bot posts and maintains one control embed there. It reuses the saved panel after a restart. The public verification panel has no management controls. Only role `1562535759276417065` (the configured High-Rank role) can perform either action. Administrator permission alone does not grant this control. The bot checks the channel and High-Rank role before opening the pause form and fetches current roles again before applying pause or resume. Old controls in the public channel cannot change the setting.
 
-A pause disables both Verify buttons and displays the explanation in the public embed. The saved pause survives restarts, blocks previously opened verification forms, and blocks new Join SaS requests. Existing staff reviews and name/other-clan changes remain available. A failed panel edit retries; the server-side pause takes effect immediately even if the old buttons are still visible.
+A pause disables both Verify buttons and displays the explanation in the public embed. The saved pause survives restarts, blocks previously opened verification forms, and blocks new Join SaS requests. Existing staff reviews and name/other-clan changes remain available. Public and staff panel updates retry independently after failures; the server-side pause takes effect immediately even if the old buttons are still visible.
 
 ## Quiet verification history
 
@@ -87,10 +87,11 @@ If earlier versions removed Member from someone incorrectly, restore Member manu
 | High-Rank category | `1562539595474927637` |
 | verify-check | `1562539651229683732` |
 | verified-log | `1562546382772899910` |
+| staff-control-center | `1564388402055483533` |
 
 Create a bot in the [Discord Developer Portal](https://discord.com/developers/applications). Enable **Server Members Intent**. Invite it with the `bot` scope and **Manage Roles**, **Manage Nicknames**, **View Channels**, **Send Messages**, **Embed Links** and **Read Message History** permissions. Move the bot role above Member, Allies and Verify-Process. Message Content Intent and Administrator permission are not required for the bot.
 
-Allow new users, Members and Allies to view `verify-please`, so verified users can access name and clan change controls. Keep `verify-check` and `verified-log` private to intended staff and the bot. Deny @everyone View Channel and inspect other role/member overrides. Allow the bot to read message history and send embeds in all three channels. Keep the verification channels inside their configured categories.
+Allow new users, Members and Allies to view `verify-please`, so verified users can access name and clan change controls. Keep `verify-check` and `verified-log` private to intended staff and the bot. Deny @everyone View Channel and inspect other role/member overrides. Keep staff-control-center visible to High-Rank staff and the bot. Allow the bot View Channel, Send Messages, Embed Links and Read Message History in all four channels. CONTROL_CHANNEL_ID can be changed in .env. Keep the verification channels inside their configured categories.
 
 ## Install and run
 
@@ -128,9 +129,17 @@ The named Docker volume preserves JSON data. Run only one bot instance per file.
 
 Stop the bot and back up `data/verification.json`, then deploy and restart. The first run converts version 1 JSON to version 2 and also saves the original as `data/verification.json.v1.bak`. Applications and the public panel ID are preserved. Existing version 2 files gain compatible profile, clan, pause and nickname-job defaults; no JSON reset is required. The updated Docker image includes the new `identity.py` module, which must also be uploaded for non-Docker hosting. Old question/claim/event data remains in that backup but no longer drives the bot.
 
-Old completed requests are simplified in place if their messages still exist. Missing messages stay deleted. Legacy pending records without a message ID are closed conservatively so the bot cannot accidentally recreate a deleted request; those users may apply again. Existing successful applications do not create a burst of history posts during migration.
+Completed reviews are not rewritten on every restart. Pending updates resume when their saved state requires it. Missing messages stay deleted. Legacy pending records without a message ID are closed conservatively so the bot cannot accidentally recreate a deleted request; those users may apply again. Existing successful applications do not create a burst of history posts during migration.
 
 The active configuration contains the token, JSON path, channel IDs, category IDs, role IDs and rejection cooldown. Old rules, language, queue and extra-question settings are ignored and may be removed from `.env`.
+
+## Message updates and rate limits
+
+Startup no longer marks every historical review for editing. Dirty reviews, history embeds and public/staff panels are compared with the message already on Discord; unchanged embeds and buttons do not produce PATCH requests. Approval processing combines role, nickname and DM results before its final review edit. Necessary edits are serialized per channel and spaced at least 1.2 seconds apart after each edit finishes.
+
+Discord can still return a temporary 429 when it imposes a tighter limit or other activity consumes the quota. discord.py continues to honor Discord's retry delay; rate-limit warnings are not hidden. The changes remove avoidable bursts rather than promise unlimited requests.
+
+The requirements now include PyNaCl, removing the optional voice-library warning after dependencies are installed. Run `python -m pip install -r requirements.txt` before restarting, or rebuild the Docker image. The bot does not join voice channels.
 
 ## Reliability and tests
 
