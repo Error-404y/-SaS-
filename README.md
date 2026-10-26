@@ -127,7 +127,7 @@ The named Docker volume preserves JSON data. Run only one bot instance per file.
 
 ## Updating from the previous bot
 
-Stop the bot and back up `data/verification.json`, then deploy and restart. The first run converts version 1 JSON to version 2 and also saves the original as `data/verification.json.v1.bak`. Applications and the public panel ID are preserved. Existing version 2 files gain compatible profile, clan, pause and nickname-job defaults; no JSON reset is required. The updated Docker image includes the new `identity.py` module, which must also be uploaded for non-Docker hosting. Old question/claim/event data remains in that backup but no longer drives the bot.
+Stop the bot and back up `data/verification.json`, then deploy and restart. The first run converts version 1 JSON to version 2 and also saves the original as `data/verification.json.v1.bak`. Applications and the public panel ID are preserved. Existing version 2 files gain compatible profile, clan, pause and nickname-job defaults; no JSON reset is required. The updated Docker image includes the `identity.py` and `delivery.py` modules, which must also be uploaded for non-Docker hosting. Old question/claim/event data remains in that backup but no longer drives the bot.
 
 Completed reviews are not rewritten on every restart. Pending updates resume when their saved state requires it. Missing messages stay deleted. Legacy pending records without a message ID are closed conservatively so the bot cannot accidentally recreate a deleted request; those users may apply again. Existing successful applications do not create a burst of history posts during migration.
 
@@ -135,9 +135,11 @@ The active configuration contains the token, JSON path, channel IDs, category ID
 
 ## Message updates and rate limits
 
-Startup no longer marks every historical review for editing. Dirty reviews, history embeds and public/staff panels are compared with the message already on Discord; unchanged embeds and buttons do not produce PATCH requests. Approval processing combines role, nickname and DM results before its final review edit. Necessary edits are serialized per channel and spaced at least 1.2 seconds apart after each edit finishes.
+Startup no longer marks every historical review for editing. Dirty reviews, history embeds and public/staff panels are compared with the message already on Discord; unchanged embeds and buttons do not produce PATCH requests. Approval processing combines role, nickname and DM results before its final review edit. Necessary edits use a persistent per-channel queue. The bot starts with a conservative six-second spacing policy, spreads remaining capacity according to Discord response headers, and increases spacing after a 429. Server retry delays and reset windows always take precedence. The queue saves its next allowed edit time before sending, so a restart cannot reset the cooldown.
 
-Discord can still return a temporary 429 when it imposes a tighter limit or other activity consumes the quota. discord.py continues to honor Discord's retry delay; rate-limit warnings are not hidden. The changes remove avoidable bursts rather than promise unlimited requests.
+The queue checks for ready messages every five seconds without sleeping inside a staff action. Multiple changes to the same review merge into its latest saved state. Role updates and DMs can complete while a review waits; its old buttons cannot override a saved decision. Delayed review/history edits do not repeatedly fetch the same message while their channel is cooling down. Role and DM recovery retains its separate 30-second interval.
+
+Discord can still return a temporary 429 when it imposes a previously unknown tighter limit or other activity consumes the quota. discord.py continues to honor Discord's retry delay; rate-limit warnings are not hidden. The HTTP trace reads the response headers and 429 body using the supported discord.py trace hook, while leaving the original response available for library retry handling. Rate-limit state is saved in the existing JSON file. The changes remove avoidable bursts rather than promise unlimited requests. See [Discord rate-limit documentation](https://docs.discord.com/developers/topics/rate-limits).
 
 The requirements now include PyNaCl, removing the optional voice-library warning after dependencies are installed. Run `python -m pip install -r requirements.txt` before restarting, or rebuild the Docker image. The bot does not join voice channels.
 
@@ -145,7 +147,7 @@ The requirements now include PyNaCl, removing the optional voice-library warning
 
 Writes use a flushed temporary file and atomic replacement. Invalid data is not overwritten. Keep backups; atomic writes are not a substitute for backups. Discord and the JSON file cannot share a transaction: an interrupted send can still have an ambiguous result. Review/history discovery reduces duplicate posts, but an interrupted DM may be sent twice.
 
-Role updates, initial review delivery, DMs and history edits retry every 30 seconds. Permanent DM denial is recorded rather than repeatedly retried. A deleted history or review message is not retried as a new post. If an accepted applicant leaves, role completion waits until they return.
+Role updates and DMs retry every 30 seconds. Dirty message updates are checked every five seconds and sent only when their pacing window permits. Permanent DM denial is recorded rather than repeatedly retried. A deleted history or review message is not retried as a new post. If an accepted applicant leaves, role completion waits until they return.
 
 ```sh
 python -m unittest discover -s tests -v

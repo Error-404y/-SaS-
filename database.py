@@ -1,6 +1,7 @@
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 import json
+import math
 import os
 from pathlib import Path
 import tempfile
@@ -21,7 +22,7 @@ class Database:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if not self.path.exists():
-            self._save(dict(version=2, next_id=1, panel_message=None, applications={}, verified={}, histories={}, joins={}, profiles={}, pause={'active': False, 'reason': '', 'dirty': False, 'control_dirty': False}, nickname_jobs={}, control_panel=None))
+            self._save(dict(version=2, next_id=1, panel_message=None, applications={}, verified={}, histories={}, joins={}, profiles={}, pause={'active': False, 'reason': '', 'dirty': False, 'control_dirty': False}, nickname_jobs={}, control_panel=None, edit_limits={}))
             return
         try:
             original = self.path.read_text(encoding='utf-8')
@@ -41,6 +42,7 @@ class Database:
             data.setdefault('pause', dict(active=False, reason='', dirty=False))
             data.setdefault('nickname_jobs', {})
             data.setdefault('control_panel', None)
+            data.setdefault('edit_limits', {})
             data['pause'].setdefault('control_dirty', False)
             for row in sorted(data['applications'].values(), key=lambda r: r['id'], reverse=True):
                 key = user_key(row['guild_id'], row['user_id'])
@@ -101,6 +103,12 @@ class Database:
         for job in data['nickname_jobs'].values():
             if job['state'] not in ('pending', 'done', 'blocked', 'skipped'):
                 raise ValueError('Invalid nickname job')
+        if not isinstance(data['edit_limits'], dict):
+            raise ValueError('Invalid edit pacing state')
+        for state in data['edit_limits'].values():
+            for field in ('next_at', 'spacing'):
+                if not isinstance(state[field], (int, float)) or not math.isfinite(state[field]) or state[field] < 0:
+                    raise ValueError('Invalid edit pacing deadline')
         required = {'id', 'guild_id', 'user_id', 'username', 'status', 'created_at', 'decided_at',
                     'reviewer_id', 'reason', 'message_id', 'review_deleted', 'review_dirty', 'roles_done',
                     'transfer_started', 'transfer_eligible', 'submission_dm', 'decision_dm'}
@@ -311,6 +319,19 @@ class Database:
     def panel_synced(self, control=False):
         data = deepcopy(self.data)
         data['pause']['control_dirty' if control else 'dirty'] = False
+        self._save(data)
+
+    def edit_limit(self, channel_id):
+        return deepcopy(self.data['edit_limits'].get(channel_id))
+
+    def save_edit_limit(self, channel_id, state):
+        data = deepcopy(self.data)
+        data['edit_limits'][channel_id] = deepcopy(state)
+        self._save(data)
+
+    def refresh_panels(self):
+        data = deepcopy(self.data)
+        data['pause'].update(dirty=True, control_dirty=True)
         self._save(data)
 
     def control_panel(self, channel_id=None, message_id=None):
