@@ -21,7 +21,7 @@ class Database:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if not self.path.exists():
-            self._save(dict(version=2, next_id=1, panel_message=None, applications={}, verified={}, histories={}, joins={}, profiles={}, pause={'active': False, 'reason': '', 'dirty': False}, nickname_jobs={}))
+            self._save(dict(version=2, next_id=1, panel_message=None, applications={}, verified={}, histories={}, joins={}, profiles={}, pause={'active': False, 'reason': '', 'dirty': False, 'control_dirty': False}, nickname_jobs={}, control_panel=None))
             return
         try:
             original = self.path.read_text(encoding='utf-8')
@@ -40,6 +40,8 @@ class Database:
             data.setdefault('profiles', {})
             data.setdefault('pause', dict(active=False, reason='', dirty=False))
             data.setdefault('nickname_jobs', {})
+            data.setdefault('control_panel', None)
+            data['pause'].setdefault('control_dirty', False)
             for row in sorted(data['applications'].values(), key=lambda r: r['id'], reverse=True):
                 key = user_key(row['guild_id'], row['user_id'])
                 if row['status'] == 'accepted' and row['profile_done'] and key not in data['profiles']:
@@ -303,13 +305,20 @@ class Database:
 
     def set_pause(self, active, reason, actor_id):
         data = deepcopy(self.data)
-        data['pause'] = dict(active=active, reason=reason.strip() if active else '', actor_id=actor_id, at=timestamp(), dirty=True)
+        data['pause'] = dict(active=active, reason=reason.strip() if active else '', actor_id=actor_id, at=timestamp(), dirty=True, control_dirty=True)
         self._save(data)
 
-    def panel_synced(self):
+    def panel_synced(self, control=False):
         data = deepcopy(self.data)
-        data['pause']['dirty'] = False
+        data['pause']['control_dirty' if control else 'dirty'] = False
         self._save(data)
+
+    def control_panel(self, channel_id=None, message_id=None):
+        if message_id is not None:
+            data = deepcopy(self.data)
+            data['control_panel'] = dict(channel_id=channel_id, message_id=message_id)
+            self._save(data)
+        return deepcopy(self.data.get('control_panel'))
 
     def queue_nickname(self, guild_id, user_id, force=False):
         data = deepcopy(self.data)

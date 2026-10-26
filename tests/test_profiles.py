@@ -175,14 +175,14 @@ class ProfileTests(BotFixture, unittest.IsolatedAsyncioTestCase):
 
     async def test_pause_requires_actual_high_rank_role_even_for_admin(self):
         self.member.guild_permissions.administrator = True
-        await self.bot.set_application_pause(self.interaction(public=True), True, 'Maintenance')
+        await self.bot.set_application_pause(self.interaction(control=True), True, 'Maintenance')
         self.assertFalse(self.bot.db.paused()['active'])
         self.member.roles.append(MagicMock(id=self.bot.ids['STAFF_ROLE_ID']))
         self.bot.ensure_panel = AsyncMock()
-        await self.bot.set_application_pause(self.interaction(public=True), True, 'Maintenance')
+        await self.bot.set_application_pause(self.interaction(control=True), True, 'Maintenance')
         self.assertTrue(self.bot.db.paused()['active'])
         self.member.roles = []
-        await self.bot.set_application_pause(self.interaction(public=True), False)
+        await self.bot.set_application_pause(self.interaction(control=True), False)
         self.assertTrue(self.bot.db.paused()['active'])
 
     async def test_pause_survives_restart_disables_buttons_and_blocks_open_form(self):
@@ -208,13 +208,13 @@ class ProfileTests(BotFixture, unittest.IsolatedAsyncioTestCase):
         self.member.roles.append(MagicMock(id=self.bot.ids['STAFF_ROLE_ID']))
         self.bot.verify_channel = MagicMock()
         self.bot.verify_channel.send = AsyncMock(side_effect=self.denied())
-        await self.bot.set_application_pause(self.interaction(public=True), True, 'Maintenance')
+        await self.bot.set_application_pause(self.interaction(control=True), True, 'Maintenance')
         self.assertTrue(self.bot.db.paused()['dirty'])
         self.bot.verify_channel.send = AsyncMock(return_value=self.message)
         self.bot.verify_channel.fetch_message = AsyncMock(return_value=self.message)
         await self.bot.recover()
         self.assertFalse(self.bot.db.paused()['dirty'])
-        await self.bot.set_application_pause(self.interaction(public=True), False)
+        await self.bot.set_application_pause(self.interaction(control=True), False)
         view = self.message.edit.call_args.kwargs['view']
         self.assertFalse(view.verify.disabled)
         self.assertFalse(view.allies.disabled)
@@ -307,7 +307,7 @@ class ProfileTests(BotFixture, unittest.IsolatedAsyncioTestCase):
     async def test_public_controls_serialize_in_separate_rows(self):
         components = VerifyView(self.bot).to_components()
         self.assertEqual([[button['label'] for button in row['components']] for row in components],
-                         [['Verify - Member', 'Verify - Allies'], ['Name change', 'Clan change'], ['Staff controls']])
+                         [['Verify - Member', 'Verify - Allies'], ['Name change', 'Clan change']])
         identifiers = [button['custom_id'] for row in components for button in row['components']]
         self.assertEqual(len(identifiers), len(set(identifiers)))
 

@@ -126,9 +126,6 @@ class VerifyView(SafeView):
         await send_embed(interaction, embed('Are you trying to join SaS?',
             '**Yes** sends a Member verification request to staff.\n**No** lets you request another clan and Allies access.\nYour current nickname and access stay in place until approval.'), ClanChoiceView(self.bot))
 
-    @discord.ui.button(label='Staff controls', style=discord.ButtonStyle.secondary, custom_id='sas:pause:controls:v1', row=2)
-    async def staff_controls(self, interaction, button):
-        await self.bot.open_staff_controls(interaction)
 
 
 class NameChangeModal(SafeModal, title='Request a name change'):
@@ -180,14 +177,16 @@ class PauseModal(SafeModal, title='Pause verification applications'):
 
 class PauseControls(SafeView):
     def __init__(self, bot):
-        super().__init__(timeout=180)
+        super().__init__(timeout=None)
         self.bot = bot
 
-    @discord.ui.button(label='Pause applications', style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label='Pause applications', style=discord.ButtonStyle.secondary, custom_id='sas:control:pause:v1')
     async def pause(self, interaction, button):
+        if not self.bot.control_context(interaction) or not any(role.id == self.bot.ids['STAFF_ROLE_ID'] for role in getattr(interaction.user, 'roles', [])):
+            return await reply(interaction, 'High-Rank role required', 'Use the staff control center with the High-Rank role.')
         await interaction.response.send_modal(PauseModal(self.bot))
 
-    @discord.ui.button(label='Resume applications', style=discord.ButtonStyle.primary)
+    @discord.ui.button(label='Resume applications', style=discord.ButtonStyle.primary, custom_id='sas:control:resume:v1')
     async def resume(self, interaction, button):
         await self.bot.set_application_pause(interaction, False)
 
