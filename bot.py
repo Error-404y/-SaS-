@@ -10,7 +10,8 @@ from dotenv import load_dotenv
 
 from database import Database
 from time_utils import zurich_time, ZurichFormatter
-from views import VerifyView, ReviewView, embed, reply, valid_username
+from views import VerifyView, ReviewView, PauseControls, embed, reply, send_embed, valid_username
+from identity import nickname, profile_from_member, clean_clan, valid_clan
 
 load_dotenv()
 log = logging.getLogger('verification')
@@ -41,6 +42,7 @@ class VerificationBot(discord.Client):
         self.lock = asyncio.Lock()
         self.guild = None
         self.configured = False
+        self.prefix_task = None
 
     async def setup_hook(self):
         self.add_view(VerifyView(self))
@@ -64,7 +66,7 @@ class VerificationBot(discord.Client):
     def target_role(self, row):
         return self.ids['ALLIES_ROLE_ID' if row.get('kind') == 'allies' else 'MEMBER_ROLE_ID']
 
-    async def submit(self, interaction, username, kind='member'):
+    async def submit(self, interaction, username, kind='member', clan=''):
         await interaction.response.defer(ephemeral=True, thinking=True)
         if not self.public_context(interaction):
             return await reply(interaction, 'Not available', 'Use the Verify button in the verification channel.')
@@ -72,7 +74,13 @@ class VerificationBot(discord.Client):
             return await reply(interaction, 'Invalid selection', 'Choose Member or Allies.')
         if not valid_username(username):
             return await reply(interaction, 'Invalid username', 'Enter your game username, without links or mentions.')
+        clan = 'SaS' if kind == 'member' else clean_clan(clan)
+        error = self.profile_error(dict(kind=kind, username=username, clan=clan))
+        if error:
+            return await reply(interaction, 'Check your details', error)
         async with self.lock:
+            if self.db.paused()['active']:
+                return await reply(interaction, 'Applications paused', safe(self.db.paused()['reason']))
             member = await self.guild.fetch_member(interaction.user.id)
             if any(r.id in self.verified_role_ids() for r in member.roles) or self.db.is_verified(self.guild.id, member.id):
                 await self.prepare_member(member)
@@ -80,12 +88,88 @@ class VerificationBot(discord.Client):
             until = self.db.cooldown_until(self.guild.id, member.id)
             if until:
                 return await reply(interaction, 'Please wait before reapplying', f'You can submit another request at {zurich_time(until.isoformat())}.')
-            row = self.db.create(self.guild.id, member.id, username, kind)
+            row = self.db.create(self.guild.id, member.id, username, kind, clan)
             if row is None:
                 return await reply(interaction, 'Application pending', 'Your request is already waiting for staff review.')
             await self.attempt(self.prepare_member, member)
             await self.process(row['id'])
         await reply(interaction, 'Application submitted', 'Your request is saved. Please wait for staff to review it. If DMs are disabled, your request still counts.')
+
+    @staticmethod
+    def profile_error(profile):
+        if not valid_username(profile['username']) or any(c in profile['username'] for c in '[]'):
+            return 'Enter only your in-game username, without a clan tag, links or mentions.'
+        if profile['clan'] and not valid_clan(profile['clan']):
+            return 'Clan names must be 1 to 12 characters using letters, numbers, spaces, hyphens or underscores.'
+        if profile['kind'] == 'allies' and not profile['clan']:
+            return 'Enter your clan name.'
+        prefix = len(profile['clan']) + 3 if profile['clan'] else 0
+        if len(profile['username']) + prefix > 32:
+            return f"With this clan tag, your username can contain at most {32 - prefix} characters. Discord nicknames allow 32 characters in total."
+        return None
+
+    async def submit_change(self, interaction, operation, value=''):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if not self.public_context(interaction):
+            return await reply(interaction, 'Not available', 'Use the verification channel.')
+        if operation not in ('name', 'clan', 'join_member'):
+            return await reply(interaction, 'Invalid request')
+        async with self.lock:
+            member = await self.guild.fetch_member(interaction.user.id)
+            previous = profile_from_member(member, self.ids, self.db.profile(self.guild.id, member.id))
+            if not previous:
+                return await reply(interaction, 'Verification required', 'Get verified as a Member or Ally before requesting a change.')
+            if self.db.busy(self.guild.id, member.id):
+                return await reply(interaction, 'Request already in progress', 'Wait until staff decide your request and its updates finish.')
+            proposed = dict(previous)
+            if operation == 'name':
+                proposed['username'] = value.strip()
+            elif operation == 'join_member':
+                proposed.update(kind='member', clan='SaS')
+            else:
+                proposed.update(kind='allies', clan=clean_clan(value))
+                if proposed['clan'] == 'SaS':
+                    return await reply(interaction, 'Joining SaS', 'Use Clan change and choose Yes - Join SaS to request Member verification.')
+            if proposed == previous:
+                return await reply(interaction, 'Nothing to change', 'These details already match your current profile.')
+            error = self.profile_error(proposed)
+            if error:
+                return await reply(interaction, 'Check your details', error)
+            try:
+                row = self.db.create(self.guild.id, member.id, proposed['username'], proposed['kind'], proposed['clan'], operation, previous)
+            except ValueError as error:
+                return await reply(interaction, 'Request unavailable', str(error))
+            if row is None:
+                return await reply(interaction, 'Request already in progress')
+            self.db.save_profile(self.guild.id, member.id, previous)
+            await self.process(row['id'])
+        await reply(interaction, 'Change request submitted', f"Requested nickname: **{safe(nickname(proposed))}**. Staff must approve before anything changes.")
+
+    async def can_pause(self, interaction):
+        if not self.public_context(interaction):
+            return False
+        member = await self.guild.fetch_member(interaction.user.id)
+        return any(role.id == self.ids['STAFF_ROLE_ID'] for role in member.roles)
+
+    async def open_staff_controls(self, interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if not await self.can_pause(interaction):
+            return await reply(interaction, 'High-Rank role required', 'Only the configured High-Rank role can pause or resume applications.')
+        pause = self.db.paused()
+        await send_embed(interaction, embed('Verification availability',
+            'Applications are paused.\n' + safe(pause['reason']) if pause['active'] else 'Applications are open.'), PauseControls(self))
+
+    async def set_application_pause(self, interaction, active, reason=''):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        async with self.lock:
+            if not await self.can_pause(interaction):
+                return await reply(interaction, 'High-Rank role required', 'Only the configured High-Rank role can pause or resume applications.')
+            if active and not reason.strip():
+                return await reply(interaction, 'Explanation required', 'Tell applicants why applications are paused.')
+            self.db.set_pause(active, reason[:500], interaction.user.id)
+            await self.attempt(self.ensure_panel)
+        await reply(interaction, 'Applications paused' if active else 'Applications resumed',
+            'The setting is saved. The public panel will retry updating if Discord is temporarily unavailable.' if self.db.paused()['dirty'] else 'The public panel has been updated.')
 
     async def decide(self, interaction, application_id, status, reason=''):
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -110,7 +194,7 @@ class VerificationBot(discord.Client):
                 return await reply(interaction, 'Reason required', str(error))
             await self.process(application_id)
             row = self.db.get(application_id)
-        description = 'The applicant has been notified, or their DMs are unavailable.'
+        description = 'Result DM sent successfully.' if row['decision_dm'] == 'done' else 'Result DM could not be delivered. The applicant may have DMs disabled.'
         if row['decision_dm'] == 'pending':
             description = 'The decision is saved. The remaining updates will retry automatically.'
         duplicates = self.db.duplicates(row)
@@ -160,22 +244,39 @@ class VerificationBot(discord.Client):
         if not all((permissions.view_channel, permissions.send_messages, permissions.embed_links, permissions.read_message_history)):
             raise RuntimeError('The bot needs View Channel, Send Messages, Embed Links and Read Message History in verified-log.')
 
+    def panel_embed(self):
+        pause = self.db.paused()
+        panel = embed('SaS | Verification Centre',
+            'A shared patrol starts with a proper introduction.\nChoose your access below to join our **Police Simulator** community.')
+        panel.color = 0xD4A85A if pause['active'] else 0x183B56
+        icon = self.guild.icon
+        if icon:
+            panel.set_thumbnail(url=str(icon.url))
+        panel.add_field(name='01 / SaS MEMBERS',
+            value=f"For players joining SaS.\n**Verify - Member**\nAccess: <@&{self.ids['MEMBER_ROLE_ID']}>\nNickname: `[SaS] Username`", inline=True)
+        panel.add_field(name='02 / ALLIED CLANS',
+            value=f"For players representing another clan.\n**Verify - Allies**\nAccess: <@&{self.ids['ALLIES_ROLE_ID']}>\nNickname: `[Clan] Username`", inline=True)
+        panel.add_field(name='YOUR APPLICATION', value='**Choose your route**  /  **Enter your details**  /  **Wait for approval**\nStaff review every request. Your result arrives by DM; keep server DMs enabled.', inline=False)
+        panel.add_field(name='ALREADY VERIFIED?', value='**Name change** updates your game name while keeping your clan.\n**Clan change** lets you join SaS or move to another clan.\nAll changes require staff approval. Your current access stays until a decision.', inline=False)
+        panel.add_field(name='APPLICATIONS PAUSED' if pause['active'] else 'APPLICATIONS OPEN',
+            value=safe(pause['reason']) if pause['active'] else 'Member and Allies applications are welcome. One request at a time.', inline=False)
+        panel.set_footer(text='SaS community | Staff approval required | No instant role changes')
+        return panel
+
     async def ensure_panel(self):
-        panel = embed('Your place in SaS starts here', 'Choose your verification type below and enter your **Police Simulator username**. Our staff will review your request.')
-        panel.add_field(name='CLAN MEMBERS', value=f"Choose **Verify - Member** to apply for <@&{self.ids['MEMBER_ROLE_ID']}> access.", inline=True)
-        panel.add_field(name='ALLIES', value=f"Choose **Verify - Allies** to apply for <@&{self.ids['ALLIES_ROLE_ID']}> access.", inline=True)
-        panel.add_field(name='WHAT HAPPENS NEXT', value='Submit your game name. Wait for staff review. Receive your result by DM.\nAfter approval, your server nickname is set to your game name (up to 32 characters).', inline=False)
-        panel.set_footer(text='One application at a time | Results by direct message')
+        panel = self.panel_embed()
         message_id = self.db.panel()
         if message_id:
             try:
                 message = await self.verify_channel.fetch_message(message_id)
                 await message.edit(embed=panel, view=VerifyView(self))
+                self.db.panel_synced()
                 return
             except discord.NotFound:
                 pass
         message = await self.verify_channel.send(embed=panel, view=VerifyView(self))
         self.db.panel(message.id)
+        self.db.panel_synced()
 
     async def on_ready(self):
         async with self.lock:
@@ -197,6 +298,7 @@ class VerificationBot(discord.Client):
                         self.db.update(row['id'], review_dirty=True)
                 self.configured = True
                 self.recover.start()
+                self.prefix_task = asyncio.create_task(self.discover_member_prefixes())
                 log.info('Ready as %s in %s', self.user, self.guild.name)
             except Exception:
                 log.exception('Startup failed. Correct the configuration and restart.')
@@ -205,11 +307,18 @@ class VerificationBot(discord.Client):
     def review_embed(self, row):
         status = row['status']
         colors = {'pending': 0xD69E2E, 'accepted': 0x258568, 'rejected': 0xBF4545, 'cancelled': 0x64748B}
-        result = embed(f"{row['kind'].title()} verification / {status.title()}",
+        label = {'verification': row['kind'].title() + ' verification', 'name': 'Name change', 'clan': 'Clan change', 'join_member': 'Member verification'}[row['operation']]
+        result = embed(f"{label} / {status.title()}",
                        f"<@{row['user_id']}>\nApplication **{row['id']:04d}**")
         result.color = colors.get(status, 0x64748B)
         result.add_field(name='GAME USERNAME', value=safe(row['username']), inline=True)
         result.add_field(name='ACCESS REQUESTED', value=f"<@&{self.target_role(row)}>", inline=True)
+        result.add_field(name='CLAN', value=safe(row['clan']) or 'Not recorded', inline=True)
+        result.add_field(name='REQUESTED NICKNAME', value=safe(nickname(row)), inline=False)
+        if row['previous']:
+            result.add_field(name='CURRENT PROFILE', value=f"{safe(nickname(row['previous']))} / {row['previous']['kind'].title()}", inline=False)
+            if row['previous']['kind'] != row['kind']:
+                result.add_field(name='ROLE CHANGE ON APPROVAL', value=f"Add {row['kind'].title()}; remove {row['previous']['kind'].title()}.", inline=False)
         result.add_field(name='SUBMITTED / ZURICH', value=zurich_time(row['created_at']), inline=False)
         duplicates = self.db.duplicates(row)
         if duplicates:
@@ -226,11 +335,15 @@ class VerificationBot(discord.Client):
             if row.get('retry_after'):
                 result.add_field(name='CAN REAPPLY / ZURICH', value=zurich_time(row['retry_after']), inline=False)
         if status == 'accepted':
-            result.add_field(name='ACCESS', value='Role update confirmed.' if row['roles_done'] else 'Updating roles. Unfinished changes retry automatically.', inline=False)
-            notes = {'done': f"Set to **{safe(row['username'][:32])}**.",
+            access = 'Existing access retained.' if row['operation'] == 'name' else 'Role update confirmed.'
+            result.add_field(name='ACCESS', value=access if row['roles_done'] else 'Updating request. Unfinished changes retry automatically.', inline=False)
+            notes = {'done': f"Set to **{safe(nickname(row))}**.",
                      'blocked': 'Could not change nickname. Staff can set it manually; check Manage Nicknames and role hierarchy.',
                      'pending': 'Nickname update pending.', 'legacy': 'Existing verification; nickname preserved.'}
             result.add_field(name='SERVER NICKNAME', value=notes[row['nickname_state']], inline=False)
+        delivery = {'pending': 'Pending / will retry', 'done': 'Sent successfully', 'blocked': 'Delivery failed / DMs unavailable'}
+        result.add_field(name='SUBMISSION DM', value=delivery[row['submission_dm']], inline=True)
+        result.add_field(name='RESULT DM', value='Waiting for a staff decision' if status == 'pending' else delivery[row['decision_dm']], inline=True)
         result.set_footer(text=f"Application {row['id']}")
         return result
 
@@ -272,22 +385,28 @@ class VerificationBot(discord.Client):
             return
         member = await self.guild.fetch_member(row['user_id'])
         before = {r.id for r in member.roles}
+        if row['operation'] == 'name':
+            self.db.finish_acceptance(application_id)
+            return
         member_role = self.target_role(row)
         progress_role = self.ids['PROGRESS_ROLE_ID']
         if not row['transfer_started']:
             self.db.update(application_id, transfer_started=True,
                            transfer_eligible=member_role not in before and progress_role in before)
+        previous_role = self.target_role(row['previous']) if row['previous'] and row['previous']['kind'] != row['kind'] else None
         failure = None
         try:
             if member_role not in before:
                 await member.add_roles(self.guild.get_role(member_role), reason='Verification accepted')
+            if previous_role and previous_role in before:
+                await member.remove_roles(self.guild.get_role(previous_role), reason='Approved clan change')
             if progress_role in before:
                 await member.remove_roles(self.guild.get_role(progress_role), reason='Verification accepted')
         except discord.HTTPException as error:
             failure = error
         current = await self.guild.fetch_member(row['user_id'])
         after = {r.id for r in current.roles}
-        if member_role in after and progress_role not in after:
+        if member_role in after and progress_role not in after and (not previous_role or previous_role not in after):
             self.db.finish_acceptance(application_id)
         elif failure:
             raise failure
@@ -299,13 +418,13 @@ class VerificationBot(discord.Client):
         if row['status'] != 'accepted' or not row['roles_done'] or row['nickname_state'] != 'pending':
             return
         member = await self.guild.fetch_member(row['user_id'])
-        nickname = row['username'][:32]
+        requested_nickname = nickname(row)
         state = 'done'
         try:
-            if member.nick != nickname:
-                await member.edit(nick=nickname, reason='Verification accepted')
+            if member.nick != requested_nickname:
+                await member.edit(nick=requested_nickname, reason='Verification accepted')
             current = await self.guild.fetch_member(row['user_id'])
-            if current.nick != nickname:
+            if current.nick != requested_nickname:
                 return
         except discord.Forbidden:
             state = 'blocked'
@@ -320,7 +439,8 @@ class VerificationBot(discord.Client):
                            and row['user_id'] == member.id and row['status'] == 'accepted' and not row['roles_done']), None)
         if unfinished:
             await self.apply_acceptance(unfinished['id'])
-            return
+            if unfinished['operation'] != 'name':
+                return
         roles = {r.id for r in member.roles}
         member_role = self.target_role({'kind': self.db.verified_kind(self.guild.id, member.id)})
         progress_role = self.ids['PROGRESS_ROLE_ID']
@@ -340,9 +460,11 @@ class VerificationBot(discord.Client):
         if field == 'submission_dm':
             text = 'Your request has been successfully submitted. Please wait until staff verify it.'
         elif row['status'] == 'accepted':
-            if not row['roles_done']:
+            if not row['roles_done'] or not row['profile_done']:
                 return
-            text = f"Your verification has been accepted. You now have **{row['kind'].title()}** access. Welcome to SaS!"
+            text = f"Your request has been accepted. Your approved profile is **{safe(nickname(row))}** with **{row['kind'].title()}** access."
+            if row['nickname_state'] == 'blocked':
+                text += '\nThe nickname change could not be applied. Please ask staff to set it manually.'
         elif row['status'] == 'rejected':
             text = f"Your verification was rejected.\n\n**Reason:** {safe(row['reason'])}\n\nYou can reapply at {zurich_time(row['retry_after']) if row.get('retry_after') else 'any time'}."
         elif row['status'] == 'cancelled':
@@ -407,13 +529,19 @@ class VerificationBot(discord.Client):
         await self.attempt(self.sync_review, application_id)
         await self.attempt(self.apply_acceptance, application_id)
         await self.attempt(self.apply_nickname, application_id)
-        await self.attempt(self.sync_review, application_id)
+        self.db.finish_profile(application_id)
         await self.attempt(self.send_dm, application_id, 'submission_dm')
         await self.attempt(self.send_dm, application_id, 'decision_dm')
+        await self.attempt(self.sync_review, application_id)
 
     @tasks.loop(seconds=30)
     async def recover(self):
         async with self.lock:
+            if self.db.paused()['dirty']:
+                await self.attempt(self.ensure_panel)
+            for job in self.db.nickname_jobs():
+                if job['guild_id'] == self.guild.id:
+                    await self.attempt(self.apply_member_prefix, job)
             for row in self.db.applications():
                 if row['guild_id'] == self.guild.id:
                     try:
@@ -433,7 +561,50 @@ class VerificationBot(discord.Client):
                 except discord.HTTPException:
                     log.exception('Join role failed; will retry')
                     continue
+                self.db.queue_nickname(job['guild_id'], job['user_id'])
                 self.db.finish_join(job['guild_id'], job['user_id'])
+
+    async def discover_member_prefixes(self):
+        try:
+            async for member in self.guild.fetch_members(limit=None):
+                if not member.bot and any(r.id == self.ids['MEMBER_ROLE_ID'] for r in member.roles):
+                    async with self.lock:
+                        self.db.queue_nickname(self.guild.id, member.id)
+        except (discord.HTTPException, OSError):
+            log.exception('Could not finish discovering Member nicknames; discovery will run again on restart')
+
+    async def apply_member_prefix(self, job):
+        if any(r['guild_id'] == self.guild.id and r['user_id'] == job['user_id'] and r['status'] == 'accepted' and not r['profile_done'] for r in self.db.applications()):
+            return
+        try:
+            member = await self.guild.fetch_member(job['user_id'])
+            if not any(r.id == self.ids['MEMBER_ROLE_ID'] for r in member.roles) or member.bot:
+                self.db.finish_nickname_job(self.guild.id, job['user_id'], 'skipped')
+                return
+            profile = profile_from_member(member, self.ids, self.db.profile(self.guild.id, member.id))
+            desired = nickname(profile)
+            if member.nick != desired:
+                await member.edit(nick=desired, reason='SaS Member nickname prefix')
+            confirmed = await self.guild.fetch_member(member.id)
+            if confirmed.nick != desired:
+                return
+            self.db.save_profile(self.guild.id, member.id, profile)
+            self.db.finish_nickname_job(self.guild.id, member.id, 'done')
+        except discord.NotFound:
+            self.db.finish_nickname_job(self.guild.id, job['user_id'], 'skipped')
+        except discord.HTTPException as error:
+            if error.status not in (400, 403):
+                raise
+            self.db.finish_nickname_job(self.guild.id, job['user_id'], 'blocked')
+            log.warning('Could not prefix Member %s; check nickname permissions and hierarchy, then set the nickname manually', job['user_id'])
+
+    async def on_member_update(self, before, after):
+        if not self.configured or after.bot or after.guild.id != self.guild.id:
+            return
+        member_role = self.ids['MEMBER_ROLE_ID']
+        if member_role not in {r.id for r in before.roles} and member_role in {r.id for r in after.roles}:
+            async with self.lock:
+                self.db.queue_nickname(self.guild.id, after.id, force=True)
 
     async def on_member_join(self, member):
         if member.bot or not self.configured or member.guild.id != self.guild.id:
@@ -442,6 +613,7 @@ class VerificationBot(discord.Client):
             self.db.queue_join(self.guild.id, member.id)
             try:
                 await self.prepare_member(member)
+                self.db.queue_nickname(self.guild.id, member.id, force=True)
                 self.db.finish_join(self.guild.id, member.id)
             except discord.HTTPException:
                 log.exception('Join role failed; will retry')
@@ -464,6 +636,8 @@ class VerificationBot(discord.Client):
         await self.delete_messages(payload.guild_id, payload.message_ids)
 
     async def close(self):
+        if self.prefix_task and not self.prefix_task.done():
+            self.prefix_task.cancel()
         if self.recover.is_running():
             self.recover.cancel()
         await super().close()

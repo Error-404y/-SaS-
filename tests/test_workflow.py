@@ -17,11 +17,13 @@ class BotFixture:
         with patch.dict(os.environ, {'DATABASE_PATH': self.temp.name + '/verification.json'}):
             self.bot = VerificationBot()
         self.bot.guild = MagicMock(id=1)
+        self.bot.guild.icon = None
         self.bot.guild.get_role.side_effect = lambda role_id: role_id
         self.bot.configured = True
         self.member = MagicMock(id=2)
         self.member.roles = [MagicMock(id=self.bot.ids['PROGRESS_ROLE_ID'])]
         self.member.guild_permissions.administrator = False
+        self.member.name = 'Player'
         self.member.nick = None
         async def edit_member(**kwargs):
             self.member.nick = kwargs['nick']
@@ -90,7 +92,7 @@ class BotFixture:
 
 class WorkflowTests(BotFixture, unittest.IsolatedAsyncioTestCase):
     async def test_only_verify_and_accept_reject_controls_exist(self):
-        self.assertEqual([c.label for c in VerifyView(self.bot).children], ['Verify - Member', 'Verify - Allies'])
+        self.assertEqual([c.label for c in VerifyView(self.bot).children], ['Verify - Member', 'Verify - Allies', 'Name change', 'Clan change', 'Staff controls'])
         self.assertEqual([c.label for c in ReviewView(self.bot).children], ['Accept', 'Reject'])
         self.assertEqual(len(ApplicationModal(self.bot).children), 1)
         self.assertTrue(ReviewView(self.bot).is_persistent())
@@ -382,7 +384,7 @@ class WorkflowTests(BotFixture, unittest.IsolatedAsyncioTestCase):
         row = self.bot.db.create(1, 2, 'A' * 100)
         self.bot.db.decide(row['id'], 3, 'accepted')
         await self.bot.process(row['id'])
-        self.assertEqual(self.member.nick, 'A' * 32)
+        self.assertEqual(self.member.nick, '[SaS] ' + 'A' * 26)
         self.assertEqual(self.bot.db.get(row['id'])['username'], 'A' * 100)
 
     async def test_nickname_transient_failure_retries_without_repeating_roles(self):
@@ -393,7 +395,7 @@ class WorkflowTests(BotFixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bot.db.get(identifier)['nickname_state'], 'pending')
         self.member.edit.side_effect = original
         await self.bot.process(identifier)
-        self.assertEqual(self.member.nick, 'Player')
+        self.assertEqual(self.member.nick, '[SaS] Player')
         self.member.add_roles.assert_awaited_once()
 
     async def test_both_buttons_open_correct_modal(self):
