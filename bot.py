@@ -2,6 +2,9 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 import logging
 import os
+import re
+
+import aiohttp
 
 import discord
 from discord import app_commands
@@ -9,6 +12,7 @@ from discord.ext import tasks
 from dotenv import load_dotenv
 
 from database import Database
+from delivery import EditDeferred, EditPacer
 from time_utils import zurich_time, ZurichFormatter
 from views import VerifyView, ReviewView, PauseControls, embed, reply, valid_username
 from identity import nickname, profile_from_member, clean_clan, valid_clan
@@ -37,7 +41,9 @@ class VerificationBot(discord.Client):
     def __init__(self):
         intents = discord.Intents.default()
         intents.members = True
-        super().__init__(intents=intents, allowed_mentions=discord.AllowedMentions.none())
+        trace = aiohttp.TraceConfig()
+        trace.on_request_end.append(self.observe_edit_response)
+        super().__init__(intents=intents, allowed_mentions=discord.AllowedMentions.none(), http_trace=trace)
         self.ids = {key: int(os.getenv(key, value)) for key, value in DEFAULTS.items()}
         self.db = Database(os.getenv('DATABASE_PATH', 'data/verification.json'), os.getenv('REJECTION_COOLDOWN_SECONDS', '600'))
         self.lock = asyncio.Lock()
@@ -45,7 +51,7 @@ class VerificationBot(discord.Client):
         self.configured = False
         self.prefix_task = None
         self.edit_locks = {}
-        self.next_edit = {}
+        self.edit_pacer = EditPacer(lambda: self.db)
 
     async def setup_hook(self):
         self.add_view(VerifyView(self))
@@ -267,11 +273,23 @@ class VerificationBot(discord.Client):
         panel.set_footer(text='SaS community | Staff approval required | No instant role changes')
         return panel
 
+    async def observe_edit_response(self, session, context, params):
+        match = re.fullmatch(r'/api/v[0-9]+/channels/([0-9]+)/messages/[0-9]+', params.url.path)
+        if params.method != 'PATCH' or not match:
+            return
+        try:
+            body = None
+            if params.response.status == 429:
+                try:
+                    body = await params.response.json(content_type=None)
+                except (ValueError, aiohttp.ClientError):
+                    pass
+            self.edit_pacer.observe(int(match.group(1)), params.response.status, params.response.headers, body)
+        except (OSError, ValueError, TypeError):
+            log.exception('Could not save Discord edit pacing; the library still handles request retries')
+
     async def wait_for_edit(self, channel_id):
-        loop = asyncio.get_running_loop()
-        delay = self.next_edit.get(channel_id, 0) - loop.time()
-        if delay > 0:
-            await asyncio.sleep(delay)
+        self.edit_pacer.reserve(channel_id)
 
     async def edit_message(self, message, result, view=None):
         def embed_content(value):
@@ -294,7 +312,7 @@ class VerificationBot(discord.Client):
             try:
                 await message.edit(embed=result, view=view)
             finally:
-                self.next_edit[channel_id] = asyncio.get_running_loop().time() + 1.2
+                self.edit_pacer.finished(channel_id)
         return True
 
     async def validate_control_channel(self):
@@ -364,8 +382,9 @@ class VerificationBot(discord.Client):
                 await self.validate()
                 await self.validate_log_channel()
                 await self.validate_control_channel()
-                await self.ensure_panel()
-                await self.ensure_control_panel()
+                self.db.refresh_panels()
+                await self.attempt(self.ensure_panel)
+                await self.attempt(self.ensure_control_panel)
                 tree = app_commands.CommandTree(self)
                 try:
                     for command in await tree.fetch_commands(guild=self.guild):
@@ -375,6 +394,7 @@ class VerificationBot(discord.Client):
                     log.warning('Could not remove the retired settings command; verification can still run.')
                 self.configured = True
                 self.recover.start()
+                self.refresh_messages.start()
                 self.prefix_task = asyncio.create_task(self.discover_member_prefixes())
                 log.info('Ready as %s in %s', self.user, self.guild.name)
             except Exception:
@@ -433,6 +453,8 @@ class VerificationBot(discord.Client):
     async def sync_review(self, application_id):
         row = self.db.get(application_id)
         if row['review_deleted'] or not row['review_dirty']:
+            return
+        if row['message_id'] and not self.edit_pacer.ready(self.ids['REVIEW_CHANNEL_ID']):
             return
         message = None
         if row['message_id']:
@@ -574,6 +596,8 @@ class VerificationBot(discord.Client):
     async def sync_history(self, history):
         if history['guild_id'] != self.guild.id or not history['dirty'] or history['deleted']:
             return
+        if history['message_id'] and not self.edit_pacer.ready(self.ids['LOG_CHANNEL_ID']):
+            return
         message = None
         if history['message_id']:
             try:
@@ -596,6 +620,8 @@ class VerificationBot(discord.Client):
     async def attempt(self, action, *args):
         try:
             await action(*args)
+        except EditDeferred:
+            return
         except (discord.HTTPException, OSError):
             log.exception('%s failed; saved work will retry', action.__name__)
 
@@ -611,6 +637,19 @@ class VerificationBot(discord.Client):
         await self.attempt(self.send_dm, application_id, 'submission_dm')
         await self.attempt(self.send_dm, application_id, 'decision_dm')
         await self.attempt(self.sync_review, application_id)
+
+    @tasks.loop(seconds=5)
+    async def refresh_messages(self):
+        async with self.lock:
+            if self.db.paused()['dirty']:
+                await self.attempt(self.ensure_panel)
+            if self.db.paused()['control_dirty']:
+                await self.attempt(self.ensure_control_panel)
+            for row in self.db.applications():
+                if row['guild_id'] == self.guild.id and row['review_dirty'] and not row['review_deleted']:
+                    await self.attempt(self.sync_review, row['id'])
+            for history in self.db.histories():
+                await self.attempt(self.sync_history, history)
 
     @tasks.loop(seconds=30)
     async def recover(self):
@@ -716,6 +755,8 @@ class VerificationBot(discord.Client):
         await self.delete_messages(payload.guild_id, payload.message_ids)
 
     async def close(self):
+        if self.refresh_messages.is_running():
+            self.refresh_messages.cancel()
         if self.prefix_task and not self.prefix_task.done():
             self.prefix_task.cancel()
         if self.recover.is_running():

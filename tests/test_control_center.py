@@ -6,6 +6,7 @@ import discord
 from discord.components import _component_factory
 
 from database import Database
+from delivery import EditDeferred
 from test_workflow import BotFixture
 from views import PauseControls, ReviewView, VerifyView, embed
 
@@ -142,10 +143,10 @@ class ControlCenterTests(BotFixture, unittest.IsolatedAsyncioTestCase):
         with patch('bot.asyncio.sleep', new_callable=AsyncMock) as sleep:
             await self.bot.edit_message(message, embed('After'))
             sleep.assert_not_awaited()
-            await self.bot.edit_message(message, embed('Another update'))
-            sleep.assert_awaited_once()
-            self.assertGreater(sleep.call_args.args[0], 0)
-            self.assertLessEqual(sleep.call_args.args[0], 1.2)
+            with self.assertRaises(EditDeferred):
+                await self.bot.edit_message(message, embed('Another update'))
+            sleep.assert_not_awaited()
+            message.edit.assert_awaited_once()
 
     async def test_setup_registers_persistent_staff_controls(self):
         with patch.object(self.bot, 'add_view') as add_view:
