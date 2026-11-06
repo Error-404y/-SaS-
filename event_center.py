@@ -380,7 +380,7 @@ class EventCenter:
             ends = datetime.fromtimestamp(event['ends_at'], timezone.utc).strftime('%m/%d %H:%M')
             details.append(f"**#{event['id']} {clean(event['title'], 45)}** | {starts} - {ends} UTC")
         if details:
-            embed.add_field(name='EVENT TIMES | SERVER CLOCK', value='\\n'.join(details)[:1024], inline=False)
+            embed.add_field(name='EVENT TIMES | SERVER CLOCK', value='\n'.join(details)[:1024], inline=False)
         embed.set_footer(text='SaS Event Center | Times follow the in-game server schedule | UTC')
         embed.timestamp = now
         if publish:
