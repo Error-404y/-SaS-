@@ -79,10 +79,10 @@ def event_banner(title, category, stage, starts_at=None, ends_at=None, server_no
     draw.text((43, 247), stage_label, font=typeface(18, True), fill=(60, 85, 117))
     if starts_at is not None:
         start = datetime.fromtimestamp(int(starts_at), timezone.utc)
-        date_string = start.strftime('%a %m/%d %H:%M')
+        date_string = start.strftime('%m/%d %H:%M:%S')
         if ends_at is not None:
             finish = datetime.fromtimestamp(int(ends_at), timezone.utc)
-            date_string += '  -  ' + finish.strftime('%a %m/%d %H:%M')
+            date_string += '  -  ' + finish.strftime('%m/%d %H:%M:%S')
         date_string += ' UTC'
         label_font = fit_text(draw, date_string, 620, 18, True)
         tw = draw.textbbox((0,0), date_string, font=label_font)[2]
@@ -174,7 +174,7 @@ def weekly_calendar(events, first_day, server_now=None, timezone_label='UTC', de
             available_width = max(45, bx1 - bx0 - 39)
             title = ellipsis(draw, row['title'], available_width, typeface(22, True))
             draw.text((bx0 + 12, y + 11), title, font=typeface(22, True), fill=(255, 255, 255), stroke_width=1, stroke_fill=(91, 79, 69))
-            time_string = start.strftime('%a %H:%M') + '  -  ' + finish.strftime('%a %H:%M') + '  ' + timezone_label
+            time_string = start.strftime('%m/%d %H:%M:%S') + '  -  ' + finish.strftime('%m/%d %H:%M:%S') + '  ' + timezone_label
             time_font = typeface(15, True)
             draw.text((bx0 + 12, y + 41), ellipsis(draw, time_string, available_width, time_font), font=time_font, fill=(45, 56, 70))
             cursor += lane
