@@ -108,7 +108,7 @@ def weekly_calendar(events, first_day, server_now=None, timezone_label='UTC', de
         groups = [('EVENTS', [])]
     lane = 78
     section_header = 45
-    top = 328
+    top = 373
     grid_height = sum(section_header + max(1, len(items)) * lane for _, items in groups)
     height = top + grid_height + 80
     width = 1120
