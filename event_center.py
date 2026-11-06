@@ -4,6 +4,7 @@ import os
 import sqlite3
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from typing import Literal
 
 import discord
 from discord import app_commands
@@ -278,14 +279,15 @@ class EventCenter:
         async def setup(interaction: discord.Interaction, channel: discord.TextChannel, notify_role: discord.Role = None):
             if not self.is_staff(interaction):
                 return await interaction.response.send_message('Staff access required.', ephemeral=True)
-            if not channel.permissions_for(interaction.guild.me).send_messages or not channel.permissions_for(interaction.guild.me).embed_links:
-                return await interaction.response.send_message('The bot needs Send Messages and Embed Links in that channel.', ephemeral=True)
+            permissions = channel.permissions_for(interaction.guild.me)
+            if not all((permissions.view_channel, permissions.send_messages, permissions.embed_links, permissions.attach_files, permissions.read_message_history)):
+                return await interaction.response.send_message('The bot needs View Channel, Send Messages, Embed Links, Attach Files and Read Message History.', ephemeral=True)
             self.store.set_channel(interaction.guild_id, channel.id, notify_role.id if notify_role else None)
             await interaction.response.send_message(f"Event reminders will be posted in {channel.mention}. Role mention at event start: {notify_role.mention if notify_role else 'disabled'}.", ephemeral=True)
 
         @group.command(name='create', description='Schedule an event using the in-game server time in UTC')
         @app_commands.describe(title='Event name', start_utc='Game server time: YYYY-MM-DD HH:MM UTC', category='Alliance, Events, Deals, or Other', notes='Optional event details')
-        async def create(interaction: discord.Interaction, title: str, start_utc: str, category: str = 'Alliance', notes: str = ''):
+        async def create(interaction: discord.Interaction, title: str, start_utc: str, category: Literal['Alliance','Events','Deals','Other'] = 'Alliance', notes: str = ''):
             if not self.is_staff(interaction):
                 return await interaction.response.send_message('Staff access required.', ephemeral=True)
             settings = self.store.settings(interaction.guild_id)
@@ -306,11 +308,15 @@ class EventCenter:
             now = int(datetime.now(timezone.utc).timestamp())
             event_id = self.store.create(interaction.guild_id, channel.id, title, category, notes, starts_at, interaction.user.id, now)
             event = self.store.event(event_id)
-            file = discord.File(event_banner(title, category, 'upcoming'), filename='sas_event.png')
             embed = self.build_embed(event)
-            embed.set_image(url='attachment://sas_event.png')
+            kwargs = dict(embed=embed, view=EventReminderView(self), allowed_mentions=discord.AllowedMentions.none())
             try:
-                message = await channel.send(embed=embed, file=file, view=EventReminderView(self), allowed_mentions=discord.AllowedMentions.none())
+                kwargs['file'] = discord.File(event_banner(title, category, 'upcoming'), filename='sas_event.png')
+                embed.set_image(url='attachment://sas_event.png')
+            except Exception:
+                log.exception('Unable to render event banner for %s', event_id)
+            try:
+                message = await channel.send(**kwargs)
             except discord.HTTPException:
                 log.exception('Could not publish SaS event %s', event_id)
                 self.store.cancel(event_id, interaction.guild_id)
@@ -359,16 +365,20 @@ class EventCenter:
             if not isinstance(channel, discord.TextChannel):
                 continue
             result = self.build_embed(event, stage)
-            file = discord.File(event_banner(event['title'], event['category'], stage), filename='sas_event_reminder.png')
-            result.set_image(url='attachment://sas_event_reminder.png')
+            extra = {}
+            try:
+                extra['file'] = discord.File(event_banner(event['title'], event['category'], stage), filename='sas_event_reminder.png')
+                result.set_image(url='attachment://sas_event_reminder.png')
+            except Exception:
+                log.exception('Unable to render reminder banner for event %s', event['id'])
             settings = self.store.settings(event['guild_id'])
             role = self.bot.guild.get_role(settings['role_id']) if settings and settings['role_id'] and stage == 'start' else None
             try:
                 message = await channel.send(
                     content=role.mention if role else None,
                     embed=result,
-                    file=file,
-                    allowed_mentions=discord.AllowedMentions(roles=[role] if role else [], users=False, everyone=False)
+                    allowed_mentions=discord.AllowedMentions(roles=[role] if role else [], users=False, everyone=False),
+                    **extra
                 )
             except discord.HTTPException:
                 log.exception('Failed to send event %s stage %s',event['id'],stage)
