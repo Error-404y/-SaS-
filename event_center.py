@@ -370,7 +370,7 @@ class EventCenter:
         banner = discord.File(weekly_calendar(events, first, now, 'UTC'), filename='sas_weekly_calendar.png')
         embed = discord.Embed(
             title='SaS | Weekly Event Calendar',
-            description=f"**Server Time:** {now.strftime('%Y-%m-%d %H:%M:%S')} UTC\\n**Calendar:** {first.strftime('%d %b')} - {(first + timedelta(days=6)).strftime('%d %b %Y')}\\n**Scheduled events:** {len(events)}",
+            description=f"**Server Time:** {now.strftime('%Y-%m-%d %H:%M:%S')} UTC\n**Calendar:** {first.strftime('%d %b')} - {(first + timedelta(days=6)).strftime('%d %b %Y')}\n**Scheduled events:** {len(events)}",
             color=0x67B0E1
         )
         embed.set_image(url='attachment://sas_weekly_calendar.png')
@@ -441,7 +441,7 @@ class EventCenter:
             embed = self.build_embed(event)
             kwargs = dict(embed=embed, view=EventReminderView(self), allowed_mentions=discord.AllowedMentions.none())
             try:
-                kwargs['file'] = discord.File(event_banner(title, category, 'upcoming'), filename='sas_event.png')
+                kwargs['file'] = discord.File(event_banner(title, category, 'upcoming', starts_at, ends_at), filename='sas_event.png')
                 embed.set_image(url='attachment://sas_event.png')
             except Exception:
                 log.exception('Unable to render event banner for %s', event_id)
@@ -491,7 +491,15 @@ class EventCenter:
                 try:
                     message = await channel.fetch_message(updated['message_id'])
                     embed = self.build_embed(updated)
-                    await message.edit(embed=embed, view=EventReminderView(self))
+                    attachments = []
+                    try:
+                        attachments = [discord.File(event_banner(updated['title'], updated['category'], 'upcoming', updated['starts_at'], updated['ends_at']), filename='sas_event.png')]
+                        embed.set_image(url='attachment://sas_event.png')
+                    except Exception:
+                        log.exception('Unable to update banner for event %s', event_id)
+                    edited = await message.edit(embed=embed, attachments=attachments, view=EventReminderView(self))
+                    if edited and edited.attachments:
+                        self.store.set_message(event_id, edited.id, edited.attachments[0].url)
                 except discord.HTTPException:
                     log.exception('Unable to update existing event message %s',event_id)
             await interaction.followup.send(f'Event #{event_id} updated. Reminders follow the new start time if rescheduled.', ephemeral=True)
@@ -538,7 +546,7 @@ class EventCenter:
             result = self.build_embed(event, stage)
             extra = {}
             try:
-                extra['file'] = discord.File(event_banner(event['title'], event['category'], stage), filename='sas_event_reminder.png')
+                extra['file'] = discord.File(event_banner(event['title'], event['category'], stage, event['starts_at'], event['ends_at']), filename='sas_event_reminder.png')
                 result.set_image(url='attachment://sas_event_reminder.png')
             except Exception:
                 log.exception('Unable to render reminder banner for event %s', event['id'])
