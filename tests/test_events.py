@@ -5,7 +5,7 @@ from pathlib import Path
 
 from PIL import Image
 
-from event_center import EventStore, EventReminderView, parse_utc
+from event_center import EventStore, EventReminderView, EventCenter, CalendarNavigation, parse_utc
 from bot import VerificationBot
 from unittest.mock import patch
 import os
@@ -156,6 +156,25 @@ class EventCommandTests(unittest.IsolatedAsyncioTestCase):
                     ['calendar', 'cancel', 'create', 'edit', 'setup', 'upcoming']
                 )
                 await bot.close()
+
+
+class CalendarDiscordTests(unittest.IsolatedAsyncioTestCase):
+    async def test_discord_calendar_embed_and_navigation(self):
+        with tempfile.TemporaryDirectory() as folder:
+            class Stub:
+                guild = discord.Object(id=1)
+            manager = EventCenter(Stub(), Path(folder) / 'calendar.sqlite3')
+            now = int(datetime.now(timezone.utc).timestamp())
+            manager.store.create(1, 123, 'Alliance Mobilization', 'Alliance', 'Prepare your members',
+                                 now + 3600, 19, now, ends_at=now + 2 * 86400)
+            embed, attachment = manager.calendar_payload(1)
+            self.assertEqual(embed.title, 'SaS | Weekly Event Calendar')
+            self.assertTrue(any(field.name == 'EVENT TIMES | SERVER CLOCK' for field in embed.fields))
+            self.assertEqual(Image.open(attachment.fp).format, 'PNG')
+            controls = CalendarNavigation(manager, 19)
+            self.assertEqual([button.label for button in controls.children],
+                             ['Previous Week', 'This Week', 'Next Week', 'Upcoming Events'])
+            manager.close()
 
 
 class CalendarImageTests(unittest.TestCase):
