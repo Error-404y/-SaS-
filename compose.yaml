@@ -5,6 +5,7 @@ services:
     env_file: .env
     environment:
       DATABASE_PATH: /app/data/verification.json
+      EVENT_DATABASE_PATH: /app/data/events.sqlite3
     volumes:
       - verification-data:/app/data
 volumes:
