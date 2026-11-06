@@ -125,7 +125,7 @@ class EventStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.settings(1)['role_id'], 987)
 
     def test_second_precision_matches_in_game_calendar(self):
-        start = parse_utc('2026-11-06 00:00:00', now=0)
+        start = parse_utc('2026-11-06 00:00:00', now=int(datetime(2026, 11, 1, tzinfo=timezone.utc).timestamp()))
         end = parse_utc('2026-11-08 23:59:59', now=0, future=False)
         self.assertEqual(datetime.fromtimestamp(start, timezone.utc).isoformat(), '2026-11-06T00:00:00+00:00')
         self.assertEqual(datetime.fromtimestamp(end, timezone.utc).isoformat(), '2026-11-08T23:59:59+00:00')
@@ -133,12 +133,12 @@ class EventStoreTests(unittest.IsolatedAsyncioTestCase):
 
     def test_colon_separated_dates_and_minute_only_backwards_compatibility(self):
         self.assertEqual(
-            parse_utc('2026:11:08 23:59:59', now=0),
-            parse_utc('2026-11-08 23:59:59', now=0)
+            parse_utc('2026:11:08 23:59:59', now=int(datetime(2026, 11, 1, tzinfo=timezone.utc).timestamp())),
+            parse_utc('2026-11-08 23:59:59', now=int(datetime(2026, 11, 1, tzinfo=timezone.utc).timestamp()))
         )
         self.assertEqual(
-            parse_utc('2026-11-08 19:00', now=0),
-            parse_utc('2026-11-08 19:00:00', now=0)
+            parse_utc('2026-11-08 19:00', now=int(datetime(2026, 11, 1, tzinfo=timezone.utc).timestamp())),
+            parse_utc('2026-11-08 19:00:00', now=int(datetime(2026, 11, 1, tzinfo=timezone.utc).timestamp()))
         )
         with self.assertRaises(ValueError):
             parse_utc('2026-11-08 24:00:00', now=0)
