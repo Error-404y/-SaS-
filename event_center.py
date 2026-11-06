@@ -380,14 +380,12 @@ class EventCenter:
     async def upcoming_message(self, interaction):
         await interaction.response.send_message(embed=self.upcoming_embed(self.store.upcoming(interaction.guild_id)), ephemeral=True)
 
-    async def show_calendar(self, interaction, week_offset=0, update=False, view=None, publish=False):
-        if interaction.guild_id != getattr(self.bot.guild, 'id', None):
-            return await interaction.response.send_message('Only available in the SaS server.', ephemeral=True)
+    def calendar_payload(self, guild_id, week_offset=0):
         now = datetime.now(timezone.utc)
         first = now.date() - timedelta(days=2) + timedelta(days=week_offset * 7)
         begin = int(datetime.combine(first, datetime.min.time(), timezone.utc).timestamp())
         end = begin + 7 * 86400
-        events = self.store.calendar_events(interaction.guild_id, begin, end)
+        events = self.store.calendar_events(guild_id, begin, end)
         banner = discord.File(weekly_calendar(events, first, now, 'UTC'), filename='sas_weekly_calendar.png')
         embed = discord.Embed(
             title='SaS | Weekly Event Calendar',
@@ -404,6 +402,28 @@ class EventCenter:
             embed.add_field(name='EVENT TIMES | SERVER CLOCK', value='\n'.join(details)[:1024], inline=False)
         embed.set_footer(text='SaS Event Center | Times follow the in-game server schedule | UTC')
         embed.timestamp = now
+        return embed, banner
+
+    async def refresh_board(self, guild_id):
+        settings = self.store.settings(guild_id)
+        if settings is None or not settings['calendar_message_id']:
+            return None
+        channel = self.bot.guild.get_channel(settings['channel_id'])
+        if not isinstance(channel, discord.TextChannel):
+            return None
+        try:
+            message = await channel.fetch_message(settings['calendar_message_id'])
+        except discord.NotFound:
+            self.store.set_board(guild_id, None)
+            return None
+        embed, banner = self.calendar_payload(guild_id)
+        edited = await message.edit(embed=embed, attachments=[banner], allowed_mentions=discord.AllowedMentions.none())
+        self.store.set_board(guild_id, edited.id if edited else message.id)
+        return edited or message
+
+    async def show_calendar(self, interaction, week_offset=0, update=False, view=None, publish=False):
+        if interaction.guild_id != getattr(self.bot.guild, 'id', None):
+            return await interaction.response.send_message('Only available in the SaS server.', ephemeral=True)
         if publish:
             settings = self.store.settings(interaction.guild_id)
             if settings is None:
@@ -413,11 +433,17 @@ class EventCenter:
                 return await interaction.response.send_message('Configured calendar channel is unavailable.', ephemeral=True)
             await interaction.response.defer(ephemeral=True, thinking=True)
             try:
+                existing = await self.refresh_board(interaction.guild_id)
+                if existing:
+                    return await interaction.followup.send(f'Calendar refreshed in {channel.mention}: {existing.jump_url}', ephemeral=True)
+                embed, banner = self.calendar_payload(interaction.guild_id, week_offset)
                 message = await channel.send(embed=embed, file=banner, allowed_mentions=discord.AllowedMentions.none())
+                self.store.set_board(interaction.guild_id, message.id)
             except discord.HTTPException:
                 log.exception('Unable to publish SaS weekly calendar')
                 return await interaction.followup.send('Calendar could not be posted. Check channel permissions.', ephemeral=True)
             return await interaction.followup.send(f'Calendar posted in {channel.mention}: {message.jump_url}', ephemeral=True)
+        embed, banner = self.calendar_payload(interaction.guild_id, week_offset)
         if view is None:
             view = CalendarNavigation(self, interaction.user.id, week_offset)
         if update:
