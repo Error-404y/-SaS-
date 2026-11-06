@@ -31,7 +31,9 @@ class EventStore:
             CREATE TABLE IF NOT EXISTS event_settings (
                 guild_id INTEGER PRIMARY KEY,
                 channel_id INTEGER NOT NULL,
-                role_id INTEGER
+                role_id INTEGER,
+                calendar_message_id INTEGER,
+                calendar_refreshed_at INTEGER
             );
             CREATE TABLE IF NOT EXISTS game_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -73,6 +75,11 @@ class EventStore:
                 FOREIGN KEY(event_id) REFERENCES game_events(id)
             );
         """)
+        settings_columns = {row['name'] for row in self.conn.execute('PRAGMA table_info(event_settings)')}
+        if 'calendar_message_id' not in settings_columns:
+            self.conn.execute('ALTER TABLE event_settings ADD COLUMN calendar_message_id INTEGER')
+        if 'calendar_refreshed_at' not in settings_columns:
+            self.conn.execute('ALTER TABLE event_settings ADD COLUMN calendar_refreshed_at INTEGER')
         columns = {row['name'] for row in self.conn.execute('PRAGMA table_info(game_events)')}
         if 'ends_at' not in columns:
             self.conn.execute('ALTER TABLE game_events ADD COLUMN ends_at INTEGER')
@@ -80,12 +87,26 @@ class EventStore:
 
     def set_channel(self, guild_id, channel_id, role_id):
         self.conn.execute(
-            'INSERT INTO event_settings(guild_id,channel_id,role_id) VALUES(?,?,?) ON CONFLICT(guild_id) DO UPDATE SET channel_id=excluded.channel_id,role_id=excluded.role_id',
+            'INSERT INTO event_settings(guild_id,channel_id,role_id) VALUES(?,?,?) ON CONFLICT(guild_id) DO UPDATE SET channel_id=excluded.channel_id,role_id=excluded.role_id,calendar_message_id=CASE WHEN channel_id=excluded.channel_id THEN calendar_message_id ELSE NULL END,calendar_refreshed_at=CASE WHEN channel_id=excluded.channel_id THEN calendar_refreshed_at ELSE NULL END',
             (guild_id, channel_id, role_id)
         )
 
     def settings(self, guild_id):
         return self.conn.execute('SELECT * FROM event_settings WHERE guild_id=?', (guild_id,)).fetchone()
+
+    def set_board(self, guild_id, message_id, now=None):
+        now = int(datetime.now(timezone.utc).timestamp()) if now is None else now
+        self.conn.execute(
+            'UPDATE event_settings SET calendar_message_id=?,calendar_refreshed_at=? WHERE guild_id=?',
+            (message_id, now, guild_id)
+        )
+
+    def boards_to_refresh(self, now=None):
+        now = int(datetime.now(timezone.utc).timestamp()) if now is None else now
+        return self.conn.execute(
+            'SELECT * FROM event_settings WHERE calendar_message_id IS NOT NULL AND COALESCE(calendar_refreshed_at,0)<=?',
+            (now - 3600,)
+        ).fetchall()
 
     def create(self, guild_id, channel_id, title, category, notes, starts_at, author_id, now=None, ends_at=None):
         now = int(datetime.now(timezone.utc).timestamp()) if now is None else now
