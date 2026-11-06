@@ -273,7 +273,42 @@ class EventReminderView(discord.ui.View):
 
     @discord.ui.button(label='View Schedule', style=discord.ButtonStyle.secondary, custom_id='sas:event:list:v1')
     async def schedule(self, interaction, button):
-        await self.manager.upcoming_message(interaction)
+        await self.manager.show_calendar(interaction)
+
+
+class CalendarNavigation(discord.ui.View):
+    def __init__(self, manager, user_id, week_offset=0):
+        super().__init__(timeout=240)
+        self.manager = manager
+        self.user_id = user_id
+        self.week_offset = week_offset
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message('Open your own calendar with /event calendar.', ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label='Previous Week', style=discord.ButtonStyle.secondary)
+    async def previous(self, interaction, button):
+        self.week_offset = max(-12, self.week_offset - 1)
+        await self.manager.show_calendar(interaction, self.week_offset, update=True, view=self)
+
+    @discord.ui.button(label='This Week', style=discord.ButtonStyle.primary)
+    async def current(self, interaction, button):
+        self.week_offset = 0
+        await self.manager.show_calendar(interaction, self.week_offset, update=True, view=self)
+
+    @discord.ui.button(label='Next Week', style=discord.ButtonStyle.secondary)
+    async def next_week(self, interaction, button):
+        self.week_offset = min(12, self.week_offset + 1)
+        await self.manager.show_calendar(interaction, self.week_offset, update=True, view=self)
+
+    @discord.ui.button(label='Upcoming Events', style=discord.ButtonStyle.secondary)
+    async def upcoming(self, interaction, button):
+        rows = self.manager.store.upcoming(interaction.guild_id)
+        result = self.manager.upcoming_embed(rows)
+        await interaction.response.send_message(embed=result, ephemeral=True)
 
 
 class EventCenter:
@@ -296,7 +331,11 @@ class EventCenter:
         result = discord.Embed(title=f"SaS | {name}", description=description, color=color)
         result.add_field(name='EVENT TYPE', value=clean(event['category'], 60), inline=True)
         result.add_field(name='SERVER START', value=f"<t:{event['starts_at']}:F>", inline=True)
+        result.add_field(name='SERVER END', value=f"<t:{event['ends_at']}:F>", inline=True)
         result.add_field(name='COUNTDOWN', value=f"<t:{event['starts_at']}:R>", inline=True)
+        server_start = datetime.fromtimestamp(event['starts_at'], timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+        server_end = datetime.fromtimestamp(event['ends_at'], timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+        result.add_field(name='IN-GAME SERVER TIME', value=f"{server_start} - {server_end}", inline=False)
         result.add_field(name='STATUS', value=status, inline=True)
         result.add_field(name='REMINDERS', value='24h / 1h / 15m / Start\nPersonal DM: 1h and 15m, opt-in only.', inline=False)
         result.set_footer(text=f"SaS Event Center | Event #{event['id']} | {stage}")
@@ -304,19 +343,59 @@ class EventCenter:
             result.set_image(url=event['banner_url'])
         return result
 
-    async def upcoming_message(self, interaction):
-        rows = self.store.upcoming(interaction.guild_id)
+    def upcoming_embed(self, rows):
         result = discord.Embed(title='SaS | Upcoming Events', color=0x318BCE)
         if rows:
             for event in rows[:10]:
                 result.add_field(
                     name=f"#{event['id']} | {clean(event['title'], 90)}",
-                    value=f"{clean(event['category'], 50)} | <t:{event['starts_at']}:F> (<t:{event['starts_at']}:R>)",
+                    value=f"{clean(event['category'], 50)} | <t:{event['starts_at']}:F> - <t:{event['ends_at']}:F> (<t:{event['starts_at']}:R>)",
                     inline=False
                 )
         else:
             result.description = 'No upcoming events have been scheduled.'
-        await interaction.response.send_message(embed=result, ephemeral=True)
+        return result
+
+    async def upcoming_message(self, interaction):
+        await interaction.response.send_message(embed=self.upcoming_embed(self.store.upcoming(interaction.guild_id)), ephemeral=True)
+
+    async def show_calendar(self, interaction, week_offset=0, update=False, view=None, publish=False):
+        if interaction.guild_id != getattr(self.bot.guild, 'id', None):
+            return await interaction.response.send_message('Only available in the SaS server.', ephemeral=True)
+        now = datetime.now(timezone.utc)
+        first = now.date() - timedelta(days=2) + timedelta(days=week_offset * 7)
+        begin = int(datetime.combine(first, datetime.min.time(), timezone.utc).timestamp())
+        end = begin + 7 * 86400
+        events = self.store.calendar_events(interaction.guild_id, begin, end)
+        banner = discord.File(weekly_calendar(events, first, now, 'UTC'), filename='sas_weekly_calendar.png')
+        embed = discord.Embed(
+            title='SaS | Weekly Event Calendar',
+            description=f"**Server Time:** {now.strftime('%Y-%m-%d %H:%M:%S')} UTC\\n**Calendar:** {first.strftime('%d %b')} - {(first + timedelta(days=6)).strftime('%d %b %Y')}\\n**Scheduled events:** {len(events)}",
+            color=0x67B0E1
+        )
+        embed.set_image(url='attachment://sas_weekly_calendar.png')
+        embed.set_footer(text='SaS Event Center | Times follow the in-game server schedule | UTC')
+        embed.timestamp = now
+        if publish:
+            settings = self.store.settings(interaction.guild_id)
+            if settings is None:
+                return await interaction.response.send_message('Run /event setup first.', ephemeral=True)
+            channel = interaction.guild.get_channel(settings['channel_id'])
+            if not isinstance(channel, discord.TextChannel):
+                return await interaction.response.send_message('Configured calendar channel is unavailable.', ephemeral=True)
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            try:
+                message = await channel.send(embed=embed, file=banner, allowed_mentions=discord.AllowedMentions.none())
+            except discord.HTTPException:
+                log.exception('Unable to publish SaS weekly calendar')
+                return await interaction.followup.send('Calendar could not be posted. Check channel permissions.', ephemeral=True)
+            return await interaction.followup.send(f'Calendar posted in {channel.mention}: {message.jump_url}', ephemeral=True)
+        if view is None:
+            view = CalendarNavigation(self, interaction.user.id, week_offset)
+        if update:
+            await interaction.response.edit_message(embed=embed, attachments=[banner], view=view)
+        else:
+            await interaction.response.send_message(embed=embed, file=banner, view=view, ephemeral=True)
 
     def register(self):
         if self.group_registered:
@@ -334,8 +413,8 @@ class EventCenter:
             await interaction.response.send_message(f"Event reminders will be posted in {channel.mention}. Role mention at event start: {notify_role.mention if notify_role else 'disabled'}.", ephemeral=True)
 
         @group.command(name='create', description='Schedule an event using the in-game server time in UTC')
-        @app_commands.describe(title='Event name', start_utc='Game server time: YYYY-MM-DD HH:MM UTC', category='Alliance, Events, Deals, or Other', notes='Optional event details')
-        async def create(interaction: discord.Interaction, title: str, start_utc: str, category: Literal['Alliance','Events','Deals','Other'] = 'Alliance', notes: str = ''):
+        @app_commands.describe(title='Event name', start_utc='Server start YYYY-MM-DD HH:MM UTC', category='Event color category', notes='Optional event details', end_utc='Optional server end YYYY-MM-DD HH:MM UTC')
+        async def create(interaction: discord.Interaction, title: str, start_utc: str, category: Literal['Alliance','Events','Deals','Port Inspection','Other'] = 'Alliance', notes: str = '', end_utc: str = ''):
             if not self.is_staff(interaction):
                 return await interaction.response.send_message('Staff access required.', ephemeral=True)
             settings = self.store.settings(interaction.guild_id)
@@ -343,6 +422,9 @@ class EventCenter:
                 return await interaction.response.send_message('Run /event setup first.', ephemeral=True)
             try:
                 starts_at = parse_utc(start_utc)
+                ends_at = parse_utc(end_utc, future=False) if end_utc.strip() else starts_at + 3600
+                if ends_at <= starts_at or ends_at - starts_at > 14 * 86400:
+                    raise ValueError('End time must follow the start and be within 14 days.')
             except ValueError as error:
                 return await interaction.response.send_message(str(error), ephemeral=True)
             title = title.strip()
@@ -354,7 +436,7 @@ class EventCenter:
                 return await interaction.response.send_message('The configured reminder channel no longer exists.', ephemeral=True)
             await interaction.response.defer(ephemeral=True, thinking=True)
             now = int(datetime.now(timezone.utc).timestamp())
-            event_id = self.store.create(interaction.guild_id, channel.id, title, category, notes, starts_at, interaction.user.id, now)
+            event_id = self.store.create(interaction.guild_id, channel.id, title, category, notes, starts_at, interaction.user.id, now, ends_at)
             event = self.store.event(event_id)
             embed = self.build_embed(event)
             kwargs = dict(embed=embed, view=EventReminderView(self), allowed_mentions=discord.AllowedMentions.none())
@@ -371,7 +453,48 @@ class EventCenter:
                 return await interaction.followup.send('The event could not be published. Check channel permissions.', ephemeral=True)
             banner_url = message.attachments[0].url if message.attachments else None
             self.store.set_message(event_id, message.id, banner_url)
-            await interaction.followup.send(f"Scheduled **{clean(title, 100)}** in {channel.mention} for <t:{starts_at}:F>. Event ID: {event_id}.", ephemeral=True)
+            await interaction.followup.send(f"Scheduled **{clean(title, 100)}** in {channel.mention} from <t:{starts_at}:F> to <t:{ends_at}:F>. Event ID: {event_id}.", ephemeral=True)
+
+        @group.command(name='calendar', description='View a game-style seven-day calendar with server times')
+        @app_commands.describe(week_offset='Weeks backward or forward (-12 to +12)', publish='Staff: post calendar to the event channel')
+        async def calendar(interaction: discord.Interaction, week_offset: app_commands.Range[int,-12,12] = 0, publish: bool = False):
+            if publish and not self.is_staff(interaction):
+                return await interaction.response.send_message('Only staff can publish the calendar.', ephemeral=True)
+            await self.show_calendar(interaction, week_offset, publish=publish)
+
+        @group.command(name='edit', description='Edit or reschedule an existing event')
+        @app_commands.describe(event_id='Event number from /event upcoming', title='New title if changing', start_utc='New start YYYY-MM-DD HH:MM UTC', end_utc='New end YYYY-MM-DD HH:MM UTC', category='New category if changing', notes='New event details if changing')
+        async def edit(interaction: discord.Interaction, event_id: int, title: str = '', start_utc: str = '', end_utc: str = '', category: str = '', notes: str = ''):
+            if not self.is_staff(interaction):
+                return await interaction.response.send_message('Staff access required.', ephemeral=True)
+            original = self.store.event(event_id)
+            if original is None or original['guild_id'] != interaction.guild_id or original['state'] != 'active':
+                return await interaction.response.send_message('Active event not found.', ephemeral=True)
+            new_title = title.strip() or original['title']
+            new_category = category.strip() or original['category']
+            new_notes = notes.strip() or original['notes']
+            try:
+                starts_at = parse_utc(start_utc) if start_utc.strip() else original['starts_at']
+                ends_at = parse_utc(end_utc, future=False) if end_utc.strip() else (starts_at + original['ends_at'] - original['starts_at'] if start_utc.strip() else original['ends_at'])
+                if starts_at < int(datetime.now(timezone.utc).timestamp()) + 300:
+                    raise ValueError('You can only edit events starting at least 5 minutes from now.')
+                if len(new_title) < 3 or len(new_title) > 100 or len(new_notes) > 900 or new_category not in CATEGORIES:
+                    raise ValueError('Invalid title, category or notes.')
+                if not self.store.edit(event_id, interaction.guild_id, new_title, new_category, new_notes, starts_at, ends_at):
+                    raise ValueError('Event no longer available.')
+            except ValueError as error:
+                return await interaction.response.send_message(str(error), ephemeral=True)
+            await interaction.response.defer(ephemeral=True)
+            updated = self.store.event(event_id)
+            channel = interaction.guild.get_channel(updated['channel_id'])
+            if isinstance(channel, discord.TextChannel) and updated['message_id']:
+                try:
+                    message = await channel.fetch_message(updated['message_id'])
+                    embed = self.build_embed(updated)
+                    await message.edit(embed=embed, view=EventReminderView(self))
+                except discord.HTTPException:
+                    log.exception('Unable to update existing event message %s',event_id)
+            await interaction.followup.send(f'Event #{event_id} updated. Reminders follow the new start time if rescheduled.', ephemeral=True)
 
         @group.command(name='upcoming', description='See the next scheduled SaS events')
         async def upcoming(interaction: discord.Interaction):
