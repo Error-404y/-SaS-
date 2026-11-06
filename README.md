@@ -1,6 +1,6 @@
 # SaS verification bot
 
-A small Discord verification bot using Python and one local JSON file. No SQL or database server. All messages use embeds. No comments, docstrings or emojis in the Python source.
+A Discord verification bot with a separate event-reminder service. Verification records use one local JSON file; the event calendar uses a separate embedded SQLite file. No database server is required. All messages use embeds. No comments, docstrings or emojis in the Python source.
 
 ## How it works
 
@@ -74,6 +74,25 @@ New joiners get Verify-Process. Previously accepted users get their saved Member
 
 If earlier versions removed Member from someone incorrectly, restore Member manually once. The nickname-prefix pass preserves it. Returning-member restoration uses saved accepted applications; it does not treat every historical role assignment as an acceptance.
 
+## SaS Event Center and reminders
+
+The event system is a manually maintained schedule. It does not automatically read screenshots, inspect the Police Chief game, or fetch an official game API. Enter confirmed start times from the in-game Events screen. All command input times are **game server time in UTC**; Discord timestamps display in each member's local timezone.
+
+In Discord, a High-Rank staff member or administrator can use:
+
+- `/event setup channel:#event-reminders notify_role:@SaS` to select a destination. The role is optional and pinged only once, when an event starts.
+- `/event create title:Alliance Mobilization start_utc:2026-11-08 19:00 category:Alliance notes:Prepare your squad` to schedule a future event. The start time is an example, not a verified game event.
+- `/event upcoming` for an ephemeral list of the next events.
+- `/event cancel event_id:1` to cancel a scheduled event and its queued reminders.
+
+A published event uses a generated blue-and-gold image and persistent **Remind Me**, **Stop Reminders**, and **View Schedule** buttons. Everyone can see the event, but only users opting in receive DMs. Each member's preference is saved for that particular event.
+
+The channel receives notices at **24 hours, 1 hour, 15 minutes, and event start**, provided the event was created early enough. Overdue reminders are skipped rather than posted late. Opted-in members receive a DM **1 hour and 15 minutes** before start, if subscribed before those deadlines. The bot attempts delivery every 30 seconds and stores notification status to survive restarts. Blocked DMs do not prevent other notifications.
+
+Staff should confirm the source game's event time zone and changes in the in-game schedule before entering or updating events. The bot does not automatically detect cancelled, moved, or recurring game events. The `events.sqlite3` file must remain on persistent storage and only one process should use it. As with other Discord webhook-style notifications, a power loss between message delivery and writing its receipt can rarely result in a repeated reminder.
+
+The bot must have View Channel, Send Messages, Embed Links, Attach Files, Read Message History, and Use Application Commands permissions in the reminder channel. Its invite should include the `applications.commands` scope.
+
 ## Server configuration
 
 | Resource | Default ID |
@@ -114,7 +133,7 @@ Copy-Item .env.example .env
 
 Edit `.env` and set `DISCORD_TOKEN`, then run `python main.py` with the virtual environment active. On Windows you can also use `.\.venv\Scripts\python.exe main.py` directly.
 
-For the hosting panel, set **STARTUP_FILE** to `main.py`. `bot.py` also works. Keep `data/verification.json` across deployments. Never put the token in GitHub.
+For the hosting panel, set **STARTUP_FILE** to `main.py`. `bot.py` also works. Keep `data/verification.json` and `data/events.sqlite3` across deployments. Never put the token in GitHub.
 
 Docker:
 
