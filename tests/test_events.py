@@ -5,6 +5,10 @@ from pathlib import Path
 from PIL import Image
 
 from event_center import EventStore, EventReminderView, parse_utc
+from bot import VerificationBot
+from unittest.mock import patch
+import os
+import discord
 from event_graphics import event_banner
 
 
@@ -85,6 +89,24 @@ class EventStoreTests(unittest.IsolatedAsyncioTestCase):
         buttons = EventReminderView(Stub())
         self.assertEqual([c.label for c in buttons.children], ['Remind Me', 'Stop Reminders', 'View Schedule'])
         self.assertTrue(buttons.is_persistent())
+
+
+
+class EventCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def test_commands_register_as_server_group(self):
+        with tempfile.TemporaryDirectory() as folder:
+            with patch.dict(os.environ, {'DATABASE_PATH': str(Path(folder) / 'verify.json')}):
+                bot = VerificationBot()
+                bot.guild = discord.Object(id=1234)
+                bot.events.register()
+                commands = bot.tree.get_commands(guild=bot.guild)
+                self.assertIn('event', [command.name for command in commands])
+                group = next(command for command in commands if command.name == 'event')
+                self.assertEqual(
+                    sorted(command.name for command in group.commands),
+                    ['cancel', 'create', 'setup', 'upcoming']
+                )
+                await bot.close()
 
 
 class EventBannerTests(unittest.TestCase):
