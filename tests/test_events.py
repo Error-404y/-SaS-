@@ -1,4 +1,5 @@
 import tempfile
+from datetime import datetime, timedelta, timezone
 import unittest
 from pathlib import Path
 
@@ -9,7 +10,7 @@ from bot import VerificationBot
 from unittest.mock import patch
 import os
 import discord
-from event_graphics import event_banner
+from event_graphics import event_banner, weekly_calendar
 
 
 class EventStoreTests(unittest.IsolatedAsyncioTestCase):
@@ -68,6 +69,42 @@ class EventStoreTests(unittest.IsolatedAsyncioTestCase):
         states = {row['state'] for row in self.store.conn.execute('SELECT state FROM event_reminders')}
         self.assertEqual(states, {'skipped'})
 
+    def test_long_events_are_visible_across_week_boundaries(self):
+        event_id = self.store.create(
+            1, 2, 'Alliance Mobilization', 'Alliance', 'Notes',
+            self.now + 90000, 5, self.now,
+            ends_at=self.now + 4 * 86400
+        )
+        beginning = self.now + 3 * 86400
+        rows = self.store.calendar_events(1, beginning, beginning + 7 * 86400)
+        self.assertIn(event_id, [row['id'] for row in rows])
+        self.assertEqual(self.store.event(event_id)['ends_at'], self.now + 4 * 86400)
+
+    def test_rescheduling_rebuilds_reminders_preserving_subscribers(self):
+        event_id = self.create()
+        self.store.subscribe(event_id, 19, self.now)
+        self.store.reminder_state(event_id, '24h', 'sent', 884)
+        new_start = self.now + 100000
+        self.assertTrue(self.store.edit(event_id, 1, 'Alliance Training', 'Alliance', 'Ready',
+                                        new_start, new_start + 7200, now=self.now))
+        self.assertEqual(self.store.event(event_id)['title'], 'Alliance Training')
+        self.assertEqual(self.store.subscriber_count(event_id), 1)
+        scheduled = self.store.conn.execute(
+            'SELECT stage,state,due_at FROM event_reminders WHERE event_id=?',
+            (event_id,)
+        ).fetchall()
+        self.assertEqual(len(scheduled), 4)
+        self.assertTrue(all(row['state'] == 'pending' for row in scheduled))
+        self.assertFalse(self.store.edit(event_id, 999, 'a', 'Other', '', new_start, new_start + 7200, now=self.now))
+
+    def test_migration_from_old_events_without_end_times(self):
+        original = self.create()
+        self.store.conn.execute('UPDATE game_events SET ends_at=NULL WHERE id=?', (original,))
+        self.store.close()
+        self.store = EventStore(Path(self.directory.name) / 'events.sqlite3')
+        row = self.store.event(original)
+        self.assertEqual(row['ends_at'], row['starts_at'] + 3600)
+
     def test_settings_survive_restart(self):
         self.store.set_channel(1, 456, 987)
         self.store.close()
@@ -104,9 +141,25 @@ class EventCommandTests(unittest.IsolatedAsyncioTestCase):
                 group = next(command for command in commands if command.name == 'event')
                 self.assertEqual(
                     sorted(command.name for command in group.commands),
-                    ['cancel', 'create', 'setup', 'upcoming']
+                    ['calendar', 'cancel', 'create', 'edit', 'setup', 'upcoming']
                 )
                 await bot.close()
+
+
+class CalendarImageTests(unittest.TestCase):
+    def test_illustrated_calendar_shows_week_and_event_ranges(self):
+        now = datetime(2026, 11, 7, 12, 0, tzinfo=timezone.utc)
+        first_day = now.date() - timedelta(days=2)
+        record = {
+            'title': 'Alliance Training',
+            'category': 'Alliance',
+            'starts_at': int((now + timedelta(hours=5)).timestamp()),
+            'ends_at': int((now + timedelta(days=2)).timestamp())
+        }
+        image = Image.open(weekly_calendar([record], first_day, server_now=now, demo=True))
+        self.assertEqual(image.format, 'PNG')
+        self.assertEqual(image.width, 1120)
+        self.assertGreater(image.height, 400)
 
 
 class EventBannerTests(unittest.TestCase):
