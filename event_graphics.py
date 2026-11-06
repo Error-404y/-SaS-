@@ -53,32 +53,40 @@ def png(image):
     return output
 
 
-def event_banner(title, category, stage):
+def event_banner(title, category, stage, starts_at=None, ends_at=None, server_now=None):
+    server_now = datetime.now(timezone.utc) if server_now is None else server_now
     width, height = 1000, 300
-    image = Image.new('RGB', (width, height))
+    image = Image.new('RGB', (width, height), (62, 49, 41))
     draw = ImageDraw.Draw(image)
-    for x in range(width):
-        fraction = x / width
-        draw.line((x, 0, x, height), fill=(int(11 + 12*fraction), int(27 + 28*fraction), int(53 + 38*fraction)))
-    for x in range(35, width, 65):
-        draw.line((x, 12, x, height - 14), fill=(32, 66, 98))
-    for y in range(24, height, 65):
-        draw.line((20, y, width - 18, y), fill=(32, 66, 98))
-    for i in range(15):
-        x = 670 + i * 24
-        height_building = 36 + (i * 37) % 116
-        draw.rectangle((x, height - height_building - 11, x + 19, height - 10), fill=(23, 58, 90))
-    draw.text((38, 26), 'SaS  /  STATE EVENT CENTER', font=typeface(20, True), fill=(158, 206, 235))
-    stage_text = {'upcoming': 'UPCOMING EVENT', '24h': '24 HOURS LEFT', '1h': '1 HOUR LEFT', '15m': '15 MINUTES LEFT', 'start': 'STARTING NOW', 'cancelled': 'EVENT CANCELLED'}.get(stage, 'EVENT UPDATE')
-    draw.text((38, 75), stage_text, font=fit_text(draw, stage_text, 645, 51, True), fill=(255, 207, 103))
-    draw.text((40, 150), ellipsis(draw, title, 635, typeface(35, True)), font=typeface(35, True), fill=(250, 252, 255))
-    draw.text((40, 224), category.upper() + '  |  GAME SERVER SCHEDULE', font=typeface(19, True), fill=(177, 198, 219))
-    draw.ellipse((755, 65, 944, 254), outline=(80, 174, 228), width=15)
-    draw.ellipse((770, 80, 930, 240), outline=(231, 182, 88), width=6)
-    draw.line((850, 161, 850, 104), fill=(245, 245, 248), width=10)
-    draw.line((850, 161, 899, 185), fill=(245, 245, 248), width=10)
-    draw.ellipse((839, 150, 861, 172), fill=(252, 204, 108))
-    draw.line((0, height - 4, width, height - 4), fill=(235, 181, 77), width=4)
+    draw.rounded_rectangle((0, 0, width - 1, height - 1), radius=18, fill=(76, 62, 52), outline=(151, 121, 84), width=3)
+    draw.rounded_rectangle((13, 13, width - 13, 68), radius=12, fill=(95, 78, 62))
+    draw.text((34, 24), 'EVENTS', font=typeface(30, True), fill=(255, 251, 238))
+    draw.text((800, 30), 'SaS  EVENT CENTER', font=typeface(16, True), fill=(251, 218, 154))
+    draw.rounded_rectangle((13, 75, width - 13, 139), radius=12, fill=(94, 173, 231), outline=(55, 128, 192), width=3)
+    label = 'Server Time ' + server_now.strftime('%Y-%m-%d %H:%M:%S') + ' UTC'
+    draw.text((48, 89), label, font=fit_text(draw, label, 910, 31, True), fill=(255, 255, 255), stroke_width=1, stroke_fill=(65, 115, 154))
+    draw.rounded_rectangle((15, 148, width - 15, height - 18), radius=13, fill=(178, 207, 230))
+    light, dark = PALETTE.get(category, PALETTE['Other'])
+    bx0, bx1, by0, by1 = 33, width - 31, 165, 230
+    draw.polygon(((bx0, by0), (bx1 - 29, by0), (bx1, (by0 + by1)//2), (bx1 - 29, by1), (bx0, by1)), fill=light, outline=dark, width=4)
+    draw.line((bx0 + 10, by0 + 4, bx1 - 38, by0 + 4), fill=(255, 246, 222), width=2)
+    event_name = ellipsis(draw, title, 820, typeface(30, True))
+    draw.text((54, 177), event_name, font=typeface(30, True), fill=(255, 255, 255), stroke_width=1, stroke_fill=(72, 64, 62))
+    stage_label = {
+        'upcoming': 'UPCOMING', '24h': '24 HOURS BEFORE', '1h': '1 HOUR BEFORE',
+        '15m': '15 MINUTES BEFORE', 'start': 'STARTING NOW', 'cancelled': 'CANCELLED'
+    }.get(stage, 'EVENT REMINDER')
+    draw.text((43, 247), stage_label, font=typeface(18, True), fill=(60, 85, 117))
+    if starts_at is not None:
+        start = datetime.fromtimestamp(int(starts_at), timezone.utc)
+        date_string = start.strftime('%a %m/%d %H:%M')
+        if ends_at is not None:
+            finish = datetime.fromtimestamp(int(ends_at), timezone.utc)
+            date_string += '  -  ' + finish.strftime('%a %m/%d %H:%M')
+        date_string += ' UTC'
+        label_font = fit_text(draw, date_string, 620, 18, True)
+        tw = draw.textbbox((0,0), date_string, font=label_font)[2]
+        draw.text((width - 36 - tw, 247), date_string, font=label_font, fill=(53, 80, 116))
     return png(image)
 
 
