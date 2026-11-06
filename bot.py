@@ -391,13 +391,6 @@ class VerificationBot(discord.Client):
                 self.db.refresh_panels()
                 await self.attempt(self.ensure_panel)
                 await self.attempt(self.ensure_control_panel)
-                tree = self.tree
-                try:
-                    for command in await tree.fetch_commands(guild=self.guild):
-                        if command.name == 'verification-settings':
-                            await command.delete()
-                except discord.HTTPException:
-                    log.warning('Could not remove the retired settings command; verification can still run.')
                 self.events.register()
                 await self.tree.sync(guild=self.guild)
                 self.configured = True
