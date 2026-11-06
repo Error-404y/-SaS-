@@ -255,10 +255,15 @@ class EventStore:
 
 def parse_utc(value, now=None, future=True):
     now = int(datetime.now(timezone.utc).timestamp()) if now is None else now
-    try:
-        start = datetime.strptime(value.strip(), '%Y-%m-%d %H:%M').replace(tzinfo=timezone.utc)
-    except ValueError as error:
-        raise ValueError('Use YYYY-MM-DD HH:MM in game/server time (UTC), for example 2026-11-08 19:00.') from error
+    start = None
+    for pattern in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M', '%Y:%m:%d %H:%M:%S', '%Y:%m:%d %H:%M'):
+        try:
+            start = datetime.strptime(value.strip(), pattern).replace(tzinfo=timezone.utc)
+            break
+        except ValueError:
+            continue
+    if start is None:
+        raise ValueError('Enter the exact game/server time in UTC as YYYY-MM-DD HH:MM:SS, for example 2026-11-08 23:59:59.')
     timestamp = int(start.timestamp())
     if future and (timestamp < now + 300 or timestamp > now + 90 * 86400):
         raise ValueError('Event starts must be between 5 minutes and 90 days from now.')
@@ -354,7 +359,7 @@ class EventCenter:
         result.add_field(name='SERVER START', value=f"<t:{event['starts_at']}:F>", inline=True)
         result.add_field(name='SERVER END', value=f"<t:{event['ends_at']}:F>", inline=True)
         result.add_field(name='COUNTDOWN', value=f"<t:{event['starts_at']}:R>", inline=True)
-        server_start = datetime.fromtimestamp(event['starts_at'], timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+        server_start = datetime.fromtimestamp(event['starts_at'], timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
         server_end = datetime.fromtimestamp(event['ends_at'], timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
         result.add_field(name='IN-GAME SERVER TIME', value=f"{server_start} - {server_end}", inline=False)
         result.add_field(name='STATUS', value=status, inline=True)
@@ -395,7 +400,7 @@ class EventCenter:
         embed.set_image(url='attachment://sas_weekly_calendar.png')
         details = []
         for event in events[:8]:
-            starts = datetime.fromtimestamp(event['starts_at'], timezone.utc).strftime('%m/%d %H:%M')
+            starts = datetime.fromtimestamp(event['starts_at'], timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
             ends = datetime.fromtimestamp(event['ends_at'], timezone.utc).strftime('%m/%d %H:%M')
             details.append(f"**#{event['id']} {clean(event['title'], 45)}** | {starts} - {ends} UTC")
         if details:
@@ -473,7 +478,7 @@ class EventCenter:
             await interaction.response.send_message(f"Event reminders will be posted in {channel.mention}. Role mention at event start: {notify_role.mention if notify_role else 'disabled'}.", ephemeral=True)
 
         @group.command(name='create', description='Schedule an event using the in-game server time in UTC')
-        @app_commands.describe(title='Event name', start_utc='Server start YYYY-MM-DD HH:MM UTC', category='Event color category', notes='Optional event details', end_utc='Optional server end YYYY-MM-DD HH:MM UTC')
+        @app_commands.describe(title='Event name', start_utc='Start YYYY-MM-DD HH:MM:SS UTC', category='Event color category', notes='Optional event details', end_utc='Optional end YYYY-MM-DD HH:MM:SS UTC')
         async def create(interaction: discord.Interaction, title: str, start_utc: str, category: Literal['Alliance','Events','Deals','Port Inspection','Other'] = 'Alliance', notes: str = '', end_utc: str = ''):
             if not self.is_staff(interaction):
                 return await interaction.response.send_message('Staff access required.', ephemeral=True)
@@ -524,7 +529,7 @@ class EventCenter:
             await self.show_calendar(interaction, week_offset, publish=publish)
 
         @group.command(name='edit', description='Edit or reschedule an existing event')
-        @app_commands.describe(event_id='Event number from /event upcoming', title='New title if changing', start_utc='New start YYYY-MM-DD HH:MM UTC', end_utc='New end YYYY-MM-DD HH:MM UTC', category='New category if changing', notes='New event details if changing')
+        @app_commands.describe(event_id='Event number from /event upcoming', title='New title if changing', start_utc='Start YYYY-MM-DD HH:MM:SS UTC', end_utc='End YYYY-MM-DD HH:MM:SS UTC', category='New category if changing', notes='New event details if changing')
         async def edit(interaction: discord.Interaction, event_id: int, title: str = '', start_utc: str = '', end_utc: str = '', category: str = '', notes: str = ''):
             if not self.is_staff(interaction):
                 return await interaction.response.send_message('Staff access required.', ephemeral=True)
