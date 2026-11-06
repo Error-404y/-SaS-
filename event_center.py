@@ -360,7 +360,7 @@ class EventCenter:
         result.add_field(name='SERVER END', value=f"<t:{event['ends_at']}:F>", inline=True)
         result.add_field(name='COUNTDOWN', value=f"<t:{event['starts_at']}:R>", inline=True)
         server_start = datetime.fromtimestamp(event['starts_at'], timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-        server_end = datetime.fromtimestamp(event['ends_at'], timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+        server_end = datetime.fromtimestamp(event['ends_at'], timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
         result.add_field(name='IN-GAME SERVER TIME', value=f"{server_start} - {server_end}", inline=False)
         result.add_field(name='STATUS', value=status, inline=True)
         result.add_field(name='REMINDERS', value='24h / 1h / 15m / Start\nPersonal DM: 1h and 15m, opt-in only.', inline=False)
@@ -401,7 +401,7 @@ class EventCenter:
         details = []
         for event in events[:8]:
             starts = datetime.fromtimestamp(event['starts_at'], timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
-            ends = datetime.fromtimestamp(event['ends_at'], timezone.utc).strftime('%m/%d %H:%M')
+            ends = datetime.fromtimestamp(event['ends_at'], timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
             details.append(f"**#{event['id']} {clean(event['title'], 45)}** | {starts} - {ends} UTC")
         if details:
             embed.add_field(name='EVENT TIMES | SERVER CLOCK', value='\n'.join(details)[:1024], inline=False)
