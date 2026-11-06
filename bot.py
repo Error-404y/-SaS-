@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 import logging
 import os
 import re
+from pathlib import Path
 
 import aiohttp
 
@@ -16,6 +17,7 @@ from delivery import EditDeferred, EditPacer
 from time_utils import zurich_time, ZurichFormatter
 from views import VerifyView, ReviewView, PauseControls, embed, reply, valid_username
 from identity import nickname, profile_from_member, clean_clan, valid_clan
+from event_center import EventCenter, EventReminderView
 
 load_dotenv()
 log = logging.getLogger('verification')
@@ -52,11 +54,15 @@ class VerificationBot(discord.Client):
         self.prefix_task = None
         self.edit_locks = {}
         self.edit_pacer = EditPacer(lambda: self.db)
+        self.tree = app_commands.CommandTree(self)
+        events_path = os.getenv('EVENT_DATABASE_PATH', str(Path(self.db.path).with_name('events.sqlite3')))
+        self.events = EventCenter(self, events_path)
 
     async def setup_hook(self):
         self.add_view(VerifyView(self))
         self.add_view(ReviewView(self))
         self.add_view(PauseControls(self))
+        self.add_view(EventReminderView(self.events))
 
     def public_context(self, interaction):
         return bool(self.configured and self.guild and interaction.guild_id == self.guild.id
@@ -385,14 +391,10 @@ class VerificationBot(discord.Client):
                 self.db.refresh_panels()
                 await self.attempt(self.ensure_panel)
                 await self.attempt(self.ensure_control_panel)
-                tree = app_commands.CommandTree(self)
-                try:
-                    for command in await tree.fetch_commands(guild=self.guild):
-                        if command.name == 'verification-settings':
-                            await command.delete()
-                except discord.HTTPException:
-                    log.warning('Could not remove the retired settings command; verification can still run.')
+                self.events.register()
+                await self.tree.sync(guild=self.guild)
                 self.configured = True
+                self.events.start()
                 self.recover.start()
                 self.refresh_messages.start()
                 self.prefix_task = asyncio.create_task(self.discover_member_prefixes())
@@ -757,6 +759,7 @@ class VerificationBot(discord.Client):
     async def close(self):
         if self.refresh_messages.is_running():
             self.refresh_messages.cancel()
+        self.events.close()
         if self.prefix_task and not self.prefix_task.done():
             self.prefix_task.cancel()
         if self.recover.is_running():

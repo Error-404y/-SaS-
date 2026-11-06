@@ -1,6 +1,6 @@
 # SaS verification bot
 
-A small Discord verification bot using Python and one local JSON file. No SQL or database server. All messages use embeds. No comments, docstrings or emojis in the Python source.
+A Discord verification bot with a separate event-reminder service. Verification records use one local JSON file; the event calendar uses a separate embedded SQLite file. No database server is required. All messages use embeds. No comments, docstrings or emojis in the Python source.
 
 ## How it works
 
@@ -74,6 +74,40 @@ New joiners get Verify-Process. Previously accepted users get their saved Member
 
 If earlier versions removed Member from someone incorrectly, restore Member manually once. The nickname-prefix pass preserves it. Returning-member restoration uses saved accepted applications; it does not treat every historical role assignment as an acceptance.
 
+## SaS Event Center and reminders
+
+The event system presents a **game-inspired seven-day calendar** based on the supplied Police Chief screenshots, with a dark brown header, blue server clock, weekday columns, the current day highlighted, color-coded event lanes and arrow-shaped duration bars. Each event also has its precise start and end time. The generated illustration is original and does not reuse game artwork.
+
+The calendar has an actual **server-time timestamp when rendered**, rather than a live ticking clock inside an image. Clicking a week-navigation button, rerunning the command, or the hourly shared-calendar update refreshes the displayed time. The current implementation uses **UTC** for the in-game server clock; verify this matches the game's server before scheduling real events. Discord timestamps in embeds automatically display in the viewer's timezone.
+
+### Setup and commands
+
+1. Staff run `/event setup channel:#event-reminders notify_role:@SaS`. The notification role is optional. It is pinged only when the event starts.
+2. Staff create entries using `/event create title:Alliance Training start_utc:2026-11-08 19:00 end_utc:2026-11-10 19:00 category:Alliance notes:Prepare your team`. Both date/time values are in `YYYY-MM-DD HH:MM` format, UTC. This is **example data**, not a verified game schedule.
+3. Everyone can open `/event calendar` for a personal weekly calendar with **Previous Week**, **This Week**, **Next Week** and **Upcoming Events** buttons. The view can navigate up to 12 weeks backward or forward.
+4. Staff can publish one shared calendar message using `/event calendar publish:True`. Rerunning the command refreshes that message rather than creating duplicates. The bot also refreshes the shared image when an event is created, edited or cancelled, and approximately hourly to update its displayed server time. Members can browse their own calendars privately without changing the shared message.
+5. Use `/event upcoming` to list upcoming events.
+6. Staff can edit or reschedule a planned event with `/event edit event_id:1 start_utc:2026-11-09 19:00 end_utc:2026-11-11 19:00` and cancel with `/event cancel event_id:1`. Changing a start time rebuilds its future reminder schedule. Subscriptions remain saved.
+
+Supported color categories: **Port Inspection** (red), **Events** (blue), **Alliance** (gold), **Deals** (red) and **Other** (green). An end time is optional; omitted events default to one hour. Longer events may span several calendar days, up to 14 days.
+
+### Reminder rules
+
+- Channel reminders post **24 hours, 1 hour and 15 minutes before start, and at event start**.
+- Members click **Remind Me** to subscribe to **private DM reminders 1 hour and 15 minutes before start**. They can click **Stop Reminders** at any time. DMs are never sent by default.
+- For members who subscribe late, only future DM stages are delivered.
+- The optional configured role ping is sent only at the start, avoiding repeated role notifications.
+- The scheduler checks every 30 seconds, persists event, subscriber and delivery state in `events.sqlite3`, and skips badly overdue notices after downtime.
+- Rescheduling rebuilds the reminder schedule. Cancelling an event stops future notifications.
+
+### Limits and operating guidance
+
+The game calendar is **not connected to an official Police Chief data API**. Events and their exact times must be entered by staff using confirmed information. The screenshot contains event names and dates but cannot prove the exact start and end times, so the bot does not seed fabricated live events.
+
+The event channel needs **View Channel, Send Messages, Embed Links, Attach Files and Read Message History** permissions for the bot. The Discord application must have `applications.commands` enabled.
+
+Keep `data/events.sqlite3` on persistent storage, along with `data/verification.json`. Run only one instance using a given SQLite database. A process interruption during the small window between a message being sent and its delivery receipt being saved can exceptionally duplicate a reminder.
+
 ## Server configuration
 
 | Resource | Default ID |
@@ -114,7 +148,7 @@ Copy-Item .env.example .env
 
 Edit `.env` and set `DISCORD_TOKEN`, then run `python main.py` with the virtual environment active. On Windows you can also use `.\.venv\Scripts\python.exe main.py` directly.
 
-For the hosting panel, set **STARTUP_FILE** to `main.py`. `bot.py` also works. Keep `data/verification.json` across deployments. Never put the token in GitHub.
+For the hosting panel, set **STARTUP_FILE** to `main.py`. `bot.py` also works. Keep `data/verification.json` and `data/events.sqlite3` across deployments. Never put the token in GitHub.
 
 Docker:
 
