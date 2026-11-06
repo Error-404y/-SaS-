@@ -111,8 +111,7 @@ class EventStore:
     def create(self, guild_id, channel_id, title, category, notes, starts_at, author_id, now=None, ends_at=None):
         now = int(datetime.now(timezone.utc).timestamp()) if now is None else now
         ends_at = starts_at + 3600 if ends_at is None else ends_at
-        if ends_at <= starts_at or ends_at - starts_at > 14 * 86400:
-            raise ValueError('Event end must be after start and within 14 days.')
+        validate_event_window(starts_at, ends_at, now)
         self.conn.execute('BEGIN IMMEDIATE')
         try:
             cursor = self.conn.execute(
@@ -135,8 +134,7 @@ class EventStore:
 
     def edit(self, event_id, guild_id, title, category, notes, starts_at, ends_at, now=None):
         now = int(datetime.now(timezone.utc).timestamp()) if now is None else now
-        if starts_at < now + 300 or ends_at <= starts_at or ends_at - starts_at > 14 * 86400:
-            raise ValueError('Event must begin at least 5 minutes ahead and last no longer than 14 days.')
+        validate_event_window(starts_at, ends_at, now)
         self.conn.execute('BEGIN IMMEDIATE')
         try:
             original = self.conn.execute(
@@ -198,7 +196,7 @@ class EventStore:
     def upcoming(self, guild_id, now=None):
         now = int(datetime.now(timezone.utc).timestamp()) if now is None else now
         return self.conn.execute(
-            "SELECT * FROM game_events WHERE guild_id=? AND state='active' AND starts_at>? ORDER BY starts_at LIMIT 15",
+            "SELECT * FROM game_events WHERE guild_id=? AND state='active' AND ends_at>? ORDER BY starts_at LIMIT 15",
             (guild_id, now)
         ).fetchall()
 
@@ -253,6 +251,17 @@ class EventStore:
         self.conn.close()
 
 
+def validate_event_window(starts_at, ends_at, now):
+    if ends_at <= starts_at or ends_at - starts_at > 14 * 86400:
+        raise ValueError('Event end must be after the start and within 14 days.')
+    if ends_at <= now:
+        raise ValueError('This event has already ended. Its end time must still be in the future.')
+    if starts_at > now + 90 * 86400:
+        raise ValueError('Events cannot start more than 90 days from now.')
+    if now < starts_at < now + 300:
+        raise ValueError('Future events must start at least 5 minutes from now.')
+
+
 def parse_utc(value, now=None, future=True):
     now = int(datetime.now(timezone.utc).timestamp()) if now is None else now
     start = None
@@ -284,6 +293,8 @@ class EventReminderView(discord.ui.View):
         event = self.manager.store.by_message(interaction.message.id)
         if not event or interaction.guild_id != event['guild_id']:
             return await interaction.response.send_message('Event not found.', ephemeral=True)
+        if event['starts_at'] <= int(datetime.now(timezone.utc).timestamp()):
+            return await interaction.response.send_message('This event has already started. Pre-event reminders are no longer available.', ephemeral=True)
         if self.manager.store.subscribe(event['id'], interaction.user.id):
             await interaction.response.send_message('You are subscribed. The bot will DM you 1 hour and 15 minutes before the event, if you subscribe before those reminders are due.', ephemeral=True)
         else:
@@ -351,19 +362,22 @@ class EventCenter:
 
     def build_embed(self, event, stage='upcoming'):
         name = clean(event['title'], 200)
-        status = 'Cancelled' if event['state'] == 'cancelled' else 'Starting Now' if stage == 'start' else 'Scheduled'
-        color = 0xC74949 if event['state'] == 'cancelled' else 0xE5B75E if stage in ('1h','15m','start') else 0x318BCE
+        now = int(datetime.now(timezone.utc).timestamp())
+        in_progress = event['starts_at'] <= now < event['ends_at'] and event['state'] == 'active'
+        status = 'Cancelled' if event['state'] == 'cancelled' else 'Starting Now' if stage == 'start' else 'In Progress' if in_progress else 'Completed' if now >= event['ends_at'] else 'Scheduled'
+        color = 0xC74949 if event['state'] == 'cancelled' else 0xE5B75E if in_progress or stage in ('1h','15m','start') else 0x318BCE
         description = clean(event['notes'], 1400) or 'Check the in-game Events calendar for the event details.'
         result = discord.Embed(title=f"SaS | {name}", description=description, color=color)
         result.add_field(name='EVENT TYPE', value=clean(event['category'], 60), inline=True)
         result.add_field(name='SERVER START', value=f"<t:{event['starts_at']}:F>", inline=True)
         result.add_field(name='SERVER END', value=f"<t:{event['ends_at']}:F>", inline=True)
-        result.add_field(name='COUNTDOWN', value=f"<t:{event['starts_at']}:R>", inline=True)
+        result.add_field(name='ENDS IN' if in_progress else 'COUNTDOWN', value=f"<t:{event['ends_at'] if in_progress else event['starts_at']}:R>", inline=True)
         server_start = datetime.fromtimestamp(event['starts_at'], timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
         server_end = datetime.fromtimestamp(event['ends_at'], timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
         result.add_field(name='IN-GAME SERVER TIME', value=f"{server_start} - {server_end}", inline=False)
         result.add_field(name='STATUS', value=status, inline=True)
-        result.add_field(name='REMINDERS', value='24h / 1h / 15m / Start\nPersonal DM: 1h and 15m, opt-in only.', inline=False)
+        reminder_info = 'Already in progress. Past pre-event reminders will not be sent.' if in_progress else '24h / 1h / 15m / Start\nPersonal DM: 1h and 15m, opt-in only.'
+        result.add_field(name='REMINDERS', value=reminder_info, inline=False)
         result.set_footer(text=f"SaS Event Center | Event #{event['id']} | {stage}")
         if event['banner_url'] and stage in ('upcoming','cancelled'):
             result.set_image(url=event['banner_url'])
@@ -486,10 +500,9 @@ class EventCenter:
             if settings is None:
                 return await interaction.response.send_message('Run /event setup first.', ephemeral=True)
             try:
-                starts_at = parse_utc(start_utc)
+                starts_at = parse_utc(start_utc, future=False)
                 ends_at = parse_utc(end_utc, future=False) if end_utc.strip() else starts_at + 3600
-                if ends_at <= starts_at or ends_at - starts_at > 14 * 86400:
-                    raise ValueError('End time must follow the start and be within 14 days.')
+                validate_event_window(starts_at, ends_at, int(datetime.now(timezone.utc).timestamp()))
             except ValueError as error:
                 return await interaction.response.send_message(str(error), ephemeral=True)
             title = title.strip()
@@ -540,10 +553,9 @@ class EventCenter:
             new_category = category.strip() or original['category']
             new_notes = notes.strip() or original['notes']
             try:
-                starts_at = parse_utc(start_utc) if start_utc.strip() else original['starts_at']
+                starts_at = parse_utc(start_utc, future=False) if start_utc.strip() else original['starts_at']
                 ends_at = parse_utc(end_utc, future=False) if end_utc.strip() else (starts_at + original['ends_at'] - original['starts_at'] if start_utc.strip() else original['ends_at'])
-                if starts_at < int(datetime.now(timezone.utc).timestamp()) + 300:
-                    raise ValueError('You can only edit events starting at least 5 minutes from now.')
+                validate_event_window(starts_at, ends_at, int(datetime.now(timezone.utc).timestamp()))
                 if len(new_title) < 3 or len(new_title) > 100 or len(new_notes) > 900 or new_category not in CATEGORIES:
                     raise ValueError('Invalid title, category or notes.')
                 if not self.store.edit(event_id, interaction.guild_id, new_title, new_category, new_notes, starts_at, ends_at):

@@ -124,6 +124,34 @@ class EventStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.settings(1)['channel_id'], 456)
         self.assertEqual(self.store.settings(1)['role_id'], 987)
 
+    def test_ongoing_port_inspection_can_be_added_without_retroactive_reminders(self):
+        now = int(datetime(2026, 11, 7, 12, 0, tzinfo=timezone.utc).timestamp())
+        start = parse_utc('2026-11-06 00:00:00', now=now, future=False)
+        end = parse_utc('2026-11-08 23:59:59', now=now, future=False)
+        event_id = self.store.create(
+            1, 2, 'Port Inspection', 'Port Inspection', 'Game event',
+            start, 5, now=now, ends_at=end
+        )
+        event = self.store.event(event_id)
+        self.assertEqual(event['starts_at'], start)
+        self.assertEqual(event['ends_at'], end)
+        self.assertEqual(len(self.store.upcoming(1, now=now)), 1)
+        self.assertEqual(self.store.due(now=now), [])
+        self.assertFalse(self.store.subscribe(event_id, 42, now=now))
+        self.assertTrue(self.store.edit(event_id, 1, 'Port Inspection', 'Port Inspection',
+                                        'Updated', start, end, now=now))
+
+    def test_ended_event_is_rejected_while_ongoing_one_is_valid(self):
+        now = int(datetime(2026, 11, 7, 12, 0, tzinfo=timezone.utc).timestamp())
+        start = int(datetime(2026, 11, 6, 0, 0, tzinfo=timezone.utc).timestamp())
+        with self.assertRaisesRegex(ValueError, 'already ended'):
+            self.store.create(1, 2, 'Old event', 'Other', '', start, 5,
+                              now=now, ends_at=now - 1)
+        with self.assertRaisesRegex(ValueError, 'at least 5 minutes'):
+            self.store.create(1, 2, 'Soon event', 'Other', '', now + 60, 5,
+                              now=now, ends_at=now + 3600)
+        self.assertIsNone(self.store.event(1))
+
     def test_second_precision_matches_in_game_calendar(self):
         start = parse_utc('2026-11-06 00:00:00', now=int(datetime(2026, 11, 1, tzinfo=timezone.utc).timestamp()))
         end = parse_utc('2026-11-08 23:59:59', now=0, future=False)

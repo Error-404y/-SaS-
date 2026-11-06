@@ -89,7 +89,7 @@ The calendar has an actual **server-time timestamp when rendered**, rather than 
 5. Use `/event upcoming` to list upcoming events.
 6. Staff can edit or reschedule a planned event with `/event edit event_id:1 start_utc:2026-11-09 00:00:00 end_utc:2026-11-11 23:59:59` and cancel with `/event cancel event_id:1`. Changing a start time rebuilds its future reminder schedule. Subscriptions remain saved.
 
-Supported color categories: **Port Inspection** (red), **Events** (blue), **Alliance** (gold), **Deals** (red) and **Other** (green). An end time is optional; omitted events default to one hour. Longer events may span several calendar days, up to 14 days.
+Supported color categories: **Port Inspection** (red), **Events** (blue), **Alliance** (gold), **Deals** (red) and **Other** (green). Events already underway are allowed if their **end time is still in the future**. For example, an event starting `2026-11-06 00:00:00` and ending `2026-11-08 23:59:59` can be entered on November 7. The calendar marks it as **In Progress**, shows when it ends, and does not send any reminders whose deadlines have already passed. Subscribers cannot join an event after it begins. An end time is optional; omitted events default to one hour. Longer events may span several calendar days, up to 14 days.
 
 ### Reminder rules
 
