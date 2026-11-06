@@ -4,11 +4,11 @@ from pathlib import Path
 
 from PIL import Image
 
-from event_center import EventStore, EventReminderView, parse_utc, EventCenter
+from event_center import EventStore, EventReminderView, parse_utc
 from event_graphics import event_banner
 
 
-class EventStoreTests(unittest.TestCase):
+class EventStoreTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.store = EventStore(Path(self.directory.name) / 'events.sqlite3')
@@ -73,13 +73,13 @@ class EventStoreTests(unittest.TestCase):
 
     def test_parse_utc_uses_utc_and_rejects_outdated_or_invalid(self):
         valid = parse_utc('2027-01-15 18:00', now=1800000000)
-        self.assertEqual(valid, 1800036000) if False else self.assertTrue(valid > 1800000300)
+        self.assertEqual(valid, 1800036000)
         with self.assertRaises(ValueError):
             parse_utc('not a date',now=1800000000)
         with self.assertRaises(ValueError):
             parse_utc('2020-01-01 18:00',now=1800000000)
 
-    def test_preview_view_is_persistent(self):
+    async def test_preview_view_is_persistent(self):
         class Stub:
             pass
         buttons = EventReminderView(Stub())
