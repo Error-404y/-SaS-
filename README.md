@@ -76,22 +76,37 @@ If earlier versions removed Member from someone incorrectly, restore Member manu
 
 ## SaS Event Center and reminders
 
-The event system is a manually maintained schedule. It does not automatically read screenshots, inspect the Police Chief game, or fetch an official game API. Enter confirmed start times from the in-game Events screen. All command input times are **game server time in UTC**; Discord timestamps display in each member's local timezone.
+The event system presents a **game-inspired seven-day calendar** based on the supplied Police Chief screenshots, with a dark brown header, blue server clock, weekday columns, the current day highlighted, color-coded event lanes and arrow-shaped duration bars. Each event also has its precise start and end time. The generated illustration is original and does not reuse game artwork.
 
-In Discord, a High-Rank staff member or administrator can use:
+The calendar has an actual **server-time timestamp when rendered**, rather than a live ticking clock inside an image. Clicking a week-navigation button or rerunning the command refreshes the displayed time. The current implementation uses **UTC** for the in-game server clock; verify this matches the game's server before scheduling real events. Discord timestamps in embeds automatically display in the viewer's timezone.
 
-- `/event setup channel:#event-reminders notify_role:@SaS` to select a destination. The role is optional and pinged only once, when an event starts.
-- `/event create title:Alliance Mobilization start_utc:2026-11-08 19:00 category:Alliance notes:Prepare your squad` to schedule a future event. The start time is an example, not a verified game event.
-- `/event upcoming` for an ephemeral list of the next events.
-- `/event cancel event_id:1` to cancel a scheduled event and its queued reminders.
+### Setup and commands
 
-A published event uses a generated blue-and-gold image and persistent **Remind Me**, **Stop Reminders**, and **View Schedule** buttons. Everyone can see the event, but only users opting in receive DMs. Each member's preference is saved for that particular event.
+1. Staff run `/event setup channel:#event-reminders notify_role:@SaS`. The notification role is optional. It is pinged only when the event starts.
+2. Staff create entries using `/event create title:Alliance Training start_utc:2026-11-08 19:00 end_utc:2026-11-10 19:00 category:Alliance notes:Prepare your team`. Both date/time values are in `YYYY-MM-DD HH:MM` format, UTC. This is **example data**, not a verified game schedule.
+3. Everyone can open `/event calendar` for a personal weekly calendar with **Previous Week**, **This Week**, **Next Week** and **Upcoming Events** buttons. The view can navigate up to 12 weeks backward or forward.
+4. Staff can publish a shareable calendar image using `/event calendar publish:True`. Members can refresh and navigate their own calendars privately without changing a shared post.
+5. Use `/event upcoming` to list upcoming events.
+6. Staff can edit or reschedule a planned event with `/event edit event_id:1 start_utc:2026-11-09 19:00 end_utc:2026-11-11 19:00` and cancel with `/event cancel event_id:1`. Changing a start time rebuilds its future reminder schedule. Subscriptions remain saved.
 
-The channel receives notices at **24 hours, 1 hour, 15 minutes, and event start**, provided the event was created early enough. Overdue reminders are skipped rather than posted late. Opted-in members receive a DM **1 hour and 15 minutes** before start, if subscribed before those deadlines. The bot attempts delivery every 30 seconds and stores notification status to survive restarts. Blocked DMs do not prevent other notifications.
+Supported color categories: **Port Inspection** (red), **Events** (blue), **Alliance** (gold), **Deals** (red) and **Other** (green). An end time is optional; omitted events default to one hour. Longer events may span several calendar days, up to 14 days.
 
-Staff should confirm the source game's event time zone and changes in the in-game schedule before entering or updating events. The bot does not automatically detect cancelled, moved, or recurring game events. The `events.sqlite3` file must remain on persistent storage and only one process should use it. As with other Discord webhook-style notifications, a power loss between message delivery and writing its receipt can rarely result in a repeated reminder.
+### Reminder rules
 
-The bot must have View Channel, Send Messages, Embed Links, Attach Files, Read Message History, and Use Application Commands permissions in the reminder channel. Its invite should include the `applications.commands` scope.
+- Channel reminders post **24 hours, 1 hour and 15 minutes before start, and at event start**.
+- Members click **Remind Me** to subscribe to **private DM reminders 1 hour and 15 minutes before start**. They can click **Stop Reminders** at any time. DMs are never sent by default.
+- For members who subscribe late, only future DM stages are delivered.
+- The optional configured role ping is sent only at the start, avoiding repeated role notifications.
+- The scheduler checks every 30 seconds, persists event, subscriber and delivery state in `events.sqlite3`, and skips badly overdue notices after downtime.
+- Rescheduling rebuilds the reminder schedule. Cancelling an event stops future notifications.
+
+### Limits and operating guidance
+
+The game calendar is **not connected to an official Police Chief data API**. Events and their exact times must be entered by staff using confirmed information. The screenshot contains event names and dates but cannot prove the exact start and end times, so the bot does not seed fabricated live events.
+
+The event channel needs **View Channel, Send Messages, Embed Links, Attach Files and Read Message History** permissions for the bot. The Discord application must have `applications.commands` enabled.
+
+Keep `data/events.sqlite3` on persistent storage, along with `data/verification.json`. Run only one instance using a given SQLite database. A process interruption during the small window between a message being sent and its delivery receipt being saved can exceptionally duplicate a reminder.
 
 ## Server configuration
 
