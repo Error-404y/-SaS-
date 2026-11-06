@@ -374,6 +374,13 @@ class EventCenter:
             color=0x67B0E1
         )
         embed.set_image(url='attachment://sas_weekly_calendar.png')
+        details = []
+        for event in events[:8]:
+            starts = datetime.fromtimestamp(event['starts_at'], timezone.utc).strftime('%m/%d %H:%M')
+            ends = datetime.fromtimestamp(event['ends_at'], timezone.utc).strftime('%m/%d %H:%M')
+            details.append(f"**#{event['id']} {clean(event['title'], 45)}** | {starts} - {ends} UTC")
+        if details:
+            embed.add_field(name='EVENT TIMES | SERVER CLOCK', value='\\n'.join(details)[:1024], inline=False)
         embed.set_footer(text='SaS Event Center | Times follow the in-game server schedule | UTC')
         embed.timestamp = now
         if publish:
