@@ -421,6 +421,12 @@ class EventCenter:
         self.store.set_board(guild_id, edited.id if edited else message.id)
         return edited or message
 
+    async def refresh_board_safe(self, guild_id):
+        try:
+            await self.refresh_board(guild_id)
+        except Exception:
+            log.exception('Could not refresh public event calendar in server %s', guild_id)
+
     async def show_calendar(self, interaction, week_offset=0, update=False, view=None, publish=False):
         if interaction.guild_id != getattr(self.bot.guild, 'id', None):
             return await interaction.response.send_message('Only available in the SaS server.', ephemeral=True)
@@ -436,7 +442,7 @@ class EventCenter:
                 existing = await self.refresh_board(interaction.guild_id)
                 if existing:
                     return await interaction.followup.send(f'Calendar refreshed in {channel.mention}: {existing.jump_url}', ephemeral=True)
-                embed, banner = self.calendar_payload(interaction.guild_id, week_offset)
+                embed, banner = self.calendar_payload(interaction.guild_id, 0)
                 message = await channel.send(embed=embed, file=banner, allowed_mentions=discord.AllowedMentions.none())
                 self.store.set_board(interaction.guild_id, message.id)
             except discord.HTTPException:
@@ -507,6 +513,7 @@ class EventCenter:
                 return await interaction.followup.send('The event could not be published. Check channel permissions.', ephemeral=True)
             banner_url = message.attachments[0].url if message.attachments else None
             self.store.set_message(event_id, message.id, banner_url)
+            await self.refresh_board_safe(interaction.guild_id)
             await interaction.followup.send(f"Scheduled **{clean(title, 100)}** in {channel.mention} from <t:{starts_at}:F> to <t:{ends_at}:F>. Event ID: {event_id}.", ephemeral=True)
 
         @group.command(name='calendar', description='View a game-style seven-day calendar with server times')
@@ -556,6 +563,7 @@ class EventCenter:
                         self.store.set_message(event_id, edited.id, edited.attachments[0].url)
                 except discord.HTTPException:
                     log.exception('Unable to update existing event message %s',event_id)
+            await self.refresh_board_safe(interaction.guild_id)
             await interaction.followup.send(f'Event #{event_id} updated. Reminders follow the new start time if rescheduled.', ephemeral=True)
 
         @group.command(name='upcoming', description='See the next scheduled SaS events')
@@ -578,6 +586,7 @@ class EventCenter:
                     await message.edit(embed=self.build_embed(event, 'cancelled'), view=None)
                 except discord.HTTPException:
                     log.exception('Could not update cancelled event %s', event_id)
+            await self.refresh_board_safe(interaction.guild_id)
             await interaction.response.send_message(f'Event #{event_id} cancelled. Scheduled notifications were stopped.', ephemeral=True)
 
         self.bot.tree.add_command(group, guild=self.bot.guild)
@@ -623,6 +632,8 @@ class EventCenter:
                     await original.edit(embed=self.build_embed(event, 'start'), view=None)
                 except discord.HTTPException:
                     log.exception('Could not close event panel %s',event['id'])
+        for settings in self.store.boards_to_refresh(now):
+            await self.refresh_board_safe(settings['guild_id'])
         for job in self.store.due_dm():
             event = self.store.event(job['event_id'])
             if event['state'] != 'active':
