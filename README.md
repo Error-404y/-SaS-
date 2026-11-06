@@ -78,14 +78,14 @@ If earlier versions removed Member from someone incorrectly, restore Member manu
 
 The event system presents a **game-inspired seven-day calendar** based on the supplied Police Chief screenshots, with a dark brown header, blue server clock, weekday columns, the current day highlighted, color-coded event lanes and arrow-shaped duration bars. Each event also has its precise start and end time. The generated illustration is original and does not reuse game artwork.
 
-The calendar has an actual **server-time timestamp when rendered**, rather than a live ticking clock inside an image. Clicking a week-navigation button or rerunning the command refreshes the displayed time. The current implementation uses **UTC** for the in-game server clock; verify this matches the game's server before scheduling real events. Discord timestamps in embeds automatically display in the viewer's timezone.
+The calendar has an actual **server-time timestamp when rendered**, rather than a live ticking clock inside an image. Clicking a week-navigation button, rerunning the command, or the hourly shared-calendar update refreshes the displayed time. The current implementation uses **UTC** for the in-game server clock; verify this matches the game's server before scheduling real events. Discord timestamps in embeds automatically display in the viewer's timezone.
 
 ### Setup and commands
 
 1. Staff run `/event setup channel:#event-reminders notify_role:@SaS`. The notification role is optional. It is pinged only when the event starts.
 2. Staff create entries using `/event create title:Alliance Training start_utc:2026-11-08 19:00 end_utc:2026-11-10 19:00 category:Alliance notes:Prepare your team`. Both date/time values are in `YYYY-MM-DD HH:MM` format, UTC. This is **example data**, not a verified game schedule.
 3. Everyone can open `/event calendar` for a personal weekly calendar with **Previous Week**, **This Week**, **Next Week** and **Upcoming Events** buttons. The view can navigate up to 12 weeks backward or forward.
-4. Staff can publish a shareable calendar image using `/event calendar publish:True`. Members can refresh and navigate their own calendars privately without changing a shared post.
+4. Staff can publish one shared calendar message using `/event calendar publish:True`. Rerunning the command refreshes that message rather than creating duplicates. The bot also refreshes the shared image when an event is created, edited or cancelled, and approximately hourly to update its displayed server time. Members can browse their own calendars privately without changing the shared message.
 5. Use `/event upcoming` to list upcoming events.
 6. Staff can edit or reschedule a planned event with `/event edit event_id:1 start_utc:2026-11-09 19:00 end_utc:2026-11-11 19:00` and cancel with `/event cancel event_id:1`. Changing a start time rebuilds its future reminder schedule. Subscriptions remain saved.
 
