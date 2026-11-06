@@ -105,6 +105,18 @@ class EventStoreTests(unittest.IsolatedAsyncioTestCase):
         row = self.store.event(original)
         self.assertEqual(row['ends_at'], row['starts_at'] + 3600)
 
+    def test_public_calendar_board_persists_and_refreshes(self):
+        self.store.set_channel(1, 88, None)
+        self.store.set_board(1, 445, self.now)
+        self.assertEqual(self.store.settings(1)['calendar_message_id'], 445)
+        self.assertNotIn(1, [row['guild_id'] for row in self.store.boards_to_refresh(self.now + 200)])
+        self.assertIn(1, [row['guild_id'] for row in self.store.boards_to_refresh(self.now + 3700)])
+        self.store.close()
+        self.store = EventStore(Path(self.directory.name) / 'events.sqlite3')
+        self.assertEqual(self.store.settings(1)['calendar_message_id'], 445)
+        self.store.set_channel(1, 99, None)
+        self.assertIsNone(self.store.settings(1)['calendar_message_id'])
+
     def test_settings_survive_restart(self):
         self.store.set_channel(1, 456, 987)
         self.store.close()
