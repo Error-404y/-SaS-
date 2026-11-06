@@ -10,12 +10,12 @@ import discord
 from discord import app_commands
 from discord.ext import tasks
 
-from event_graphics import event_banner
+from event_graphics import event_banner, weekly_calendar
 
 
 log = logging.getLogger('sas.events')
 STAGES = (('24h', 86400), ('1h', 3600), ('15m', 900), ('start', 0))
-CATEGORIES = ('Alliance', 'Events', 'Deals', 'Other')
+CATEGORIES = ('Alliance', 'Events', 'Deals', 'Port Inspection', 'Other')
 
 
 class EventStore:
@@ -41,6 +41,7 @@ class EventStore:
                 category TEXT NOT NULL,
                 notes TEXT NOT NULL,
                 starts_at INTEGER NOT NULL,
+                ends_at INTEGER,
                 created_at INTEGER NOT NULL,
                 created_by INTEGER NOT NULL,
                 message_id INTEGER,
@@ -72,6 +73,10 @@ class EventStore:
                 FOREIGN KEY(event_id) REFERENCES game_events(id)
             );
         """)
+        columns = {row['name'] for row in self.conn.execute('PRAGMA table_info(game_events)')}
+        if 'ends_at' not in columns:
+            self.conn.execute('ALTER TABLE game_events ADD COLUMN ends_at INTEGER')
+        self.conn.execute('UPDATE game_events SET ends_at=starts_at+3600 WHERE ends_at IS NULL')
 
     def set_channel(self, guild_id, channel_id, role_id):
         self.conn.execute(
@@ -82,13 +87,16 @@ class EventStore:
     def settings(self, guild_id):
         return self.conn.execute('SELECT * FROM event_settings WHERE guild_id=?', (guild_id,)).fetchone()
 
-    def create(self, guild_id, channel_id, title, category, notes, starts_at, author_id, now=None):
+    def create(self, guild_id, channel_id, title, category, notes, starts_at, author_id, now=None, ends_at=None):
         now = int(datetime.now(timezone.utc).timestamp()) if now is None else now
+        ends_at = starts_at + 3600 if ends_at is None else ends_at
+        if ends_at <= starts_at or ends_at - starts_at > 14 * 86400:
+            raise ValueError('Event end must be after start and within 14 days.')
         self.conn.execute('BEGIN IMMEDIATE')
         try:
             cursor = self.conn.execute(
-                'INSERT INTO game_events(guild_id,channel_id,title,category,notes,starts_at,created_at,created_by) VALUES(?,?,?,?,?,?,?,?)',
-                (guild_id, channel_id, title, category, notes, starts_at, now, author_id)
+                'INSERT INTO game_events(guild_id,channel_id,title,category,notes,starts_at,ends_at,created_at,created_by) VALUES(?,?,?,?,?,?,?,?,?)',
+                (guild_id, channel_id, title, category, notes, starts_at, ends_at, now, author_id)
             )
             event_id = cursor.lastrowid
             for stage, seconds in STAGES:
@@ -103,6 +111,46 @@ class EventStore:
         except Exception:
             self.conn.execute('ROLLBACK')
             raise
+
+    def edit(self, event_id, guild_id, title, category, notes, starts_at, ends_at, now=None):
+        now = int(datetime.now(timezone.utc).timestamp()) if now is None else now
+        if starts_at < now + 300 or ends_at <= starts_at or ends_at - starts_at > 14 * 86400:
+            raise ValueError('Event must begin at least 5 minutes ahead and last no longer than 14 days.')
+        self.conn.execute('BEGIN IMMEDIATE')
+        try:
+            original = self.conn.execute(
+                "SELECT * FROM game_events WHERE id=? AND guild_id=? AND state='active'",
+                (event_id, guild_id)
+            ).fetchone()
+            if original is None:
+                self.conn.execute('COMMIT')
+                return False
+            changed_time = original['starts_at'] != starts_at
+            self.conn.execute(
+                'UPDATE game_events SET title=?,category=?,notes=?,starts_at=?,ends_at=? WHERE id=?',
+                (title, category, notes, starts_at, ends_at, event_id)
+            )
+            if changed_time:
+                self.conn.execute('DELETE FROM event_reminders WHERE event_id=?', (event_id,))
+                self.conn.execute('DELETE FROM event_dm_jobs WHERE event_id=?', (event_id,))
+                for stage, seconds in STAGES:
+                    due_at = starts_at - seconds
+                    if due_at >= now - 60:
+                        self.conn.execute(
+                            'INSERT INTO event_reminders(event_id,stage,due_at) VALUES(?,?,?)',
+                            (event_id, stage, due_at)
+                        )
+            self.conn.execute('COMMIT')
+            return True
+        except Exception:
+            self.conn.execute('ROLLBACK')
+            raise
+
+    def calendar_events(self, guild_id, first_day, last_day):
+        return self.conn.execute(
+            "SELECT * FROM game_events WHERE guild_id=? AND state='active' AND starts_at<? AND ends_at>? ORDER BY starts_at LIMIT 80",
+            (guild_id, last_day, first_day)
+        ).fetchall()
 
     def event(self, event_id):
         return self.conn.execute('SELECT * FROM game_events WHERE id=?', (event_id,)).fetchone()
@@ -184,15 +232,15 @@ class EventStore:
         self.conn.close()
 
 
-def parse_utc(value, now=None):
+def parse_utc(value, now=None, future=True):
     now = int(datetime.now(timezone.utc).timestamp()) if now is None else now
     try:
         start = datetime.strptime(value.strip(), '%Y-%m-%d %H:%M').replace(tzinfo=timezone.utc)
     except ValueError as error:
         raise ValueError('Use YYYY-MM-DD HH:MM in game/server time (UTC), for example 2026-11-08 19:00.') from error
     timestamp = int(start.timestamp())
-    if timestamp < now + 300 or timestamp > now + 90 * 86400:
-        raise ValueError('Events must start between 5 minutes and 90 days from now.')
+    if future and (timestamp < now + 300 or timestamp > now + 90 * 86400):
+        raise ValueError('Event starts must be between 5 minutes and 90 days from now.')
     return timestamp
 
 
