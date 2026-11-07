@@ -10,7 +10,7 @@ import discord
 from discord import app_commands
 from discord.ext import tasks
 
-from event_graphics import event_banner, weekly_calendar
+from event_graphics import weekly_calendar, event_board
 
 
 log = logging.getLogger('sas.events')
@@ -48,7 +48,8 @@ class EventStore:
                 created_by INTEGER NOT NULL,
                 message_id INTEGER,
                 banner_url TEXT,
-                state TEXT NOT NULL DEFAULT 'active'
+                state TEXT NOT NULL DEFAULT 'active',
+                display_phase TEXT
             );
             CREATE TABLE IF NOT EXISTS event_subscribers (
                 event_id INTEGER NOT NULL,
@@ -83,6 +84,8 @@ class EventStore:
         columns = {row['name'] for row in self.conn.execute('PRAGMA table_info(game_events)')}
         if 'ends_at' not in columns:
             self.conn.execute('ALTER TABLE game_events ADD COLUMN ends_at INTEGER')
+        if 'display_phase' not in columns:
+            self.conn.execute('ALTER TABLE game_events ADD COLUMN display_phase TEXT')
         self.conn.execute('UPDATE game_events SET ends_at=starts_at+3600 WHERE ends_at IS NULL')
 
     def set_channel(self, guild_id, channel_id, role_id):
@@ -121,7 +124,7 @@ class EventStore:
             event_id = cursor.lastrowid
             for stage, seconds in STAGES:
                 due_at = starts_at - seconds
-                if due_at >= now - 60:
+                if due_at > now:
                     self.conn.execute(
                         'INSERT INTO event_reminders(event_id,stage,due_at) VALUES(?,?,?)',
                         (event_id, stage, due_at)
@@ -154,7 +157,7 @@ class EventStore:
                 self.conn.execute('DELETE FROM event_dm_jobs WHERE event_id=?', (event_id,))
                 for stage, seconds in STAGES:
                     due_at = starts_at - seconds
-                    if due_at >= now - 60:
+                    if due_at > now:
                         self.conn.execute(
                             'INSERT INTO event_reminders(event_id,stage,due_at) VALUES(?,?,?)',
                             (event_id, stage, due_at)
@@ -178,10 +181,31 @@ class EventStore:
         return self.conn.execute('SELECT * FROM game_events WHERE message_id=?', (message_id,)).fetchone()
 
     def set_message(self, event_id, message_id, banner_url=None):
+        event = self.event(event_id)
+        phase = event_phase(event) if event else None
         self.conn.execute(
-            'UPDATE game_events SET message_id=?,banner_url=? WHERE id=?',
-            (message_id, banner_url, event_id)
+            'UPDATE game_events SET message_id=?,banner_url=?,display_phase=? WHERE id=?',
+            (message_id, banner_url, phase, event_id)
         )
+
+    def mark_display_phase(self, event_id, phase):
+        self.conn.execute('UPDATE game_events SET display_phase=?,banner_url=NULL WHERE id=?', (phase, event_id))
+
+    def mark_card_missing(self, event_id):
+        self.conn.execute('UPDATE game_events SET message_id=NULL,banner_url=NULL,display_phase=NULL WHERE id=?', (event_id,))
+
+    def cards_to_refresh(self, now=None):
+        now = int(datetime.now(timezone.utc).timestamp()) if now is None else now
+        return self.conn.execute(
+            """SELECT * FROM game_events WHERE message_id IS NOT NULL
+            AND COALESCE(display_phase,'') != CASE
+                WHEN state='cancelled' THEN 'Cancelled'
+                WHEN ends_at<=? THEN 'Completed'
+                WHEN starts_at<=? THEN 'In Progress'
+                ELSE 'Upcoming' END
+            ORDER BY starts_at LIMIT 20""",
+            (now, now)
+        ).fetchall()
 
     def cancel(self, event_id, guild_id):
         cursor = self.conn.execute(
@@ -199,6 +223,21 @@ class EventStore:
             "SELECT * FROM game_events WHERE guild_id=? AND state='active' AND ends_at>? ORDER BY starts_at LIMIT 15",
             (guild_id, now)
         ).fetchall()
+
+    def board_events(self, guild_id, now=None, limit=24):
+        now = int(datetime.now(timezone.utc).timestamp()) if now is None else now
+        return self.conn.execute(
+            """SELECT * FROM game_events WHERE guild_id=? AND state='active' AND ends_at>?
+            ORDER BY CASE WHEN starts_at<=? THEN 0 ELSE 1 END, starts_at, id LIMIT ?""",
+            (guild_id, now, now, limit)
+        ).fetchall()
+
+    def board_event_count(self, guild_id, now=None):
+        now = int(datetime.now(timezone.utc).timestamp()) if now is None else now
+        return self.conn.execute(
+            "SELECT COUNT(*) FROM game_events WHERE guild_id=? AND state='active' AND ends_at>?",
+            (guild_id, now)
+        ).fetchone()[0]
 
     def subscribe(self, event_id, user_id, now=None):
         now = int(datetime.now(timezone.utc).timestamp()) if now is None else now
@@ -279,6 +318,17 @@ def parse_utc(value, now=None, future=True):
     return timestamp
 
 
+def event_phase(event, now=None):
+    now = int(datetime.now(timezone.utc).timestamp()) if now is None else now
+    if event['state'] == 'cancelled':
+        return 'Cancelled'
+    if now >= event['ends_at']:
+        return 'Completed'
+    if now >= event['starts_at']:
+        return 'In Progress'
+    return 'Upcoming'
+
+
 def clean(value, limit):
     return discord.utils.escape_mentions(discord.utils.escape_markdown(str(value)))[:limit]
 
@@ -353,6 +403,7 @@ class EventCenter:
         self.bot = bot
         self.store = EventStore(path)
         self.group_registered = False
+        self.board_lock = asyncio.Lock()
 
     def is_staff(self, interaction):
         return bool(
@@ -360,28 +411,56 @@ class EventCenter:
             and isinstance(interaction.user, discord.Member) and self.bot.is_reviewer(interaction.user)
         )
 
-    def build_embed(self, event, stage='upcoming'):
-        name = clean(event['title'], 200)
-        now = int(datetime.now(timezone.utc).timestamp())
-        in_progress = event['starts_at'] <= now < event['ends_at'] and event['state'] == 'active'
-        status = 'Cancelled' if event['state'] == 'cancelled' else 'Starting Now' if stage == 'start' else 'In Progress' if in_progress else 'Completed' if now >= event['ends_at'] else 'Scheduled'
-        color = 0xC74949 if event['state'] == 'cancelled' else 0xE5B75E if in_progress or stage in ('1h','15m','start') else 0x318BCE
-        description = clean(event['notes'], 1400) or 'Check the in-game Events calendar for the event details.'
-        result = discord.Embed(title=f"SaS | {name}", description=description, color=color)
+    def build_embed(self, event, stage=None, now=None):
+        now = int(datetime.now(timezone.utc).timestamp()) if now is None else now
+        phase = event_phase(event, now)
+        title = clean(event['title'], 200)
+        description = clean(event['notes'], 1400) or 'See the in-game Events calendar for further information.'
+        color = {
+            'Upcoming': 0x318BCE,
+            'In Progress': 0xE5B75E,
+            'Completed': 0x738499,
+            'Cancelled': 0xC74949
+        }[phase]
+        heading = f"SaS | {title}"
+        stage_names = {'24h': '24-Hour Reminder', '1h': '1-Hour Reminder', '15m': '15-Minute Reminder', 'start': 'Event Start'}
+        if stage in stage_names:
+            heading = f"SaS | {stage_names[stage]} | {title}"
+        result = discord.Embed(title=heading, description=description, color=color)
         result.add_field(name='EVENT TYPE', value=clean(event['category'], 60), inline=True)
+        result.add_field(name='STATUS', value=phase, inline=True)
         result.add_field(name='SERVER START', value=f"<t:{event['starts_at']}:F>", inline=True)
         result.add_field(name='SERVER END', value=f"<t:{event['ends_at']}:F>", inline=True)
-        result.add_field(name='ENDS IN' if in_progress else 'COUNTDOWN', value=f"<t:{event['ends_at'] if in_progress else event['starts_at']}:R>", inline=True)
-        server_start = datetime.fromtimestamp(event['starts_at'], timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-        server_end = datetime.fromtimestamp(event['ends_at'], timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-        result.add_field(name='IN-GAME SERVER TIME', value=f"{server_start} - {server_end}", inline=False)
-        result.add_field(name='STATUS', value=status, inline=True)
-        reminder_info = 'Already in progress. Past pre-event reminders will not be sent.' if in_progress else '24h / 1h / 15m / Start\nPersonal DM: 1h and 15m, opt-in only.'
-        result.add_field(name='REMINDERS', value=reminder_info, inline=False)
-        result.set_footer(text=f"SaS Event Center | Event #{event['id']} | {stage}")
-        if event['banner_url'] and stage in ('upcoming','cancelled'):
-            result.set_image(url=event['banner_url'])
+        if phase == 'Upcoming':
+            result.add_field(name='STARTS IN', value=f"<t:{event['starts_at']}:R>", inline=True)
+        elif phase == 'In Progress':
+            result.add_field(name='ENDS IN', value=f"<t:{event['ends_at']}:R>", inline=True)
+        server_start = datetime.fromtimestamp(event['starts_at'], timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+        server_end = datetime.fromtimestamp(event['ends_at'], timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+        result.add_field(name='IN-GAME SERVER TIME (UTC)', value=f"{server_start} — {server_end}", inline=False)
+        reminders = {
+            'Upcoming': 'Channel: 24h, 1h, 15m, start. Opt-in DMs: 1h and 15m.',
+            'In Progress': 'The event has started. No earlier reminders will be sent.',
+            'Completed': 'The event has ended. All reminders are closed.',
+            'Cancelled': 'This event was cancelled. All reminders are disabled.'
+        }
+        result.add_field(name='REMINDERS', value=reminders[phase], inline=False)
+        result.set_footer(text=f"SaS Event Center | Event #{event['id']} | {phase}")
         return result
+
+    async def sync_event_card(self, event, message=None):
+        if not event['message_id']:
+            return None
+        channel = self.bot.guild.get_channel(event['channel_id'])
+        if not isinstance(channel, discord.TextChannel):
+            return None
+        if message is None:
+            message = await channel.fetch_message(event['message_id'])
+        phase = event_phase(event)
+        view = EventReminderView(self) if phase == 'Upcoming' else None
+        await message.edit(embed=self.build_embed(event), attachments=[], view=view, allowed_mentions=discord.AllowedMentions.none())
+        self.store.mark_display_phase(event['id'], phase)
+        return message
 
     def upcoming_embed(self, rows):
         result = discord.Embed(title='SaS | Upcoming Events', color=0x318BCE)
@@ -389,7 +468,7 @@ class EventCenter:
             for event in rows[:10]:
                 result.add_field(
                     name=f"#{event['id']} | {clean(event['title'], 90)}",
-                    value=f"{clean(event['category'], 50)} | <t:{event['starts_at']}:F> - <t:{event['ends_at']}:F> (<t:{event['starts_at']}:R>)",
+                    value=f"{clean(event['category'], 50)} | **{event_phase(event)}** | <t:{event['starts_at']}:F> — <t:{event['ends_at']}:F> | <t:{event['ends_at'] if event_phase(event) == 'In Progress' else event['starts_at']}:R>",
                     inline=False
                 )
         else:
@@ -423,28 +502,64 @@ class EventCenter:
         embed.timestamp = now
         return embed, banner
 
-    async def refresh_board(self, guild_id):
-        settings = self.store.settings(guild_id)
-        if settings is None or not settings['calendar_message_id']:
-            return None
-        channel = self.bot.guild.get_channel(settings['channel_id'])
-        if not isinstance(channel, discord.TextChannel):
-            return None
-        try:
-            message = await channel.fetch_message(settings['calendar_message_id'])
-        except discord.NotFound:
-            self.store.set_board(guild_id, None)
-            return None
-        embed, banner = self.calendar_payload(guild_id)
-        edited = await message.edit(embed=embed, attachments=[banner], allowed_mentions=discord.AllowedMentions.none())
-        self.store.set_board(guild_id, edited.id if edited else message.id)
-        return edited or message
+    def board_payload(self, guild_id):
+        now = datetime.now(timezone.utc)
+        records = self.store.board_events(guild_id, int(now.timestamp()))
+        entries = [
+            {
+                'id': item['id'], 'title': item['title'], 'category': item['category'],
+                'starts_at': item['starts_at'], 'ends_at': item['ends_at'],
+                'phase': event_phase(item, int(now.timestamp()))
+            }
+            for item in records
+        ]
+        total = self.store.board_event_count(guild_id, int(now.timestamp()))
+        file = discord.File(event_board(entries, now, total), filename='sas_events_overview.png')
+        embed = discord.Embed(
+            title='SaS | Event Center',
+            description=f"**Server Time:** {now.strftime('%Y-%m-%d %H:%M:%S')} UTC\n**Active and upcoming events:** {total}\nNew events are automatically added to this graphic. Use /event calendar to browse the seven-day timeline.",
+            color=0x5DAAE3
+        )
+        embed.set_image(url='attachment://sas_events_overview.png')
+        embed.set_footer(text='SaS Event Center | Shared schedule | All times UTC')
+        embed.timestamp = now
+        return embed, file
 
-    async def refresh_board_safe(self, guild_id):
+    async def ensure_board(self, guild_id, create=False):
+        async with self.board_lock:
+            settings = self.store.settings(guild_id)
+            if settings is None:
+                return None
+            channel = self.bot.guild.get_channel(settings['channel_id'])
+            if not isinstance(channel, discord.TextChannel):
+                return None
+            message = None
+            if settings['calendar_message_id']:
+                try:
+                    message = await channel.fetch_message(settings['calendar_message_id'])
+                except discord.NotFound:
+                    self.store.set_board(guild_id, None)
+                if message:
+                    embed, file = self.board_payload(guild_id)
+                    edited = await message.edit(embed=embed, attachments=[file], allowed_mentions=discord.AllowedMentions.none())
+                    self.store.set_board(guild_id, (edited or message).id)
+                    return edited or message
+            if create:
+                embed, file = self.board_payload(guild_id)
+                message = await channel.send(embed=embed, file=file, allowed_mentions=discord.AllowedMentions.none())
+                self.store.set_board(guild_id, message.id)
+                return message
+            return None
+
+    async def refresh_board(self, guild_id):
+        return await self.ensure_board(guild_id)
+
+    async def refresh_board_safe(self, guild_id, create=False):
         try:
-            await self.refresh_board(guild_id)
-        except Exception:
-            log.exception('Could not refresh public event calendar in server %s', guild_id)
+            return await self.ensure_board(guild_id, create=create)
+        except (discord.HTTPException, OSError, ValueError):
+            log.exception('Could not synchronize shared SaS event calendar in server %s', guild_id)
+            return None
 
     async def show_calendar(self, interaction, week_offset=0, update=False, view=None, publish=False):
         if interaction.guild_id != getattr(self.bot.guild, 'id', None):
@@ -458,16 +573,13 @@ class EventCenter:
                 return await interaction.response.send_message('Configured calendar channel is unavailable.', ephemeral=True)
             await interaction.response.defer(ephemeral=True, thinking=True)
             try:
-                existing = await self.refresh_board(interaction.guild_id)
-                if existing:
-                    return await interaction.followup.send(f'Calendar refreshed in {channel.mention}: {existing.jump_url}', ephemeral=True)
-                embed, banner = self.calendar_payload(interaction.guild_id, 0)
-                message = await channel.send(embed=embed, file=banner, allowed_mentions=discord.AllowedMentions.none())
-                self.store.set_board(interaction.guild_id, message.id)
+                message = await self.ensure_board(interaction.guild_id, create=True)
+                if not message:
+                    return await interaction.followup.send('Calendar channel is unavailable.', ephemeral=True)
             except discord.HTTPException:
                 log.exception('Unable to publish SaS weekly calendar')
                 return await interaction.followup.send('Calendar could not be posted. Check channel permissions.', ephemeral=True)
-            return await interaction.followup.send(f'Calendar posted in {channel.mention}: {message.jump_url}', ephemeral=True)
+            return await interaction.followup.send(f'Combined event calendar updated in {channel.mention}: {message.jump_url}', ephemeral=True)
         embed, banner = self.calendar_payload(interaction.guild_id, week_offset)
         if view is None:
             view = CalendarNavigation(self, interaction.user.id, week_offset)
@@ -517,24 +629,27 @@ class EventCenter:
             event_id = self.store.create(interaction.guild_id, channel.id, title, category, notes, starts_at, interaction.user.id, now, ends_at)
             event = self.store.event(event_id)
             embed = self.build_embed(event)
-            kwargs = dict(embed=embed, view=EventReminderView(self), allowed_mentions=discord.AllowedMentions.none())
+            view = EventReminderView(self) if event_phase(event) == 'Upcoming' else None
             try:
-                kwargs['file'] = discord.File(event_banner(title, category, 'upcoming', starts_at, ends_at), filename='sas_event.png')
-                embed.set_image(url='attachment://sas_event.png')
-            except Exception:
-                log.exception('Unable to render event banner for %s', event_id)
-            try:
-                message = await channel.send(**kwargs)
+                message = await channel.send(embed=embed, view=view, allowed_mentions=discord.AllowedMentions.none())
             except discord.HTTPException:
                 log.exception('Could not publish SaS event %s', event_id)
                 self.store.cancel(event_id, interaction.guild_id)
                 return await interaction.followup.send('The event could not be published. Check channel permissions.', ephemeral=True)
-            banner_url = message.attachments[0].url if message.attachments else None
-            self.store.set_message(event_id, message.id, banner_url)
-            await self.refresh_board_safe(interaction.guild_id)
-            await interaction.followup.send(f"Scheduled **{clean(title, 100)}** in {channel.mention} from <t:{starts_at}:F> to <t:{ends_at}:F>. Event ID: {event_id}.", ephemeral=True)
+            self.store.set_message(event_id, message.id)
+            board = await self.refresh_board_safe(interaction.guild_id, create=True)
+            if board:
+                await interaction.followup.send(
+                    f"Added **{clean(title, 100)}** to the shared Events calendar: {board.jump_url}\nEvent details: {message.jump_url}\nEvent ID: {event_id}",
+                    ephemeral=True
+                )
+            else:
+                await interaction.followup.send(
+                    f"Event #{event_id} was saved and posted in {channel.mention}, but the shared calendar could not be updated. Check bot permissions and run /event calendar publish:True.",
+                    ephemeral=True
+                )
 
-        @group.command(name='calendar', description='View a game-style seven-day calendar with server times')
+        @group.command(name='calendar', description='Browse seven days or publish the combined Events overview')
         @app_commands.describe(week_offset='Weeks backward or forward (-12 to +12)', publish='Staff: post calendar to the event channel')
         async def calendar(interaction: discord.Interaction, week_offset: app_commands.Range[int,-12,12] = 0, publish: bool = False):
             if publish and not self.is_staff(interaction):
@@ -564,22 +679,13 @@ class EventCenter:
                 return await interaction.response.send_message(str(error), ephemeral=True)
             await interaction.response.defer(ephemeral=True)
             updated = self.store.event(event_id)
-            channel = interaction.guild.get_channel(updated['channel_id'])
-            if isinstance(channel, discord.TextChannel) and updated['message_id']:
+            if updated['message_id']:
                 try:
-                    message = await channel.fetch_message(updated['message_id'])
-                    embed = self.build_embed(updated)
-                    attachments = []
-                    try:
-                        attachments = [discord.File(event_banner(updated['title'], updated['category'], 'upcoming', updated['starts_at'], updated['ends_at']), filename='sas_event.png')]
-                        embed.set_image(url='attachment://sas_event.png')
-                    except Exception:
-                        log.exception('Unable to update banner for event %s', event_id)
-                    edited = await message.edit(embed=embed, attachments=attachments, view=EventReminderView(self))
-                    if edited and edited.attachments:
-                        self.store.set_message(event_id, edited.id, edited.attachments[0].url)
+                    await self.sync_event_card(updated)
+                except discord.NotFound:
+                    self.store.mark_card_missing(event_id)
                 except discord.HTTPException:
-                    log.exception('Unable to update existing event message %s',event_id)
+                    log.exception('Unable to update event details for %s', event_id)
             await self.refresh_board_safe(interaction.guild_id)
             await interaction.followup.send(f'Event #{event_id} updated. Reminders follow the new start time if rescheduled.', ephemeral=True)
 
@@ -596,11 +702,11 @@ class EventCenter:
             if not self.store.cancel(event_id, interaction.guild_id):
                 return await interaction.response.send_message('Active event not found.', ephemeral=True)
             event = self.store.event(event_id)
-            channel = interaction.guild.get_channel(event['channel_id'])
-            if channel and event['message_id']:
+            if event['message_id']:
                 try:
-                    message = await channel.fetch_message(event['message_id'])
-                    await message.edit(embed=self.build_embed(event, 'cancelled'), view=None)
+                    await self.sync_event_card(event)
+                except discord.NotFound:
+                    self.store.mark_card_missing(event_id)
                 except discord.HTTPException:
                     log.exception('Could not update cancelled event %s', event_id)
             await self.refresh_board_safe(interaction.guild_id)
@@ -617,38 +723,41 @@ class EventCenter:
         for reminder in self.store.due(now):
             event = self.store.event(reminder['event_id'])
             stage = reminder['stage']
-            if event['state'] != 'active' or now - reminder['due_at'] > 600:
+            if (event['state'] != 'active' or now >= event['ends_at']
+                    or now - reminder['due_at'] > 600
+                    or (stage != 'start' and now >= event['starts_at'])):
                 self.store.reminder_state(event['id'], stage, 'skipped')
                 continue
             channel = self.bot.guild.get_channel(event['channel_id'])
             if not isinstance(channel, discord.TextChannel):
                 continue
-            result = self.build_embed(event, stage)
-            extra = {}
-            try:
-                extra['file'] = discord.File(event_banner(event['title'], event['category'], stage, event['starts_at'], event['ends_at']), filename='sas_event_reminder.png')
-                result.set_image(url='attachment://sas_event_reminder.png')
-            except Exception:
-                log.exception('Unable to render reminder banner for event %s', event['id'])
             settings = self.store.settings(event['guild_id'])
             role = self.bot.guild.get_role(settings['role_id']) if settings and settings['role_id'] and stage == 'start' else None
             try:
                 message = await channel.send(
                     content=role.mention if role else None,
-                    embed=result,
-                    allowed_mentions=discord.AllowedMentions(roles=[role] if role else [], users=False, everyone=False),
-                    **extra
+                    embed=self.build_embed(event, stage),
+                    allowed_mentions=discord.AllowedMentions(roles=[role] if role else [], users=False, everyone=False)
                 )
             except discord.HTTPException:
-                log.exception('Failed to send event %s stage %s',event['id'],stage)
+                log.exception('Failed to send event %s stage %s', event['id'], stage)
                 continue
-            self.store.reminder_state(event['id'],stage,'sent',message.id)
-            if stage == 'start' and event['message_id']:
-                try:
-                    original = await channel.fetch_message(event['message_id'])
-                    await original.edit(embed=self.build_embed(event, 'start'), view=None)
-                except discord.HTTPException:
-                    log.exception('Could not close event panel %s',event['id'])
+            self.store.reminder_state(event['id'], stage, 'sent', message.id)
+        phase_changed = False
+        for event in self.store.cards_to_refresh(now):
+            try:
+                await self.sync_event_card(event)
+                phase_changed = True
+            except discord.NotFound:
+                self.store.mark_card_missing(event['id'])
+                phase_changed = True
+            except discord.HTTPException:
+                log.exception('Unable to refresh status on event #%s', event['id'])
+        settings = self.store.settings(self.bot.guild.id)
+        if settings and not settings['calendar_message_id'] and self.store.upcoming(self.bot.guild.id, now):
+            await self.refresh_board_safe(self.bot.guild.id, create=True)
+        elif phase_changed and settings and settings['calendar_message_id']:
+            await self.refresh_board_safe(self.bot.guild.id)
         for settings in self.store.boards_to_refresh(now):
             await self.refresh_board_safe(settings['guild_id'])
         for job in self.store.due_dm():
@@ -656,7 +765,7 @@ class EventCenter:
             if event['state'] != 'active':
                 self.store.dm_state(job['event_id'], job['stage'], job['user_id'], 'skipped')
                 continue
-            if int(datetime.now(timezone.utc).timestamp()) >= event['starts_at'] + 300:
+            if int(datetime.now(timezone.utc).timestamp()) >= event['starts_at']:
                 self.store.dm_state(job['event_id'], job['stage'], job['user_id'], 'skipped')
                 continue
             message = self.build_embed(event,job['stage'])

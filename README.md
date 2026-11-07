@@ -76,37 +76,46 @@ If earlier versions removed Member from someone incorrectly, restore Member manu
 
 ## SaS Event Center and reminders
 
-The event system presents a **game-inspired seven-day calendar** based on the supplied Police Chief screenshots, with a dark brown header, blue server clock, weekday columns, the current day highlighted, color-coded event lanes and arrow-shaped duration bars. Each event also has its precise start and end time. The generated illustration is original and does not reuse game artwork.
+The bot publishes **one combined SaS Events graphic** inspired by Police Chief. Every active or upcoming event appears on its own color-coded bar beneath a single server clock. For example, **Port Inspection** and **Work Log** appear as two separate entries, even when both use the Port Inspection category. The board shows each event's exact start/end date and time, plus **Upcoming** or **In Progress**.
 
-The calendar has an actual **server-time timestamp when rendered**, rather than a live ticking clock inside an image. Clicking a week-navigation button, rerunning the command, or the hourly shared-calendar update refreshes the displayed time. The current implementation uses **UTC** for the in-game server clock; verify this matches the game's server before scheduling real events. Discord timestamps in embeds automatically display in the viewer's timezone.
+The shared graphic is **created automatically on the first event** and updated, not reposted, whenever staff add, edit or cancel another event. Event start/end transitions also update the graphic, and a scheduled refresh updates its printed clock approximately once per hour. Discord cannot continuously animate the timestamp inside a static PNG.
 
-### Setup and commands
+A separate **seven-day calendar** remains available privately with `/event calendar`, including **Previous Week**, **This Week**, **Next Week** and **Upcoming Events** controls. `/event calendar publish:True` creates or refreshes the combined Events board rather than creating another one-event picture.
 
-1. Staff run `/event setup channel:#event-reminders notify_role:@SaS`. The notification role is optional. It is pinged only when the event starts.
-2. Staff create entries using `/event create title:Alliance Training start_utc:2026-11-08 00:00:00 end_utc:2026-11-10 23:59:59 category:Alliance notes:Prepare your team`. Both date/time values accept precise `YYYY-MM-DD HH:MM:SS` format, UTC. For convenience, `YYYY:MM:DD HH:MM:SS` and the previous minute-only format also work. This is **example data**, not a verified game schedule.
-3. Everyone can open `/event calendar` for a personal weekly calendar with **Previous Week**, **This Week**, **Next Week** and **Upcoming Events** buttons. The view can navigate up to 12 weeks backward or forward.
-4. Staff can publish one shared calendar message using `/event calendar publish:True`. Rerunning the command refreshes that message rather than creating duplicates. The bot also refreshes the shared image when an event is created, edited or cancelled, and approximately hourly to update its displayed server time. Members can browse their own calendars privately without changing the shared message.
-5. Use `/event upcoming` to list upcoming events.
-6. Staff can edit or reschedule a planned event with `/event edit event_id:1 start_utc:2026-11-09 00:00:00 end_utc:2026-11-11 23:59:59` and cancel with `/event cancel event_id:1`. Changing a start time rebuilds its future reminder schedule. Subscriptions remain saved.
+### Staff setup and commands
 
-Supported color categories: **Port Inspection** (red), **Events** (blue), **Alliance** (gold), **Deals** (red) and **Other** (green). Events already underway are allowed if their **end time is still in the future**. For example, an event starting `2026-11-06 00:00:00` and ending `2026-11-08 23:59:59` can be entered on November 7. The calendar marks it as **In Progress**, shows when it ends, and does not send any reminders whose deadlines have already passed. Subscribers cannot join an event after it begins. An end time is optional; omitted events default to one hour. Longer events may span several calendar days, up to 14 days.
+1. Configure `/event setup channel:#event-reminders notify_role:@SaS`. The role is optional and pinged only at event start.
+2. Add events using `/event create title:Port Inspection start_utc:2026-11-06 00:00:00 end_utc:2026-11-08 23:59:59 category:Port Inspection`.
+3. Add another event such as `/event create title:Work Log start_utc:2026-11-06 00:00:00 end_utc:2026-11-08 23:59:59 category:Port Inspection`. The existing graphic automatically gains a second bar.
+4. Use `/event calendar` for the navigable weekly view and `/event upcoming` for event numbers and dates.
+5. Use `/event edit event_id:1 start_utc:2026-11-08 10:00:00 end_utc:2026-11-10 23:59:59` to adjust details, or `/event cancel event_id:1` to stop its reminders and remove it from the shared graphic.
 
-### Reminder rules
+The timestamps above are **format examples** from the provided screenshots, not confirmed game schedule data. Full `YYYY-MM-DD HH:MM:SS` timestamps are supported, along with `YYYY:MM:DD HH:MM:SS` and minute-only input. All input times use **UTC**, which must match the game's clock to produce correct notifications. Discord renders its own timestamps in each member's local timezone.
 
-- Channel reminders post **24 hours, 1 hour and 15 minutes before start, and at event start**.
-- Members click **Remind Me** to subscribe to **private DM reminders 1 hour and 15 minutes before start**. They can click **Stop Reminders** at any time. DMs are never sent by default.
-- For members who subscribe late, only future DM stages are delivered.
-- The optional configured role ping is sent only at the start, avoiding repeated role notifications.
-- The scheduler checks every 30 seconds, persists event, subscriber and delivery state in `events.sqlite3`, and skips badly overdue notices after downtime.
-- Rescheduling rebuilds the reminder schedule. Cancelling an event stops future notifications.
+Event categories are **Port Inspection** (red), **Events** (blue), **Alliance** (gold), **Deals** (red) and **Other** (green). Events may last up to 14 days and can be entered after they start if the end time is still in the future. Past reminders are never created for events already in progress.
 
-### Limits and operating guidance
+### Event details and reminder behavior
 
-The game calendar is **not connected to an official Police Chief data API**. Events and their exact times must be entered by staff using confirmed information. The screenshot contains event names and dates but cannot prove the exact start and end times, so the bot does not seed fabricated live events.
+The bot continues to post a small per-event Discord embed containing the event title, status, exact time, and reminder buttons for events that have not started. **It no longer attaches a separate oversized image to each event**; all events share the Events overview graphic. Existing event messages from the previous version are updated when the bot starts, removing their old isolated artwork and correcting the footer/status labels.
 
-The event channel needs **View Channel, Send Messages, Embed Links, Attach Files and Read Message History** permissions for the bot. The Discord application must have `applications.commands` enabled.
+Status wording comes from one calculation in both embeds and the shared graphic:
 
-Keep `data/events.sqlite3` on persistent storage, along with `data/verification.json`. Run only one instance using a given SQLite database. A process interruption during the small window between a message being sent and its delivery receipt being saved can exceptionally duplicate a reminder.
+- **Upcoming**: event has not started.
+- **In Progress**: start time has passed but end time has not.
+- **Completed**: end time has passed.
+- **Cancelled**: staff cancelled the event.
+
+Channel reminders are posted at **24 hours, 1 hour, 15 minutes and event start**, if those notification times are still in the future when the event is added. Members may click **Remind Me** on upcoming event details to opt in to private DMs **1 hour and 15 minutes** before start. They may unsubscribe via **Stop Reminders**. The optional role ping happens once, at start. DMs are not sent once the event has started.
+
+The scheduler checks approximately every 30 seconds, keeps event/subscriber/reminder data in the persistent `events.sqlite3`, and avoids sending stale notifications after downtime. Events whose end time passed are removed from the shared list at the next scheduled refresh. A rare process interruption between sending a message and recording the receipt can result in a duplicate reminder.
+
+### Operating notes
+
+The bot **does not read Police Chief's game calendar automatically**. Staff must enter verified event times manually. The combined Events graphic shows up to 24 active/upcoming events at once, with the total count if there are more.
+
+The bot requires View Channel, Send Messages, Embed Links, Attach Files, and Read Message History permissions in its event channel; its application must be invited with the `applications.commands` scope.
+
+Persist both `data/verification.json` and `data/events.sqlite3`. Run only one bot instance per event SQLite file to avoid duplicate notifications.
 
 ## Server configuration
 

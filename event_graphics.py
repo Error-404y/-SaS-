@@ -53,40 +53,56 @@ def png(image):
     return output
 
 
-def event_banner(title, category, stage, starts_at=None, ends_at=None, server_now=None):
-    server_now = datetime.now(timezone.utc) if server_now is None else server_now
-    width, height = 1000, 300
-    image = Image.new('RGB', (width, height), (62, 49, 41))
+def event_board(events, server_now=None, total_count=None):
+    if server_now is None:
+        server_now = datetime.now(timezone.utc)
+    if server_now.tzinfo is None:
+        raise ValueError('Server time requires a timezone.')
+    entries = list(events)
+    count = len(entries) if total_count is None else total_count
+    entries = entries[:24]
+    row_height = 123
+    width = 1000
+    body_y = 169
+    height = max(375, body_y + row_height * max(1, len(entries)) + 68)
+    image = Image.new('RGB', (width, height), (64, 50, 42))
     draw = ImageDraw.Draw(image)
-    draw.rounded_rectangle((0, 0, width - 1, height - 1), radius=18, fill=(76, 62, 52), outline=(151, 121, 84), width=3)
-    draw.rounded_rectangle((13, 13, width - 13, 68), radius=12, fill=(95, 78, 62))
-    draw.text((34, 24), 'EVENTS', font=typeface(30, True), fill=(255, 251, 238))
-    draw.text((800, 30), 'SaS  EVENT CENTER', font=typeface(16, True), fill=(251, 218, 154))
-    draw.rounded_rectangle((13, 75, width - 13, 139), radius=12, fill=(94, 173, 231), outline=(55, 128, 192), width=3)
-    label = 'Server Time ' + server_now.strftime('%Y-%m-%d %H:%M:%S') + ' UTC'
-    draw.text((48, 89), label, font=fit_text(draw, label, 910, 31, True), fill=(255, 255, 255), stroke_width=1, stroke_fill=(65, 115, 154))
-    draw.rounded_rectangle((15, 148, width - 15, height - 18), radius=13, fill=(178, 207, 230))
-    light, dark = PALETTE.get(category, PALETTE['Other'])
-    bx0, bx1, by0, by1 = 33, width - 31, 165, 230
-    draw.polygon(((bx0, by0), (bx1 - 29, by0), (bx1, (by0 + by1)//2), (bx1 - 29, by1), (bx0, by1)), fill=light, outline=dark, width=4)
-    draw.line((bx0 + 10, by0 + 4, bx1 - 38, by0 + 4), fill=(255, 246, 222), width=2)
-    event_name = ellipsis(draw, title, 820, typeface(30, True))
-    draw.text((54, 177), event_name, font=typeface(30, True), fill=(255, 255, 255), stroke_width=1, stroke_fill=(72, 64, 62))
-    stage_label = {
-        'upcoming': 'UPCOMING', '24h': '24 HOURS BEFORE', '1h': '1 HOUR BEFORE',
-        '15m': '15 MINUTES BEFORE', 'start': 'STARTING NOW', 'cancelled': 'CANCELLED'
-    }.get(stage, 'EVENT REMINDER')
-    draw.text((43, 247), stage_label, font=typeface(18, True), fill=(60, 85, 117))
-    if starts_at is not None:
-        start = datetime.fromtimestamp(int(starts_at), timezone.utc)
-        date_string = start.strftime('%m/%d %H:%M:%S')
-        if ends_at is not None:
-            finish = datetime.fromtimestamp(int(ends_at), timezone.utc)
-            date_string += '  -  ' + finish.strftime('%m/%d %H:%M:%S')
-        date_string += ' UTC'
-        label_font = fit_text(draw, date_string, 620, 18, True)
-        tw = draw.textbbox((0,0), date_string, font=label_font)[2]
-        draw.text((width - 36 - tw, 247), date_string, font=label_font, fill=(53, 80, 116))
+    draw.rounded_rectangle((2, 2, width - 3, height - 3), radius=19, fill=(87, 69, 54), outline=(161, 127, 89), width=5)
+    draw.rounded_rectangle((14, 13, width - 14, 77), radius=13, fill=(100, 80, 64))
+    draw.text((34, 24), 'EVENTS', font=typeface(35, True), fill=(255, 253, 245))
+    draw.text((733, 33), 'SaS EVENT CENTER', font=typeface(18, True), fill=(253, 219, 157))
+    draw.rounded_rectangle((14, 84, width - 14, 156), radius=12, fill=(90, 170, 227), outline=(54, 128, 195), width=3)
+    clock = 'Server Time ' + server_now.strftime('%Y-%m-%d %H:%M:%S') + ' UTC'
+    draw.text((43, 104), clock, font=fit_text(draw, clock, 910, 30, True), fill=(250, 252, 255), stroke_width=1, stroke_fill=(70, 108, 139))
+    draw.rounded_rectangle((14, body_y, width - 14, height - 23), radius=13, fill=(174, 207, 233), outline=(233, 241, 250), width=3)
+    if not entries:
+        draw.text((55, body_y + 47), 'No active or upcoming events have been scheduled.', font=fit_text(draw, 'No active or upcoming events have been scheduled.', 880, 24, True), fill=(54, 89, 130))
+    for index, event in enumerate(entries):
+        y = body_y + 13 + index * row_height
+        category = event['category']
+        color, outline = PALETTE.get(category, PALETTE['Other'])
+        draw.polygon(((35, y), (939, y), (966, y + 32), (939, y + 65), (35, y + 65)), fill=color, outline=outline, width=4)
+        draw.line((47, y + 4, 939, y + 4), fill=(255, 243, 207), width=2)
+        title = str(event['title'])
+        title_font = fit_text(draw, title, 825, 31, True, minimum=18)
+        draw.text((60, y + 10), ellipsis(draw, title, 840, title_font), font=title_font, fill=(255, 255, 252), stroke_width=1, stroke_fill=(84, 68, 64))
+        phase = str(event['phase'])
+        if phase not in ('Upcoming', 'In Progress', 'Completed', 'Cancelled'):
+            phase = 'Upcoming'
+        phase_font = typeface(18, True)
+        draw.text((45, y + 77), phase.upper(), font=phase_font, fill=(46, 77, 114))
+        start = datetime.fromtimestamp(int(event['starts_at']), timezone.utc)
+        finish = datetime.fromtimestamp(int(event['ends_at']), timezone.utc)
+        period = start.strftime('%Y-%m-%d %H:%M:%S') + '  —  ' + finish.strftime('%Y-%m-%d %H:%M:%S') + ' UTC'
+        period_font = fit_text(draw, period, 740, 17, True)
+        text_width = draw.textbbox((0, 0), period, font=period_font)[2]
+        draw.text((width - 47 - text_width, y + 79), period, font=period_font, fill=(52, 82, 117))
+        if index != len(entries) - 1:
+            draw.line((33, y + row_height - 6, 964, y + row_height - 6), fill=(141, 179, 211), width=1)
+    footer = 'All events are subject to the in-game schedule'
+    if count > len(entries):
+        footer += f'  |  Showing {len(entries)} of {count}'
+    draw.text((31, height - 52), footer, font=fit_text(draw, footer, 920, 17, True), fill=(56, 88, 127))
     return png(image)
 
 

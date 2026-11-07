@@ -5,12 +5,12 @@ from pathlib import Path
 
 from PIL import Image
 
-from event_center import EventStore, EventReminderView, EventCenter, CalendarNavigation, parse_utc
+from event_center import EventStore, EventReminderView, EventCenter, CalendarNavigation, parse_utc, event_phase
 from bot import VerificationBot
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock, AsyncMock
 import os
 import discord
-from event_graphics import event_banner, weekly_calendar
+from event_graphics import weekly_calendar, event_board
 
 
 class EventStoreTests(unittest.IsolatedAsyncioTestCase):
@@ -116,6 +116,39 @@ class EventStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.settings(1)['calendar_message_id'], 445)
         self.store.set_channel(1, 99, None)
         self.assertIsNone(self.store.settings(1)['calendar_message_id'])
+
+    def test_new_events_share_one_board_with_different_titles(self):
+        ongoing = self.store.create(1, 2, 'Port Inspection', 'Port Inspection', '',
+                                    self.now - 3600, 7, now=self.now, ends_at=self.now + 86400)
+        upcoming = self.store.create(1, 2, 'Work Log', 'Port Inspection', '',
+                                     self.now + 7200, 7, now=self.now, ends_at=self.now + 172800)
+        entries = self.store.board_events(1, now=self.now)
+        self.assertEqual([row['title'] for row in entries], ['Port Inspection', 'Work Log'])
+        self.assertEqual([row['id'] for row in entries], [ongoing, upcoming])
+        self.assertEqual(self.store.board_event_count(1, now=self.now), 2)
+        self.assertEqual(self.store.due(now=self.now), [])
+
+    def test_event_phases_match_start_and_end_exactly(self):
+        event_id = self.create(start_offset=90000)
+        event = self.store.event(event_id)
+        self.assertEqual(event_phase(event, self.now), 'Upcoming')
+        self.assertEqual(event_phase(event, event['starts_at']), 'In Progress')
+        self.assertEqual(event_phase(event, event['ends_at'] - 1), 'In Progress')
+        self.assertEqual(event_phase(event, event['ends_at']), 'Completed')
+        self.store.cancel(event_id, 1)
+        self.assertEqual(event_phase(self.store.event(event_id), self.now), 'Cancelled')
+
+    def test_status_refresh_tracks_existing_message_records(self):
+        event_id = self.create(start_offset=1800)
+        self.store.set_message(event_id, 852)
+        self.assertEqual(self.store.event(event_id)['display_phase'], 'Upcoming')
+        future = self.now + 3600
+        pending = self.store.cards_to_refresh(now=future)
+        self.assertIn(event_id, [row['id'] for row in pending])
+        self.store.mark_display_phase(event_id, 'Completed')
+        self.assertEqual(self.store.event(event_id)['display_phase'], 'Completed')
+        self.store.mark_card_missing(event_id)
+        self.assertIsNone(self.store.event(event_id)['message_id'])
 
     def test_settings_survive_restart(self):
         self.store.set_channel(1, 456, 987)
@@ -239,6 +272,167 @@ class CalendarDiscordTests(unittest.IsolatedAsyncioTestCase):
             manager.close()
 
 
+class SharedEventBoardTests(unittest.IsolatedAsyncioTestCase):
+    async def test_board_is_published_once_then_edited(self):
+        with tempfile.TemporaryDirectory() as folder:
+            channel = MagicMock(spec=discord.TextChannel)
+            channel.id = 88
+            channel.send = AsyncMock()
+            channel.fetch_message = AsyncMock()
+            message = MagicMock()
+            message.id = 12345
+            message.jump_url = 'https://discord.com/channels/1/88/12345'
+            message.edit = AsyncMock(return_value=message)
+            channel.send.return_value = message
+            channel.fetch_message.return_value = message
+            guild = MagicMock()
+            guild.id = 1
+            guild.get_channel.return_value = channel
+            bot = MagicMock()
+            bot.guild = guild
+            manager = EventCenter(bot, Path(folder) / 'events.sqlite3')
+            now = int(datetime.now(timezone.utc).timestamp())
+            manager.store.set_channel(1, 88, None)
+            manager.store.create(1, 88, 'Port Inspection', 'Port Inspection', '',
+                                 now - 3600, 7, now=now, ends_at=now + 7200)
+            manager.store.create(1, 88, 'Work Log', 'Port Inspection', '',
+                                 now - 3600, 7, now=now, ends_at=now + 86400)
+            first = await manager.ensure_board(1, create=True)
+            self.assertEqual(first.id, 12345)
+            self.assertEqual(channel.send.await_count, 1)
+            embed = channel.send.await_args.kwargs['embed']
+            attachment = channel.send.await_args.kwargs['file']
+            self.assertEqual(embed.title, 'SaS | Event Center')
+            image = Image.open(attachment.fp)
+            self.assertEqual(image.format, 'PNG')
+            self.assertEqual(image.width, 1000)
+            self.assertGreater(image.height, 400)
+            await manager.ensure_board(1, create=True)
+            self.assertEqual(channel.send.await_count, 1)
+            self.assertEqual(message.edit.await_count, 1)
+            self.assertEqual(manager.store.settings(1)['calendar_message_id'], 12345)
+            manager.close()
+
+    async def test_existing_event_image_removed_and_footer_fixed(self):
+        with tempfile.TemporaryDirectory() as folder:
+            channel = MagicMock(spec=discord.TextChannel)
+            channel.id = 88
+            message = MagicMock()
+            message.id = 555
+            message.edit = AsyncMock(return_value=message)
+            channel.fetch_message = AsyncMock(return_value=message)
+            guild = MagicMock()
+            guild.id = 1
+            guild.get_channel.return_value = channel
+            bot = MagicMock()
+            bot.guild = guild
+            manager = EventCenter(bot, Path(folder) / 'events.sqlite3')
+            now = int(datetime.now(timezone.utc).timestamp())
+            event_id = manager.store.create(1, 88, 'Work Log', 'Port Inspection', '',
+                                            now - 120, 7, now=now, ends_at=now + 43200)
+            manager.store.set_message(event_id, message.id, 'https://example.com/old_event_banner.png')
+            manager.store.conn.execute('UPDATE game_events SET display_phase=NULL WHERE id=?',(event_id,))
+            record = manager.store.event(event_id)
+            self.assertEqual([row['id'] for row in manager.store.cards_to_refresh(now)], [event_id])
+            await manager.sync_event_card(record)
+            opts = message.edit.await_args.kwargs
+            self.assertEqual(opts['attachments'], [])
+            self.assertIsNone(opts['view'])
+            embed = opts['embed']
+            self.assertEqual(next(field.value for field in embed.fields if field.name == 'STATUS'), 'In Progress')
+            self.assertEqual(embed.footer.text, f'SaS Event Center | Event #{event_id} | In Progress')
+            self.assertIsNone(embed.image.url)
+            self.assertEqual(manager.store.event(event_id)['display_phase'], 'In Progress')
+            self.assertIsNone(manager.store.event(event_id)['banner_url'])
+            manager.close()
+
+
+class EventOverviewImageTests(unittest.TestCase):
+    def test_multiple_events_render_together_in_a_single_png(self):
+        now = datetime(2026, 11, 7, 12, 0, tzinfo=timezone.utc)
+        events = [
+            {'title':'Port Inspection', 'category':'Port Inspection', 'phase':'In Progress',
+             'starts_at':int((now-timedelta(hours=2)).timestamp()),
+             'ends_at':int((now+timedelta(days=2)).timestamp())},
+            {'title':'Work Log', 'category':'Port Inspection', 'phase':'In Progress',
+             'starts_at':int((now-timedelta(hours=2)).timestamp()),
+             'ends_at':int((now+timedelta(days=2)).timestamp())},
+            {'title':'Alliance Mobilization', 'category':'Alliance', 'phase':'Upcoming',
+             'starts_at':int((now+timedelta(days=1)).timestamp()),
+             'ends_at':int((now+timedelta(days=3)).timestamp())}
+        ]
+        image = Image.open(event_board(events, now))
+        self.assertEqual(image.format, 'PNG')
+        self.assertEqual(image.width, 1000)
+        self.assertGreater(image.height, 550)
+        self.assertGreater(image.height, Image.open(event_board(events[:1], now)).height)
+
+
+class EventCreationIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_create_two_events_updates_same_discord_graphic(self):
+        with tempfile.TemporaryDirectory() as folder:
+            with patch.dict(os.environ, {
+                'DATABASE_PATH':str(Path(folder) / 'verify.json'),
+                'EVENT_DATABASE_PATH':str(Path(folder) / 'events.sqlite3')
+            }):
+                bot = VerificationBot()
+                guild = MagicMock()
+                guild.id = 1
+                channel = MagicMock(spec=discord.TextChannel)
+                channel.id = 88
+                channel.mention = '#events'
+                channel.send = AsyncMock()
+                messages = {}
+                counter = [200]
+                async def send(**kwargs):
+                    counter[0] += 1
+                    message = MagicMock()
+                    message.id = counter[0]
+                    message.jump_url = f'https://discord.com/channels/1/88/{message.id}'
+                    message.edit = AsyncMock(return_value=message)
+                    messages[message.id] = message
+                    return message
+                async def fetch(message_id):
+                    return messages[message_id]
+                channel.send.side_effect = send
+                channel.fetch_message = AsyncMock(side_effect=fetch)
+                guild.get_channel.return_value = channel
+                bot.guild = guild
+                bot.events.is_staff = lambda interaction: True
+                bot.events.store.set_channel(1, 88, None)
+                bot.events.register()
+                group = bot.tree.get_commands(guild=guild)[0]
+                command = group.get_command('create')
+                interaction = MagicMock()
+                interaction.guild_id = 1
+                interaction.guild = guild
+                interaction.user.id = 99
+                interaction.response.defer = AsyncMock()
+                interaction.response.send_message = AsyncMock()
+                interaction.followup.send = AsyncMock()
+                clock = datetime.now(timezone.utc)
+                start = (clock - timedelta(hours=1)).strftime('%Y-%m-%d %H:%M:%S')
+                finish = (clock + timedelta(hours=23)).strftime('%Y-%m-%d %H:%M:%S')
+                for title in ('Port Inspection', 'Work Log'):
+                    await command.callback(interaction, title=title, start_utc=start,
+                                           category='Port Inspection', notes='', end_utc=finish)
+                self.assertEqual(channel.send.await_count, 3)
+                self.assertEqual(bot.events.store.board_event_count(1), 2)
+                event_one, board, event_two = channel.send.await_args_list
+                self.assertNotIn('file', event_one.kwargs)
+                self.assertEqual(board.kwargs['embed'].title, 'SaS | Event Center')
+                self.assertNotIn('file', event_two.kwargs)
+                board_id = bot.events.store.settings(1)['calendar_message_id']
+                self.assertEqual(messages[board_id].edit.await_count, 1)
+                self.assertEqual(
+                    [event['title'] for event in bot.events.store.board_events(1)],
+                    ['Port Inspection', 'Work Log']
+                )
+                embeds = [event_one.kwargs['embed'], event_two.kwargs['embed']]
+                self.assertTrue(all(embed.footer.text.endswith('In Progress') for embed in embeds))
+                await bot.close()
+
+
 class CalendarImageTests(unittest.TestCase):
     def test_illustrated_calendar_shows_week_and_event_ranges(self):
         now = datetime(2026, 11, 7, 12, 0, tzinfo=timezone.utc)
@@ -253,14 +447,6 @@ class CalendarImageTests(unittest.TestCase):
         self.assertEqual(image.format, 'PNG')
         self.assertEqual(image.width, 1120)
         self.assertGreater(image.height, 400)
-
-
-class EventBannerTests(unittest.TestCase):
-    def test_banner_is_png(self):
-        data = event_banner('Alliance Mobilization', 'Alliance', '1h')
-        picture = Image.open(data)
-        self.assertEqual(picture.size, (1000, 300))
-        self.assertEqual(picture.format, 'PNG')
 
 
 if __name__ == '__main__':
