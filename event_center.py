@@ -385,6 +385,7 @@ class EventCenter:
         self.bot = bot
         self.store = EventStore(path)
         self.group_registered = False
+        self.board_lock = asyncio.Lock()
 
     def is_staff(self, interaction):
         return bool(
@@ -483,28 +484,41 @@ class EventCenter:
         embed.timestamp = now
         return embed, banner
 
-    async def refresh_board(self, guild_id):
-        settings = self.store.settings(guild_id)
-        if settings is None or not settings['calendar_message_id']:
+    async def ensure_board(self, guild_id, create=False):
+        async with self.board_lock:
+            settings = self.store.settings(guild_id)
+            if settings is None:
+                return None
+            channel = self.bot.guild.get_channel(settings['channel_id'])
+            if not isinstance(channel, discord.TextChannel):
+                return None
+            message = None
+            if settings['calendar_message_id']:
+                try:
+                    message = await channel.fetch_message(settings['calendar_message_id'])
+                except discord.NotFound:
+                    self.store.set_board(guild_id, None)
+                if message:
+                    embed, file = self.calendar_payload(guild_id)
+                    edited = await message.edit(embed=embed, attachments=[file], allowed_mentions=discord.AllowedMentions.none())
+                    self.store.set_board(guild_id, (edited or message).id)
+                    return edited or message
+            if create:
+                embed, file = self.calendar_payload(guild_id)
+                message = await channel.send(embed=embed, file=file, allowed_mentions=discord.AllowedMentions.none())
+                self.store.set_board(guild_id, message.id)
+                return message
             return None
-        channel = self.bot.guild.get_channel(settings['channel_id'])
-        if not isinstance(channel, discord.TextChannel):
-            return None
-        try:
-            message = await channel.fetch_message(settings['calendar_message_id'])
-        except discord.NotFound:
-            self.store.set_board(guild_id, None)
-            return None
-        embed, banner = self.calendar_payload(guild_id)
-        edited = await message.edit(embed=embed, attachments=[banner], allowed_mentions=discord.AllowedMentions.none())
-        self.store.set_board(guild_id, edited.id if edited else message.id)
-        return edited or message
 
-    async def refresh_board_safe(self, guild_id):
+    async def refresh_board(self, guild_id):
+        return await self.ensure_board(guild_id)
+
+    async def refresh_board_safe(self, guild_id, create=False):
         try:
-            await self.refresh_board(guild_id)
-        except Exception:
-            log.exception('Could not refresh public event calendar in server %s', guild_id)
+            return await self.ensure_board(guild_id, create=create)
+        except (discord.HTTPException, OSError, ValueError):
+            log.exception('Could not synchronize shared SaS event calendar in server %s', guild_id)
+            return None
 
     async def show_calendar(self, interaction, week_offset=0, update=False, view=None, publish=False):
         if interaction.guild_id != getattr(self.bot.guild, 'id', None):
@@ -518,16 +532,13 @@ class EventCenter:
                 return await interaction.response.send_message('Configured calendar channel is unavailable.', ephemeral=True)
             await interaction.response.defer(ephemeral=True, thinking=True)
             try:
-                existing = await self.refresh_board(interaction.guild_id)
-                if existing:
-                    return await interaction.followup.send(f'Calendar refreshed in {channel.mention}: {existing.jump_url}', ephemeral=True)
-                embed, banner = self.calendar_payload(interaction.guild_id, 0)
-                message = await channel.send(embed=embed, file=banner, allowed_mentions=discord.AllowedMentions.none())
-                self.store.set_board(interaction.guild_id, message.id)
+                message = await self.ensure_board(interaction.guild_id, create=True)
+                if not message:
+                    return await interaction.followup.send('Calendar channel is unavailable.', ephemeral=True)
             except discord.HTTPException:
                 log.exception('Unable to publish SaS weekly calendar')
                 return await interaction.followup.send('Calendar could not be posted. Check channel permissions.', ephemeral=True)
-            return await interaction.followup.send(f'Calendar posted in {channel.mention}: {message.jump_url}', ephemeral=True)
+            return await interaction.followup.send(f'Combined event calendar updated in {channel.mention}: {message.jump_url}', ephemeral=True)
         embed, banner = self.calendar_payload(interaction.guild_id, week_offset)
         if view is None:
             view = CalendarNavigation(self, interaction.user.id, week_offset)
