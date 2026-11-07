@@ -515,51 +515,93 @@ class EventCreationIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(manager.store.settings(1)['text_message_channel_id'], channel.id)
             manager.close()
 
-    async def test_due_reminders_edit_shared_text_not_publish_channel_messages(self):
+    async def test_one_hour_ping_targets_exact_member_role_in_updates_channel(self):
         with tempfile.TemporaryDirectory() as folder:
             channel = MagicMock(spec=discord.TextChannel)
             channel.id = 1568431370747908291
-            existing = MagicMock()
-            existing.id = 8744
-            existing.jump_url = 'https://discord.com/channels/1/1568431370747908291/8744'
-            existing.edit = AsyncMock(return_value=existing)
-            channel.send = AsyncMock(return_value=existing)
-            channel.fetch_message = AsyncMock(return_value=existing)
+            feed = MagicMock()
+            feed.id = 8744
+            feed.edit = AsyncMock(return_value=feed)
+            ping = MagicMock()
+            ping.id = 9876
+            channel.send = AsyncMock(side_effect=[feed, ping])
+            channel.fetch_message = AsyncMock(return_value=feed)
+            perms = channel.permissions_for.return_value
+            perms.view_channel = True
+            perms.send_messages = True
+            role = MagicMock(spec=discord.Role)
+            role.id = 1562535352290250842
+            role.mention = '<@&1562535352290250842>'
+            role.mentionable = True
             guild = MagicMock()
             guild.id = 1
             guild.get_channel.side_effect = lambda cid: channel if cid == channel.id else None
-            user = MagicMock()
-            user.send = AsyncMock()
+            guild.get_role.side_effect = lambda rid: role if rid == role.id else None
+            guild.me = MagicMock()
             bot = MagicMock()
             bot.guild = guild
             bot.configured = True
-            bot.fetch_user = AsyncMock(return_value=user)
+            bot.fetch_user = AsyncMock()
             manager = EventCenter(bot, Path(folder) / 'events.sqlite3')
             manager.refresh_board_safe = AsyncMock()
             manager.retire_legacy_cards = AsyncMock()
             manager.store.set_channel(1, 88, None)
             now = int(datetime.now(timezone.utc).timestamp())
-            eid = manager.store.create(1, 88, 'Oilfield Strike', 'Alliance', '',
-                                       now + 3700, 5, now=now, ends_at=now+8000)
-            manager.store.subscribe(eid, 42, now=now-10)
-            await manager.ensure_text_feed(1, create=True)
-            manager.store.conn.execute(
-                "UPDATE event_reminders SET due_at=? WHERE event_id=? AND stage='1h'",
-                (now-1, eid)
+            event_id = manager.store.create(
+                1, 88, 'Oilfield Strike', 'Alliance', '',
+                now + 3599, 5, now=now-100, ends_at=now+8000
             )
+            await manager.ensure_text_feed(1, create=True)
             await manager.scheduler.coro(manager)
-            self.assertEqual(channel.send.await_count, 1)
-            self.assertEqual(existing.edit.await_count, 1)
-            alert_embed = existing.edit.await_args.kwargs['embed']
-            self.assertEqual(alert_embed.fields[0].name, 'LATEST REMINDERS')
-            self.assertIn('Oilfield Strike', alert_embed.fields[0].value)
-            self.assertIn('1 hour until start', alert_embed.fields[0].value)
+            self.assertEqual(channel.send.await_count, 2)
+            self.assertEqual(feed.edit.await_count, 0)
+            request = channel.send.await_args.kwargs
+            self.assertIn('<@&1562535352290250842>', request['content'])
+            self.assertIn('Oilfield Strike', request['content'])
+            self.assertIn('starts in 1 hour', request['content'])
+            self.assertTrue(request['allowed_mentions'].roles)
+            self.assertEqual(request['allowed_mentions'].roles[0].id, role.id)
+            self.assertFalse(request['allowed_mentions'].everyone)
             record = manager.store.conn.execute(
                 "SELECT state,message_id FROM event_reminders WHERE event_id=? AND stage='1h'",
-                (eid,)
+                (event_id,)
             ).fetchone()
-            self.assertEqual((record['state'],record['message_id']), ('sent',existing.id))
-            user.send.assert_awaited_once()
+            self.assertEqual((record['state'],record['message_id']), ('sent',9876))
+            await manager.scheduler.coro(manager)
+            self.assertEqual(channel.send.await_count, 2)
+            bot.fetch_user.assert_not_awaited()
+            manager.close()
+
+    async def test_missing_or_unmentionable_member_role_cannot_trigger_ping(self):
+        with tempfile.TemporaryDirectory() as folder:
+            channel = MagicMock(spec=discord.TextChannel)
+            channel.id = 1568431370747908291
+            channel.send = AsyncMock()
+            role = MagicMock(spec=discord.Role)
+            role.id = 1562535352290250842
+            role.mentionable = False
+            guild = MagicMock()
+            guild.id = 1
+            guild.me = MagicMock()
+            guild.get_channel.return_value = channel
+            guild.get_role.return_value = role
+            perms = channel.permissions_for.return_value
+            perms.view_channel = True
+            perms.send_messages = True
+            perms.mention_everyone = False
+            bot = MagicMock()
+            bot.guild = guild
+            manager = EventCenter(bot, Path(folder) / 'events.sqlite3')
+            now = int(datetime.now(timezone.utc).timestamp())
+            event_id = manager.store.create(1, 88, 'Work Log', 'Events', '',
+                                            now+7200, 5, now=now, ends_at=now+8300)
+            self.assertIsNone(await manager.send_member_ping(manager.store.event(event_id)))
+            channel.send.assert_not_awaited()
+            role.mentionable = True
+            sent = MagicMock()
+            sent.id = 22
+            channel.send = AsyncMock(return_value=sent)
+            self.assertEqual((await manager.send_member_ping(manager.store.event(event_id))).id, 22)
             manager.close()
 
     async def test_legacy_event_card_deleted_only_when_bot_owned(self):
