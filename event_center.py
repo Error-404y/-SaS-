@@ -145,8 +145,14 @@ class EventStore:
         return self.conn.execute(
             """SELECT * FROM event_settings
             WHERE text_message_id IS NOT NULL
-            AND (COALESCE(text_refreshed_at,0)<=? OR text_message_channel_id!=?)""",
-            (now - 3600, target_channel_id)
+            AND (COALESCE(text_refreshed_at,0)<=? OR text_message_channel_id!=?
+            OR EXISTS (
+                SELECT 1 FROM game_events e WHERE e.guild_id=event_settings.guild_id
+                AND e.state='active'
+                AND ((e.starts_at>COALESCE(text_refreshed_at,0) AND e.starts_at<=?)
+                  OR (e.ends_at>COALESCE(text_refreshed_at,0) AND e.ends_at<=?))
+            ))""",
+            (now - 3600, target_channel_id, now, now)
         ).fetchall()
 
     def legacy_event_cards(self, guild_id, limit=12):
@@ -448,7 +454,9 @@ class EventCenter:
         self.store = EventStore(path)
         self.group_registered = False
         self.board_lock = asyncio.Lock()
+        self.text_lock = asyncio.Lock()
         self.board_channel_id = int(os.getenv('EVENT_BOARD_CHANNEL_ID', str(DEFAULT_EVENT_BOARD_CHANNEL_ID)))
+        self.text_channel_id = int(os.getenv('EVENT_TEXT_CHANNEL_ID', str(DEFAULT_EVENT_TEXT_CHANNEL_ID)))
 
     def is_staff(self, interaction):
         return bool(
@@ -569,6 +577,106 @@ class EventCenter:
         embed.set_footer(text='SaS Event Center | Shared schedule | All times UTC')
         embed.timestamp = now
         return embed, file
+
+    def text_channel(self):
+        channel = self.bot.guild.get_channel(self.text_channel_id)
+        if not isinstance(channel, discord.TextChannel) or channel.id != self.text_channel_id:
+            return None
+        return channel
+
+    def text_payload(self, guild_id, alerts=None, now=None):
+        now = int(datetime.now(timezone.utc).timestamp()) if now is None else now
+        items = self.store.board_events(guild_id, now=now, limit=20)
+        total = self.store.board_event_count(guild_id, now=now)
+        embed = discord.Embed(
+            title='SaS | Event Updates',
+            description=f'**Active and upcoming events:** {total}\\nThis is the live event list. New events are added here automatically.',
+            color=discord.Color.from_rgb(93, 170, 227)
+        )
+        if alerts:
+            labels = {'24h': '24 hours until start', '1h': '1 hour until start', '15m': '15 minutes until start', 'start': 'Starting now'}
+            lines = []
+            for item in alerts[:8]:
+                record = self.store.event(item['event_id'])
+                if record:
+                    lines.append(f"**{clean(record['title'], 65)}** — {labels[item['stage']]}")
+            if lines:
+                embed.add_field(name='LATEST REMINDERS', value='\\n'.join(lines)[:1024], inline=False)
+        for event in items:
+            phase = event_phase(event, now)
+            start = datetime.fromtimestamp(event['starts_at'], timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+            end = datetime.fromtimestamp(event['ends_at'], timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+            name = f"#{event['id']} | {clean(event['title'], 80)} | {phase}"
+            value = f"**Type:** {clean(event['category'], 30)}\\n**UTC:** {start} — {end}"
+            value += f"\\n**{'Ends' if phase == 'In Progress' else 'Starts'}:** <t:{event['ends_at'] if phase == 'In Progress' else event['starts_at']}:R>"
+            if event['notes']:
+                value += f"\\n{clean(event['notes'], 125)}"
+            embed.add_field(name=name[:256], value=value[:1024], inline=False)
+        if not items:
+            embed.add_field(name='Schedule', value='No active or upcoming events.', inline=False)
+        if total > len(items):
+            embed.add_field(name='More events', value=f'{total-len(items)} more — see /event upcoming or /event calendar.', inline=False)
+        embed.set_footer(text='SaS Event Updates | Shared schedule | Times in UTC | Use /event remind to subscribe')
+        embed.timestamp = datetime.fromtimestamp(now, timezone.utc)
+        return embed
+
+    async def ensure_text_feed(self, guild_id, create=False, alerts=None):
+        async with self.text_lock:
+            settings = self.store.settings(guild_id)
+            if settings is None:
+                return None
+            channel = self.text_channel()
+            if channel is None:
+                log.error('Event Updates channel %s is unavailable', self.text_channel_id)
+                return None
+            old_id = settings['text_message_id']
+            old_channel_id = settings['text_message_channel_id']
+            if old_id and old_channel_id == channel.id:
+                try:
+                    message = await channel.fetch_message(old_id)
+                except discord.NotFound:
+                    self.store.set_text_message(guild_id, None, None)
+                else:
+                    await message.edit(embed=self.text_payload(guild_id, alerts), allowed_mentions=discord.AllowedMentions.none())
+                    self.store.set_text_message(guild_id, message.id, channel.id)
+                    return message
+            if create or old_id:
+                message = await channel.send(embed=self.text_payload(guild_id, alerts), allowed_mentions=discord.AllowedMentions.none())
+                self.store.set_text_message(guild_id, message.id, channel.id)
+                return message
+            return None
+
+    async def refresh_text_safe(self, guild_id, create=False, alerts=None):
+        try:
+            return await self.ensure_text_feed(guild_id, create=create, alerts=alerts)
+        except (discord.HTTPException, OSError, ValueError):
+            log.exception('Unable to update shared text events in channel %s', self.text_channel_id)
+            return None
+
+    async def retire_legacy_cards(self, guild_id):
+        for event in self.store.legacy_event_cards(guild_id):
+            channel = self.bot.guild.get_channel(event['channel_id'])
+            if not isinstance(channel, discord.TextChannel):
+                continue
+            try:
+                message = await channel.fetch_message(event['message_id'])
+            except discord.NotFound:
+                self.store.mark_card_missing(event['id'])
+                continue
+            except discord.HTTPException:
+                log.exception('Unable to inspect old event card #%s', event['id'])
+                continue
+            if message.author.id != self.bot.user.id:
+                self.store.mark_card_missing(event['id'])
+                continue
+            try:
+                await message.delete()
+            except discord.NotFound:
+                pass
+            except discord.HTTPException:
+                log.exception('Unable to delete old event card #%s', event['id'])
+                continue
+            self.store.mark_card_missing(event['id'])
 
     def board_channel(self):
         channel = self.bot.guild.get_channel(self.board_channel_id)
