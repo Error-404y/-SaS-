@@ -74,48 +74,43 @@ New joiners get Verify-Process. Previously accepted users get their saved Member
 
 If earlier versions removed Member from someone incorrectly, restore Member manually once. The nickname-prefix pass preserves it. Returning-member restoration uses saved accepted applications; it does not treat every historical role assignment as an acceptance.
 
-## SaS Event Center and reminders
+## SaS Event Center
 
-The bot publishes **one combined SaS Events graphic** inspired by Police Chief. Every active or upcoming event appears on its own color-coded bar beneath a single server clock. For example, **Port Inspection** and **Work Log** appear as two separate entries, even when both use the Port Inspection category. The board shows each event's exact start/end date and time, plus **Upcoming** or **In Progress**.
+The bot maintains **two shared messages**, not one new Discord message per event:
 
-The shared graphic is posted in the dedicated Discord channel **1568424573836464208** (configurable with `EVENT_BOARD_CHANNEL_ID`). Event details and timed reminders stay in the `/event setup` reminder channel. The shared graphic is **created automatically on the first event** and updated, not reposted, whenever staff add, edit or cancel another event. Event start/end transitions also update the graphic, and a scheduled refresh updates its printed clock approximately once per hour. Discord cannot continuously animate the timestamp inside a static PNG.
+- **Graphical Events overview:** Channel `1568424573836464208` (configured by `EVENT_BOARD_CHANNEL_ID`). Multiple events appear on one image, each on its own colored bar.
+- **Written Event Updates:** Channel `1568431370747908291` (configured by `EVENT_TEXT_CHANNEL_ID`). This is **one editable Discord embed** containing the title, category, status, exact start/end times, countdown, and description of each event. For example, Port Inspection, Work Log, and Oilfield Strike appear as entries in the same text message.
 
-A separate **seven-day calendar** remains available privately with `/event calendar`, including **Previous Week**, **This Week**, **Next Week** and **Upcoming Events** controls. `/event calendar publish:True` creates or refreshes the combined Events board rather than creating another one-event picture.
+Running `/event create` adds the new event to both existing messages. `/event edit` updates them; `/event cancel` removes it from the active list. The update operation stores each shared message ID in the SQLite database, preventing duplicate posts on repeated updates or restarts. Each text embed displays up to 14 active/upcoming events; the graphical overview displays up to 24 and both indicate if additional events exist. The bot refreshes the shared messages on state transitions and approximately hourly.
 
-### Staff setup and commands
+Older individual event messages created by earlier bot versions are gradually removed once the shared text message is successfully present. Deletions apply only to messages authored by the same bot; event database records and reminder subscriptions are retained.
 
-1. Configure `/event setup channel:#event-reminders notify_role:@SaS` for event details and timed reminders. The role is optional and pinged only at event start. The combined graphic goes to channel `1568424573836464208`, regardless of the reminder channel.
-2. Add events using `/event create title:Port Inspection start_utc:2026-11-06 00:00:00 end_utc:2026-11-08 23:59:59 category:Port Inspection`.
-3. Add another event such as `/event create title:Work Log start_utc:2026-11-06 00:00:00 end_utc:2026-11-08 23:59:59 category:Port Inspection`. The existing graphic automatically gains a second bar.
-4. Use `/event calendar` for the navigable weekly view and `/event upcoming` for event numbers and dates.
-5. Use `/event edit event_id:1 start_utc:2026-11-08 10:00:00 end_utc:2026-11-10 23:59:59` to adjust details, or `/event cancel event_id:1` to stop its reminders and remove it from the shared graphic.
+### Commands
 
-The timestamps above are **format examples** from the provided screenshots, not confirmed game schedule data. Full `YYYY-MM-DD HH:MM:SS` timestamps are supported, along with `YYYY:MM:DD HH:MM:SS` and minute-only input. All input times use **UTC**, which must match the game's clock to produce correct notifications. Discord renders its own timestamps in each member's local timezone.
+Use `/event setup` once if you have not previously configured the event service. It saves legacy event settings. Events now publish directly to the two channels above, **regardless of the channel chosen during setup**.
 
-Event categories are **Port Inspection** (red), **Events** (blue), **Alliance** (gold), **Deals** (red) and **Other** (green). Events may last up to 14 days and can be entered after they start if the end time is still in the future. Past reminders are never created for events already in progress.
+- `/event create title:Oilfield Strike start_utc:2026-11-10 00:00:00 end_utc:2026-11-10 23:59:59 category:Alliance`: creates an event and updates both shared messages
+- `/event edit event_id:8 title:Oilfield Strike`: edits an existing event and both overviews
+- `/event cancel event_id:8`: cancels it, removing it from the active overviews
+- `/event updates`: staff can publish or refresh the written overview
+- `/event upcoming`: displays a private list of event IDs and times
+- `/event calendar`: opens a private navigable seven-day calendar; `/event calendar publish:True` refreshes the graphical overview
+- `/event remind event_id:8`: subscribes the member to **private DM reminders** for a future event
+- `/event unremind event_id:8`: removes the member's DM subscription
 
-### Event details and reminder behavior
+Times must be entered in **UTC server time** as `YYYY-MM-DD HH:MM:SS`; minute-only input also works. Discord displays Discord timestamps in the reader's local timezone.
 
-The bot continues to post a small per-event Discord embed containing the event title, status, exact time, and reminder buttons for events that have not started. **It no longer attaches a separate oversized image to each event**; all events share the Events overview graphic. Existing event messages from the previous version are updated when the bot starts, removing their old isolated artwork and correcting the footer/status labels.
+### Reminder behavior
 
-Status wording comes from one calculation in both embeds and the shared graphic:
+The previous behavior of publishing **individual channel messages** at event creation and again at 24 hours, 1 hour, 15 minutes and start has been removed. Instead, due reminders update the **same written Event Updates message**, including a **LATEST REMINDERS** section for the affected events. This avoids flooding the server.
 
-- **Upcoming**: event has not started.
-- **In Progress**: start time has passed but end time has not.
-- **Completed**: end time has passed.
-- **Cancelled**: staff cancelled the event.
+Members who explicitly subscribe using `/event remind` still receive personal DMs 1 hour and 15 minutes before an event starts, where appropriate. No member is subscribed by default. Stage deadlines are stored and survive restarts. Notifications overdue by more than 10 minutes are skipped to prevent stale alerts. Role pings have been disabled in unified-message mode because editing an existing Discord message is not a reliable way to issue a new role ping; the bot does not send separate ping messages.
 
-Channel reminders are posted at **24 hours, 1 hour, 15 minutes and event start**, if those notification times are still in the future when the event is added. Members may click **Remind Me** on upcoming event details to opt in to private DMs **1 hour and 15 minutes** before start. They may unsubscribe via **Stop Reminders**. The optional role ping happens once, at start. DMs are not sent once the event has started.
+### Requirements
 
-The scheduler checks approximately every 30 seconds, keeps event/subscriber/reminder data in the persistent `events.sqlite3`, and avoids sending stale notifications after downtime. Events whose end time passed are removed from the shared list at the next scheduled refresh. A rare process interruption between sending a message and recording the receipt can result in a duplicate reminder.
+The bot must be able to View Channel, Send Messages, Embed Links and Read Message History in **both** overview channels, plus Attach Files in the graphics channel. It needs Manage Messages only for removal of old messages if they were not authored by the bot (the migration intentionally never removes other users' messages).
 
-### Operating notes
-
-The bot **does not read Police Chief's game calendar automatically**. Staff must enter verified event times manually. The combined Events graphic shows up to 24 active/upcoming events at once, with the total count if there are more.
-
-The bot requires View Channel, Send Messages, Embed Links, Attach Files, and Read Message History permissions in its reminder channel **and** the dedicated Event Center channel `1568424573836464208`. The bot needs Manage Messages only if you want it to remove an obsolete previous board message. The application must be invited with the `applications.commands` scope. If an older shared board exists in the reminder channel, the bot creates a fresh one in the dedicated channel, remembers the new message ID, and attempts to delete the old bot-owned overview after successful publication.
-
-Persist both `data/verification.json` and `data/events.sqlite3`. Run only one bot instance per event SQLite file to avoid duplicate notifications.
+The event database `data/events.sqlite3` must be on persistent storage. Only one process should use it. Both the graphics and text are based on staff-entered events; there is **no automatic Police Chief game API integration**. Each message is a static Discord embed or picture, not a live ticking clock.
 
 ## Server configuration
 
