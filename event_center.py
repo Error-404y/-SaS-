@@ -322,11 +322,6 @@ class EventStore:
             'UPDATE event_reminders SET state=?,message_id=? WHERE event_id=? AND stage=? AND state=?',
             (state, message_id, event_id, stage, 'pending')
         )
-        if state == 'sent' and stage in ('1h', '15m'):
-            self.conn.execute(
-                "INSERT OR IGNORE INTO event_dm_jobs(event_id,stage,user_id) SELECT s.event_id,?,s.user_id FROM event_subscribers s JOIN game_events e ON e.id=s.event_id WHERE s.event_id=? AND s.joined_at<=? AND e.state='active'",
-                (stage, event_id, self.conn.execute('SELECT due_at FROM event_reminders WHERE event_id=? AND stage=?',(event_id,stage)).fetchone()[0])
-            )
 
     def due_dm(self):
         return self.conn.execute(
@@ -384,36 +379,6 @@ def event_phase(event, now=None):
 
 def clean(value, limit):
     return discord.utils.escape_mentions(discord.utils.escape_markdown(str(value)))[:limit]
-
-
-class EventReminderView(discord.ui.View):
-    def __init__(self, manager):
-        super().__init__(timeout=None)
-        self.manager = manager
-
-    @discord.ui.button(label='Remind Me', style=discord.ButtonStyle.primary, custom_id='sas:event:subscribe:v1')
-    async def subscribe(self, interaction, button):
-        event = self.manager.store.by_message(interaction.message.id)
-        if not event or interaction.guild_id != event['guild_id']:
-            return await interaction.response.send_message('Event not found.', ephemeral=True)
-        if event['starts_at'] <= int(datetime.now(timezone.utc).timestamp()):
-            return await interaction.response.send_message('This event has already started. Pre-event reminders are no longer available.', ephemeral=True)
-        if self.manager.store.subscribe(event['id'], interaction.user.id):
-            await interaction.response.send_message('You are subscribed. The bot will DM you 1 hour and 15 minutes before the event, if you subscribe before those reminders are due.', ephemeral=True)
-        else:
-            await interaction.response.send_message('This event is no longer accepting subscriptions.', ephemeral=True)
-
-    @discord.ui.button(label='Stop Reminders', style=discord.ButtonStyle.secondary, custom_id='sas:event:unsubscribe:v1')
-    async def unsubscribe(self, interaction, button):
-        event = self.manager.store.by_message(interaction.message.id)
-        if not event or interaction.guild_id != event['guild_id']:
-            return await interaction.response.send_message('Event not found.', ephemeral=True)
-        self.manager.store.unsubscribe(event['id'], interaction.user.id)
-        await interaction.response.send_message('Your reminders for this event are disabled.', ephemeral=True)
-
-    @discord.ui.button(label='View Schedule', style=discord.ButtonStyle.secondary, custom_id='sas:event:list:v1')
-    async def schedule(self, interaction, button):
-        await self.manager.show_calendar(interaction)
 
 
 class CalendarNavigation(discord.ui.View):
