@@ -859,8 +859,9 @@ class EventCenter:
             if not (permissions.view_channel and permissions.send_messages and (role.mentionable or permissions.mention_everyone)):
                 log.error('Bot must be able to mention Member role %s in channel %s', self.member_role_id, self.text_channel_id)
                 return None
+        utc_start = datetime.fromtimestamp(event['starts_at'], timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
         return await channel.send(
-            content=f"{role.mention} **{clean(event['title'], 100)}** starts in 1 hour.\n**Event start:** <t:{event['starts_at']}:F> (UTC)",
+            content=f"{role.mention} **1-hour event reminder | {clean(event['title'], 100)}**\n**Starts:** {utc_start} UTC (<t:{event['starts_at']}:R>)",
             allowed_mentions=discord.AllowedMentions(everyone=False, users=False, roles=[role])
         )
 
