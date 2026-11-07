@@ -765,7 +765,7 @@ class EventCenter:
             return
         group = app_commands.Group(name='event', description='SaS event calendar and reminders')
 
-        @group.command(name='setup', description='Choose the reminder channel and optional role ping')
+        @group.command(name='setup', description='Configure legacy event settings and the shared event feeds')
         async def setup(interaction: discord.Interaction, channel: discord.TextChannel, notify_role: discord.Role = None):
             if not self.is_staff(interaction):
                 return await interaction.response.send_message('Staff access required.', ephemeral=True)
@@ -773,7 +773,7 @@ class EventCenter:
             if not all((permissions.view_channel, permissions.send_messages, permissions.embed_links, permissions.attach_files, permissions.read_message_history)):
                 return await interaction.response.send_message('The bot needs View Channel, Send Messages, Embed Links, Attach Files and Read Message History.', ephemeral=True)
             self.store.set_channel(interaction.guild_id, channel.id, notify_role.id if notify_role else None)
-            await interaction.response.send_message(f"Event reminders will be posted in {channel.mention}. Role mention at event start: {notify_role.mention if notify_role else 'disabled'}.", ephemeral=True)
+            await interaction.response.send_message(f"Event administration configured. The combined text list posts in <#{self.text_channel_id}> and the graphic posts in <#{self.board_channel_id}>. Individual channel reminders and role pings are disabled; private opt-in reminders remain available.", ephemeral=True)
 
         @group.command(name='create', description='Schedule an event using the in-game server time in UTC')
         @app_commands.describe(title='Event name', start_utc='Start YYYY-MM-DD HH:MM:SS UTC', category='Event color category', notes='Optional event details', end_utc='Optional end YYYY-MM-DD HH:MM:SS UTC')
@@ -803,7 +803,7 @@ class EventCenter:
             board = await self.refresh_board_safe(interaction.guild_id, create=True)
             if feed and board:
                 return await interaction.followup.send(
-                    f"Event **{clean(title, 100)}** (#{event_id}) added to the shared updates: {feed.jump_url}\\nGraphic: {board.jump_url}",
+                    f"Event **{clean(title, 100)}** (#{event_id}) added to the shared updates: {feed.jump_url}\nGraphic: {board.jump_url}",
                     ephemeral=True
                 )
             if not feed:
@@ -916,6 +916,7 @@ class EventCenter:
         if not self.bot.configured:
             return
         now = int(datetime.now(timezone.utc).timestamp())
+        notifications = []
         for reminder in self.store.due(now):
             event = self.store.event(reminder['event_id'])
             stage = reminder['stage']
@@ -924,38 +925,24 @@ class EventCenter:
                     or (stage != 'start' and now >= event['starts_at'])):
                 self.store.reminder_state(event['id'], stage, 'skipped')
                 continue
-            channel = self.bot.guild.get_channel(event['channel_id'])
-            if not isinstance(channel, discord.TextChannel):
-                continue
-            settings = self.store.settings(event['guild_id'])
-            role = self.bot.guild.get_role(settings['role_id']) if settings and settings['role_id'] and stage == 'start' else None
-            try:
-                message = await channel.send(
-                    content=role.mention if role else None,
-                    embed=self.build_embed(event, stage),
-                    allowed_mentions=discord.AllowedMentions(roles=[role] if role else [], users=False, everyone=False)
-                )
-            except discord.HTTPException:
-                log.exception('Failed to send event %s stage %s', event['id'], stage)
-                continue
-            self.store.reminder_state(event['id'], stage, 'sent', message.id)
-        phase_changed = False
-        for event in self.store.cards_to_refresh(now):
-            try:
-                await self.sync_event_card(event)
-                phase_changed = True
-            except discord.NotFound:
-                self.store.mark_card_missing(event['id'])
-                phase_changed = True
-            except discord.HTTPException:
-                log.exception('Unable to refresh status on event #%s', event['id'])
+            notifications.append(reminder)
+        if notifications:
+            feed = await self.refresh_text_safe(self.bot.guild.id, create=True, alerts=notifications)
+            if feed:
+                for reminder in notifications:
+                    self.store.reminder_state(reminder['event_id'], reminder['stage'], 'sent', feed.id)
         settings = self.store.settings(self.bot.guild.id)
+        if settings and not settings['text_message_id'] and self.store.upcoming(self.bot.guild.id, now):
+            await self.refresh_text_safe(self.bot.guild.id, create=True)
+        for item in self.store.text_feeds_to_refresh(now, self.text_channel_id):
+            await self.refresh_text_safe(item['guild_id'], create=True)
+        settings = self.store.settings(self.bot.guild.id)
+        if settings and settings['text_message_id']:
+            await self.retire_legacy_cards(self.bot.guild.id)
         if settings and not settings['calendar_message_id'] and self.store.upcoming(self.bot.guild.id, now):
             await self.refresh_board_safe(self.bot.guild.id, create=True)
-        elif phase_changed and settings and settings['calendar_message_id']:
-            await self.refresh_board_safe(self.bot.guild.id)
-        for settings in self.store.boards_to_refresh(now, self.board_channel_id):
-            await self.refresh_board_safe(settings['guild_id'])
+        for item in self.store.boards_to_refresh(now, self.board_channel_id):
+            await self.refresh_board_safe(item['guild_id'])
         for job in self.store.due_dm():
             event = self.store.event(job['event_id'])
             if event['state'] != 'active':
