@@ -743,16 +743,21 @@ class EventCenter:
                 log.exception('Failed to send event %s stage %s', event['id'], stage)
                 continue
             self.store.reminder_state(event['id'], stage, 'sent', message.id)
+        phase_changed = False
         for event in self.store.cards_to_refresh(now):
             try:
                 await self.sync_event_card(event)
+                phase_changed = True
             except discord.NotFound:
                 self.store.mark_card_missing(event['id'])
+                phase_changed = True
             except discord.HTTPException:
                 log.exception('Unable to refresh status on event #%s', event['id'])
         settings = self.store.settings(self.bot.guild.id)
         if settings and not settings['calendar_message_id'] and self.store.upcoming(self.bot.guild.id, now):
             await self.refresh_board_safe(self.bot.guild.id, create=True)
+        elif phase_changed and settings and settings['calendar_message_id']:
+            await self.refresh_board_safe(self.bot.guild.id)
         for settings in self.store.boards_to_refresh(now):
             await self.refresh_board_safe(settings['guild_id'])
         for job in self.store.due_dm():
