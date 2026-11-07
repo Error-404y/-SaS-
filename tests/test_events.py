@@ -532,6 +532,53 @@ class EventCreationIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(manager.store.settings(1)['text_message_channel_id'], channel.id)
             manager.close()
 
+    async def test_due_reminders_edit_shared_text_not_publish_channel_messages(self):
+        with tempfile.TemporaryDirectory() as folder:
+            channel = MagicMock(spec=discord.TextChannel)
+            channel.id = 1568431370747908291
+            existing = MagicMock()
+            existing.id = 8744
+            existing.jump_url = 'https://discord.com/channels/1/1568431370747908291/8744'
+            existing.edit = AsyncMock(return_value=existing)
+            channel.send = AsyncMock(return_value=existing)
+            channel.fetch_message = AsyncMock(return_value=existing)
+            guild = MagicMock()
+            guild.id = 1
+            guild.get_channel.side_effect = lambda cid: channel if cid == channel.id else None
+            user = MagicMock()
+            user.send = AsyncMock()
+            bot = MagicMock()
+            bot.guild = guild
+            bot.configured = True
+            bot.fetch_user = AsyncMock(return_value=user)
+            manager = EventCenter(bot, Path(folder) / 'events.sqlite3')
+            manager.refresh_board_safe = AsyncMock()
+            manager.retire_legacy_cards = AsyncMock()
+            manager.store.set_channel(1, 88, None)
+            now = int(datetime.now(timezone.utc).timestamp())
+            eid = manager.store.create(1, 88, 'Oilfield Strike', 'Alliance', '',
+                                       now + 3700, 5, now=now, ends_at=now+8000)
+            manager.store.subscribe(eid, 42, now=now-10)
+            await manager.ensure_text_feed(1, create=True)
+            manager.store.conn.execute(
+                "UPDATE event_reminders SET due_at=? WHERE event_id=? AND stage='1h'",
+                (now-1, eid)
+            )
+            await manager.scheduler.coro(manager)
+            self.assertEqual(channel.send.await_count, 1)
+            self.assertEqual(existing.edit.await_count, 1)
+            alert_embed = existing.edit.await_args.kwargs['embed']
+            self.assertEqual(alert_embed.fields[0].name, 'LATEST REMINDERS')
+            self.assertIn('Oilfield Strike', alert_embed.fields[0].value)
+            self.assertIn('1 hour until start', alert_embed.fields[0].value)
+            record = manager.store.conn.execute(
+                "SELECT state,message_id FROM event_reminders WHERE event_id=? AND stage='1h'",
+                (eid,)
+            ).fetchone()
+            self.assertEqual((record['state'],record['message_id']), ('sent',existing.id))
+            user.send.assert_awaited_once()
+            manager.close()
+
     async def test_legacy_event_card_deleted_only_when_bot_owned(self):
         with tempfile.TemporaryDirectory() as folder:
             channel = MagicMock(spec=discord.TextChannel)
