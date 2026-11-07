@@ -48,7 +48,8 @@ class EventStore:
                 created_by INTEGER NOT NULL,
                 message_id INTEGER,
                 banner_url TEXT,
-                state TEXT NOT NULL DEFAULT 'active'
+                state TEXT NOT NULL DEFAULT 'active',
+                display_phase TEXT
             );
             CREATE TABLE IF NOT EXISTS event_subscribers (
                 event_id INTEGER NOT NULL,
@@ -83,6 +84,8 @@ class EventStore:
         columns = {row['name'] for row in self.conn.execute('PRAGMA table_info(game_events)')}
         if 'ends_at' not in columns:
             self.conn.execute('ALTER TABLE game_events ADD COLUMN ends_at INTEGER')
+        if 'display_phase' not in columns:
+            self.conn.execute('ALTER TABLE game_events ADD COLUMN display_phase TEXT')
         self.conn.execute('UPDATE game_events SET ends_at=starts_at+3600 WHERE ends_at IS NULL')
 
     def set_channel(self, guild_id, channel_id, role_id):
@@ -121,7 +124,7 @@ class EventStore:
             event_id = cursor.lastrowid
             for stage, seconds in STAGES:
                 due_at = starts_at - seconds
-                if due_at >= now - 60:
+                if due_at > now:
                     self.conn.execute(
                         'INSERT INTO event_reminders(event_id,stage,due_at) VALUES(?,?,?)',
                         (event_id, stage, due_at)
@@ -154,7 +157,7 @@ class EventStore:
                 self.conn.execute('DELETE FROM event_dm_jobs WHERE event_id=?', (event_id,))
                 for stage, seconds in STAGES:
                     due_at = starts_at - seconds
-                    if due_at >= now - 60:
+                    if due_at > now:
                         self.conn.execute(
                             'INSERT INTO event_reminders(event_id,stage,due_at) VALUES(?,?,?)',
                             (event_id, stage, due_at)
@@ -178,10 +181,28 @@ class EventStore:
         return self.conn.execute('SELECT * FROM game_events WHERE message_id=?', (message_id,)).fetchone()
 
     def set_message(self, event_id, message_id, banner_url=None):
+        event = self.event(event_id)
+        phase = event_phase(event) if event else None
         self.conn.execute(
-            'UPDATE game_events SET message_id=?,banner_url=? WHERE id=?',
-            (message_id, banner_url, event_id)
+            'UPDATE game_events SET message_id=?,banner_url=?,display_phase=? WHERE id=?',
+            (message_id, banner_url, phase, event_id)
         )
+
+    def mark_display_phase(self, event_id, phase):
+        self.conn.execute('UPDATE game_events SET display_phase=?,banner_url=NULL WHERE id=?', (phase, event_id))
+
+    def cards_to_refresh(self, now=None):
+        now = int(datetime.now(timezone.utc).timestamp()) if now is None else now
+        return self.conn.execute(
+            """SELECT * FROM game_events WHERE message_id IS NOT NULL
+            AND COALESCE(display_phase,'') != CASE
+                WHEN state='cancelled' THEN 'Cancelled'
+                WHEN ends_at<=? THEN 'Completed'
+                WHEN starts_at<=? THEN 'In Progress'
+                ELSE 'Upcoming' END
+            ORDER BY starts_at LIMIT 20""",
+            (now, now)
+        ).fetchall()
 
     def cancel(self, event_id, guild_id):
         cursor = self.conn.execute(
@@ -277,6 +298,17 @@ def parse_utc(value, now=None, future=True):
     if future and (timestamp < now + 300 or timestamp > now + 90 * 86400):
         raise ValueError('Event starts must be between 5 minutes and 90 days from now.')
     return timestamp
+
+
+def event_phase(event, now=None):
+    now = int(datetime.now(timezone.utc).timestamp()) if now is None else now
+    if event['state'] == 'cancelled':
+        return 'Cancelled'
+    if now >= event['ends_at']:
+        return 'Completed'
+    if now >= event['starts_at']:
+        return 'In Progress'
+    return 'Upcoming'
 
 
 def clean(value, limit):
