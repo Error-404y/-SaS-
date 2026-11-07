@@ -847,26 +847,42 @@ class EventCenter:
         self.bot.tree.add_command(group, guild=self.bot.guild)
         self.group_registered = True
 
+    async def send_member_ping(self, event):
+        channel = self.text_channel()
+        role = self.bot.guild.get_role(self.member_role_id)
+        if channel is None or role is None:
+            log.error('One-hour event ping cannot be sent: channel %s or Member role %s unavailable', self.text_channel_id, self.member_role_id)
+            return None
+        member = self.bot.guild.me
+        if member is not None:
+            permissions = channel.permissions_for(member)
+            if not (permissions.view_channel and permissions.send_messages and (role.mentionable or permissions.mention_everyone)):
+                log.error('Bot must be able to mention Member role %s in channel %s', self.member_role_id, self.text_channel_id)
+                return None
+        return await channel.send(
+            content=f"{role.mention} **{clean(event['title'], 100)}** starts in 1 hour.\\n**Event start:** <t:{event['starts_at']}:F> (UTC)",
+            allowed_mentions=discord.AllowedMentions(everyone=False, users=False, roles=[role])
+        )
+
     @tasks.loop(seconds=30)
     async def scheduler(self):
         if not self.bot.configured:
             return
         now = int(datetime.now(timezone.utc).timestamp())
-        notifications = []
         for reminder in self.store.due(now):
             event = self.store.event(reminder['event_id'])
-            stage = reminder['stage']
-            if (event['state'] != 'active' or now >= event['ends_at']
-                    or now - reminder['due_at'] > 600
-                    or (stage != 'start' and now >= event['starts_at'])):
-                self.store.reminder_state(event['id'], stage, 'skipped')
+            if (reminder['stage'] != '1h' or not event or event['state'] != 'active'
+                    or now >= event['starts_at'] or now >= event['ends_at']
+                    or now - reminder['due_at'] > 600):
+                self.store.reminder_state(reminder['event_id'], reminder['stage'], 'skipped')
                 continue
-            notifications.append(reminder)
-        if notifications:
-            feed = await self.refresh_text_safe(self.bot.guild.id, create=True, alerts=notifications)
-            if feed:
-                for reminder in notifications:
-                    self.store.reminder_state(reminder['event_id'], reminder['stage'], 'sent', feed.id)
+            try:
+                message = await self.send_member_ping(event)
+            except discord.HTTPException:
+                log.exception('Failed to ping Member role for event #%s', event['id'])
+                continue
+            if message is not None:
+                self.store.reminder_state(event['id'], '1h', 'sent', message.id)
         settings = self.store.settings(self.bot.guild.id)
         if settings and not settings['text_message_id'] and self.store.upcoming(self.bot.guild.id, now):
             await self.refresh_text_safe(self.bot.guild.id, create=True)
@@ -879,25 +895,6 @@ class EventCenter:
             await self.refresh_board_safe(self.bot.guild.id, create=True)
         for item in self.store.boards_to_refresh(now, self.board_channel_id):
             await self.refresh_board_safe(item['guild_id'])
-        for job in self.store.due_dm():
-            event = self.store.event(job['event_id'])
-            if event['state'] != 'active':
-                self.store.dm_state(job['event_id'], job['stage'], job['user_id'], 'skipped')
-                continue
-            if int(datetime.now(timezone.utc).timestamp()) >= event['starts_at']:
-                self.store.dm_state(job['event_id'], job['stage'], job['user_id'], 'skipped')
-                continue
-            message = self.build_embed(event,job['stage'])
-            try:
-                user = await self.bot.fetch_user(job['user_id'])
-                await user.send(embed=message)
-            except (discord.Forbidden,discord.NotFound):
-                self.store.dm_state(job['event_id'],job['stage'],job['user_id'],'blocked')
-            except discord.HTTPException:
-                log.exception('Could not send event DM for event %s',event['id'])
-            else:
-                self.store.dm_state(job['event_id'],job['stage'],job['user_id'],'sent')
-
     @scheduler.before_loop
     async def before_scheduler(self):
         await self.bot.wait_until_ready()
