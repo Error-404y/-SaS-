@@ -15,6 +15,7 @@ from event_graphics import weekly_calendar, event_board
 
 log = logging.getLogger('sas.events')
 DEFAULT_EVENT_BOARD_CHANNEL_ID = 1568424573836464208
+DEFAULT_EVENT_TEXT_CHANNEL_ID = 1568431370747908291
 STAGES = (('24h', 86400), ('1h', 3600), ('15m', 900), ('start', 0))
 CATEGORIES = ('Alliance', 'Events', 'Deals', 'Port Inspection', 'Other')
 
@@ -35,7 +36,10 @@ class EventStore:
                 role_id INTEGER,
                 calendar_message_id INTEGER,
                 calendar_refreshed_at INTEGER,
-                calendar_message_channel_id INTEGER
+                calendar_message_channel_id INTEGER,
+                text_message_id INTEGER,
+                text_message_channel_id INTEGER,
+                text_refreshed_at INTEGER
             );
             CREATE TABLE IF NOT EXISTS game_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -86,6 +90,9 @@ class EventStore:
         if 'calendar_message_channel_id' not in settings_columns:
             self.conn.execute('ALTER TABLE event_settings ADD COLUMN calendar_message_channel_id INTEGER')
         self.conn.execute('UPDATE event_settings SET calendar_message_channel_id=channel_id WHERE calendar_message_id IS NOT NULL AND calendar_message_channel_id IS NULL')
+        for name in ('text_message_id', 'text_message_channel_id', 'text_refreshed_at'):
+            if name not in settings_columns:
+                self.conn.execute(f'ALTER TABLE event_settings ADD COLUMN {name} INTEGER')
         columns = {row['name'] for row in self.conn.execute('PRAGMA table_info(game_events)')}
         if 'ends_at' not in columns:
             self.conn.execute('ALTER TABLE game_events ADD COLUMN ends_at INTEGER')
@@ -124,6 +131,28 @@ class EventStore:
         return self.conn.execute(
             'SELECT * FROM event_settings WHERE calendar_message_id IS NOT NULL AND (COALESCE(calendar_refreshed_at,0)<=? OR COALESCE(calendar_message_channel_id,channel_id)!=?)',
             (now - 3600, target_channel_id)
+        ).fetchall()
+
+    def set_text_message(self, guild_id, message_id, channel_id, now=None):
+        now = int(datetime.now(timezone.utc).timestamp()) if now is None else now
+        self.conn.execute(
+            'UPDATE event_settings SET text_message_id=?,text_message_channel_id=?,text_refreshed_at=? WHERE guild_id=?',
+            (message_id, channel_id if message_id else None, now, guild_id)
+        )
+
+    def text_feeds_to_refresh(self, now=None, target_channel_id=None):
+        now = int(datetime.now(timezone.utc).timestamp()) if now is None else now
+        return self.conn.execute(
+            """SELECT * FROM event_settings
+            WHERE text_message_id IS NOT NULL
+            AND (COALESCE(text_refreshed_at,0)<=? OR text_message_channel_id!=?)""",
+            (now - 3600, target_channel_id)
+        ).fetchall()
+
+    def legacy_event_cards(self, guild_id, limit=12):
+        return self.conn.execute(
+            'SELECT * FROM game_events WHERE guild_id=? AND message_id IS NOT NULL ORDER BY id LIMIT ?',
+            (guild_id, limit)
         ).fetchall()
 
     def create(self, guild_id, channel_id, title, category, notes, starts_at, author_id, now=None, ends_at=None):
