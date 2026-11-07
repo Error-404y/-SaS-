@@ -860,7 +860,7 @@ class EventCenter:
                 log.error('Bot must be able to mention Member role %s in channel %s', self.member_role_id, self.text_channel_id)
                 return None
         return await channel.send(
-            content=f"{role.mention} **{clean(event['title'], 100)}** starts in 1 hour.\\n**Event start:** <t:{event['starts_at']}:F> (UTC)",
+            content=f"{role.mention} **{clean(event['title'], 100)}** starts in 1 hour.\n**Event start:** <t:{event['starts_at']}:F> (UTC)",
             allowed_mentions=discord.AllowedMentions(everyone=False, users=False, roles=[role])
         )
 
