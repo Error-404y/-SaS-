@@ -518,8 +518,12 @@ class EventCreationIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     message.edit = AsyncMock(return_value=message)
                     sent.append((channel_id, message, kwargs))
                     return message
-                reminders.send = AsyncMock(side_effect=lambda **kwargs: send(88, **kwargs))
-                overview.send = AsyncMock(side_effect=lambda **kwargs: send(1568424573836464208, **kwargs))
+                async def send_reminder(**kwargs):
+                    return await send(88, **kwargs)
+                async def send_overview(**kwargs):
+                    return await send(1568424573836464208, **kwargs)
+                reminders.send = AsyncMock(side_effect=send_reminder)
+                overview.send = AsyncMock(side_effect=send_overview)
                 overview.fetch_message = AsyncMock(side_effect=lambda message_id: next(m for _,m,_ in sent if m.id==message_id))
                 guild.get_channel.side_effect = lambda channel_id: {88:reminders,1568424573836464208:overview}.get(channel_id)
                 bot.guild = guild
