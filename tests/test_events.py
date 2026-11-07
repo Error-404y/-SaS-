@@ -495,6 +495,60 @@ class EventCreationIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 await bot.close()
 
 
+    async def test_event_create_posts_overview_to_specified_channel_only(self):
+        with tempfile.TemporaryDirectory() as folder:
+            with patch.dict(os.environ, {
+                'DATABASE_PATH':str(Path(folder) / 'verify.json'),
+                'EVENT_DATABASE_PATH':str(Path(folder) / 'events.sqlite3')
+            }):
+                bot = VerificationBot()
+                guild = MagicMock()
+                guild.id = 1
+                reminders = MagicMock(spec=discord.TextChannel)
+                reminders.id = 88
+                reminders.mention = '#event-reminders'
+                overview = MagicMock(spec=discord.TextChannel)
+                overview.id = 1568424573836464208
+                overview.mention = '#event-overview'
+                sent = []
+                async def send(channel_id, **kwargs):
+                    message = MagicMock()
+                    message.id = 400 + len(sent)
+                    message.jump_url = f'https://discord.com/channels/1/{channel_id}/{message.id}'
+                    message.edit = AsyncMock(return_value=message)
+                    sent.append((channel_id, message, kwargs))
+                    return message
+                reminders.send = AsyncMock(side_effect=lambda **kwargs: send(88, **kwargs))
+                overview.send = AsyncMock(side_effect=lambda **kwargs: send(1568424573836464208, **kwargs))
+                overview.fetch_message = AsyncMock(side_effect=lambda message_id: next(m for _,m,_ in sent if m.id==message_id))
+                guild.get_channel.side_effect = lambda channel_id: {88:reminders,1568424573836464208:overview}.get(channel_id)
+                bot.guild = guild
+                bot.events.is_staff = lambda interaction: True
+                bot.events.store.set_channel(1, 88, None)
+                bot.events.register()
+                command = bot.tree.get_commands(guild=guild)[0].get_command('create')
+                interaction = MagicMock()
+                interaction.guild_id = 1
+                interaction.guild = guild
+                interaction.user.id = 99
+                interaction.response.defer = AsyncMock()
+                interaction.followup.send = AsyncMock()
+                now = datetime.now(timezone.utc)
+                start = (now+timedelta(hours=6)).strftime('%Y-%m-%d %H:%M:%S')
+                end = (now+timedelta(hours=8)).strftime('%Y-%m-%d %H:%M:%S')
+                for title in ('Port Inspection', 'Work Log'):
+                    await command.callback(interaction, title=title, start_utc=start,
+                                           category='Port Inspection', notes='', end_utc=end)
+                self.assertEqual([id for id,_,_ in sent],[88,1568424573836464208,88])
+                self.assertEqual(reminders.send.await_count, 2)
+                self.assertEqual(overview.send.await_count, 1)
+                self.assertEqual(sent[1][2]['embed'].title, 'SaS | Event Center')
+                self.assertEqual(sent[1][1].edit.await_count, 1)
+                self.assertEqual(bot.events.store.settings(1)['calendar_message_channel_id'], 1568424573836464208)
+                self.assertEqual(bot.events.store.board_event_count(1), 2)
+                await bot.close()
+
+
 class CalendarImageTests(unittest.TestCase):
     def test_illustrated_calendar_shows_week_and_event_ranges(self):
         now = datetime(2026, 11, 7, 12, 0, tzinfo=timezone.utc)
