@@ -10,7 +10,7 @@ import discord
 from discord import app_commands
 from discord.ext import tasks
 
-from event_graphics import weekly_calendar
+from event_graphics import weekly_calendar, event_board
 
 
 log = logging.getLogger('sas.events')
@@ -223,6 +223,21 @@ class EventStore:
             "SELECT * FROM game_events WHERE guild_id=? AND state='active' AND ends_at>? ORDER BY starts_at LIMIT 15",
             (guild_id, now)
         ).fetchall()
+
+    def board_events(self, guild_id, now=None, limit=24):
+        now = int(datetime.now(timezone.utc).timestamp()) if now is None else now
+        return self.conn.execute(
+            """SELECT * FROM game_events WHERE guild_id=? AND state='active' AND ends_at>?
+            ORDER BY CASE WHEN starts_at<=? THEN 0 ELSE 1 END, starts_at, id LIMIT ?""",
+            (guild_id, now, now, limit)
+        ).fetchall()
+
+    def board_event_count(self, guild_id, now=None):
+        now = int(datetime.now(timezone.utc).timestamp()) if now is None else now
+        return self.conn.execute(
+            "SELECT COUNT(*) FROM game_events WHERE guild_id=? AND state='active' AND ends_at>?",
+            (guild_id, now)
+        ).fetchone()[0]
 
     def subscribe(self, event_id, user_id, now=None):
         now = int(datetime.now(timezone.utc).timestamp()) if now is None else now
@@ -487,6 +502,29 @@ class EventCenter:
         embed.timestamp = now
         return embed, banner
 
+    def board_payload(self, guild_id):
+        now = datetime.now(timezone.utc)
+        records = self.store.board_events(guild_id, int(now.timestamp()))
+        entries = [
+            {
+                'id': item['id'], 'title': item['title'], 'category': item['category'],
+                'starts_at': item['starts_at'], 'ends_at': item['ends_at'],
+                'phase': event_phase(item, int(now.timestamp()))
+            }
+            for item in records
+        ]
+        total = self.store.board_event_count(guild_id, int(now.timestamp()))
+        file = discord.File(event_board(entries, now, total), filename='sas_events_overview.png')
+        embed = discord.Embed(
+            title='SaS | Event Center',
+            description=f"**Server Time:** {now.strftime('%Y-%m-%d %H:%M:%S')} UTC\n**Active and upcoming events:** {total}\nNew events are automatically added to this graphic. Use /event calendar to browse the seven-day timeline.",
+            color=0x5DAAE3
+        )
+        embed.set_image(url='attachment://sas_events_overview.png')
+        embed.set_footer(text='SaS Event Center | Shared schedule | All times UTC')
+        embed.timestamp = now
+        return embed, file
+
     async def ensure_board(self, guild_id, create=False):
         async with self.board_lock:
             settings = self.store.settings(guild_id)
@@ -502,12 +540,12 @@ class EventCenter:
                 except discord.NotFound:
                     self.store.set_board(guild_id, None)
                 if message:
-                    embed, file = self.calendar_payload(guild_id)
+                    embed, file = self.board_payload(guild_id)
                     edited = await message.edit(embed=embed, attachments=[file], allowed_mentions=discord.AllowedMentions.none())
                     self.store.set_board(guild_id, (edited or message).id)
                     return edited or message
             if create:
-                embed, file = self.calendar_payload(guild_id)
+                embed, file = self.board_payload(guild_id)
                 message = await channel.send(embed=embed, file=file, allowed_mentions=discord.AllowedMentions.none())
                 self.store.set_board(guild_id, message.id)
                 return message
@@ -611,7 +649,7 @@ class EventCenter:
                     ephemeral=True
                 )
 
-        @group.command(name='calendar', description='View a game-style seven-day calendar with server times')
+        @group.command(name='calendar', description='Browse seven days or publish the combined Events overview')
         @app_commands.describe(week_offset='Weeks backward or forward (-12 to +12)', publish='Staff: post calendar to the event channel')
         async def calendar(interaction: discord.Interaction, week_offset: app_commands.Range[int,-12,12] = 0, publish: bool = False):
             if publish and not self.is_staff(interaction):
