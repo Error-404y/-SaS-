@@ -586,11 +586,11 @@ class EventCenter:
 
     def text_payload(self, guild_id, alerts=None, now=None):
         now = int(datetime.now(timezone.utc).timestamp()) if now is None else now
-        items = self.store.board_events(guild_id, now=now, limit=20)
+        items = self.store.board_events(guild_id, now=now, limit=14)
         total = self.store.board_event_count(guild_id, now=now)
         embed = discord.Embed(
             title='SaS | Event Updates',
-            description=f'**Active and upcoming events:** {total}\\nThis is the live event list. New events are added here automatically.',
+            description=f'**Active and upcoming events:** {total}\nThis is the live event list. New events are added here automatically.',
             color=discord.Color.from_rgb(93, 170, 227)
         )
         if alerts:
@@ -601,16 +601,16 @@ class EventCenter:
                 if record:
                     lines.append(f"**{clean(record['title'], 65)}** — {labels[item['stage']]}")
             if lines:
-                embed.add_field(name='LATEST REMINDERS', value='\\n'.join(lines)[:1024], inline=False)
+                embed.add_field(name='LATEST REMINDERS', value='\n'.join(lines)[:1024], inline=False)
         for event in items:
             phase = event_phase(event, now)
             start = datetime.fromtimestamp(event['starts_at'], timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
             end = datetime.fromtimestamp(event['ends_at'], timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
             name = f"#{event['id']} | {clean(event['title'], 80)} | {phase}"
-            value = f"**Type:** {clean(event['category'], 30)}\\n**UTC:** {start} — {end}"
-            value += f"\\n**{'Ends' if phase == 'In Progress' else 'Starts'}:** <t:{event['ends_at'] if phase == 'In Progress' else event['starts_at']}:R>"
+            value = f"**Type:** {clean(event['category'], 30)}\n**UTC:** {start} — {end}"
+            value += f"\n**{'Ends' if phase == 'In Progress' else 'Starts'}:** <t:{event['ends_at'] if phase == 'In Progress' else event['starts_at']}:R>"
             if event['notes']:
-                value += f"\\n{clean(event['notes'], 125)}"
+                value += f"\n{clean(event['notes'], 125)}"
             embed.add_field(name=name[:256], value=value[:1024], inline=False)
         if not items:
             embed.add_field(name='Schedule', value='No active or upcoming events.', inline=False)
@@ -799,27 +799,22 @@ class EventCenter:
             await interaction.response.defer(ephemeral=True, thinking=True)
             now = int(datetime.now(timezone.utc).timestamp())
             event_id = self.store.create(interaction.guild_id, channel.id, title, category, notes, starts_at, interaction.user.id, now, ends_at)
-            event = self.store.event(event_id)
-            embed = self.build_embed(event)
-            view = EventReminderView(self) if event_phase(event) == 'Upcoming' else None
-            try:
-                message = await channel.send(embed=embed, view=view, allowed_mentions=discord.AllowedMentions.none())
-            except discord.HTTPException:
-                log.exception('Could not publish SaS event %s', event_id)
-                self.store.cancel(event_id, interaction.guild_id)
-                return await interaction.followup.send('The event could not be published. Check channel permissions.', ephemeral=True)
-            self.store.set_message(event_id, message.id)
+            feed = await self.refresh_text_safe(interaction.guild_id, create=True)
             board = await self.refresh_board_safe(interaction.guild_id, create=True)
-            if board:
-                await interaction.followup.send(
-                    f"Added **{clean(title, 100)}** to the shared Events calendar: {board.jump_url}\nEvent details: {message.jump_url}\nEvent ID: {event_id}",
+            if feed and board:
+                return await interaction.followup.send(
+                    f"Event **{clean(title, 100)}** (#{event_id}) added to the shared updates: {feed.jump_url}\\nGraphic: {board.jump_url}",
                     ephemeral=True
                 )
-            else:
-                await interaction.followup.send(
-                    f"Event #{event_id} was saved and posted in {channel.mention}, but the shared graphic could not be updated in <#{self.board_channel_id}>. Check bot permissions and run /event calendar publish:True.",
+            if not feed:
+                return await interaction.followup.send(
+                    f"Event #{event_id} was saved, but the text overview could not be posted in <#{self.text_channel_id}>. Check bot permissions and use /event updates.",
                     ephemeral=True
                 )
+            await interaction.followup.send(
+                f"Event #{event_id} is in {feed.jump_url}, but the graphic could not be refreshed in <#{self.board_channel_id}>.",
+                ephemeral=True
+            )
 
         @group.command(name='calendar', description='Browse seven days or publish the combined Events overview')
         @app_commands.describe(week_offset='Weeks backward or forward (-12 to +12)', publish='Staff: post calendar to the event channel')
@@ -850,16 +845,12 @@ class EventCenter:
             except ValueError as error:
                 return await interaction.response.send_message(str(error), ephemeral=True)
             await interaction.response.defer(ephemeral=True)
-            updated = self.store.event(event_id)
-            if updated['message_id']:
-                try:
-                    await self.sync_event_card(updated)
-                except discord.NotFound:
-                    self.store.mark_card_missing(event_id)
-                except discord.HTTPException:
-                    log.exception('Unable to update event details for %s', event_id)
-            await self.refresh_board_safe(interaction.guild_id)
-            await interaction.followup.send(f'Event #{event_id} updated. Reminders follow the new start time if rescheduled.', ephemeral=True)
+            feed = await self.refresh_text_safe(interaction.guild_id, create=True)
+            await self.refresh_board_safe(interaction.guild_id, create=True)
+            await interaction.followup.send(
+                f"Event #{event_id} updated in the shared list." + (f" {feed.jump_url}" if feed else " The text channel is currently unavailable."),
+                ephemeral=True
+            )
 
         @group.command(name='upcoming', description='See the next scheduled SaS events')
         async def upcoming(interaction: discord.Interaction):
@@ -873,16 +864,49 @@ class EventCenter:
                 return await interaction.response.send_message('Staff access required.', ephemeral=True)
             if not self.store.cancel(event_id, interaction.guild_id):
                 return await interaction.response.send_message('Active event not found.', ephemeral=True)
+            await self.refresh_text_safe(interaction.guild_id, create=True)
+            await self.refresh_board_safe(interaction.guild_id, create=True)
+            await interaction.response.send_message(
+                f'Event #{event_id} cancelled and removed from the shared active schedule.',
+                ephemeral=True
+            )
+
+        @group.command(name='updates', description='Publish or refresh the shared event text list')
+        async def updates(interaction: discord.Interaction):
+            if not self.is_staff(interaction):
+                return await interaction.response.send_message('Staff access required.', ephemeral=True)
+            await interaction.response.defer(ephemeral=True)
+            message = await self.refresh_text_safe(interaction.guild_id, create=True)
+            if not message:
+                return await interaction.followup.send(
+                    f'Event text channel <#{self.text_channel_id}> is unavailable. Check View Channel, Send Messages and Embed Links.',
+                    ephemeral=True
+                )
+            await interaction.followup.send(f'Shared event list updated: {message.jump_url}', ephemeral=True)
+
+        @group.command(name='remind', description='Subscribe to private reminders for one event')
+        async def remind(interaction: discord.Interaction, event_id: int):
+            if interaction.guild_id != getattr(self.bot.guild, 'id', None):
+                return await interaction.response.send_message('Only available in the SaS server.', ephemeral=True)
             event = self.store.event(event_id)
-            if event['message_id']:
-                try:
-                    await self.sync_event_card(event)
-                except discord.NotFound:
-                    self.store.mark_card_missing(event_id)
-                except discord.HTTPException:
-                    log.exception('Could not update cancelled event %s', event_id)
-            await self.refresh_board_safe(interaction.guild_id)
-            await interaction.response.send_message(f'Event #{event_id} cancelled. Scheduled notifications were stopped.', ephemeral=True)
+            if not event or event['guild_id'] != interaction.guild_id:
+                return await interaction.response.send_message('Event not found.', ephemeral=True)
+            if not self.store.subscribe(event_id, interaction.user.id):
+                return await interaction.response.send_message('This event is no longer accepting reminders.', ephemeral=True)
+            await interaction.response.send_message(
+                f'Private reminders enabled for event #{event_id}. You will receive DMs 1 hour and 15 minutes before start if subscribed before those deadlines.',
+                ephemeral=True
+            )
+
+        @group.command(name='unremind', description='Disable your private reminders for one event')
+        async def unremind(interaction: discord.Interaction, event_id: int):
+            if interaction.guild_id != getattr(self.bot.guild, 'id', None):
+                return await interaction.response.send_message('Only available in the SaS server.', ephemeral=True)
+            event = self.store.event(event_id)
+            if not event or event['guild_id'] != interaction.guild_id:
+                return await interaction.response.send_message('Event not found.', ephemeral=True)
+            self.store.unsubscribe(event_id, interaction.user.id)
+            await interaction.response.send_message(f'Private reminders disabled for event #{event_id}.', ephemeral=True)
 
         self.bot.tree.add_command(group, guild=self.bot.guild)
         self.group_registered = True
