@@ -465,7 +465,6 @@ class EventCreationIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     channels[channel_id] = channel
                 guild.get_channel.side_effect = channels.get
                 bot.guild = guild
-                bot.user = None if False else bot.user
                 bot.events.is_staff = lambda interaction: True
                 bot.events.store.set_channel(1, 88, None)
                 bot.events.register()
