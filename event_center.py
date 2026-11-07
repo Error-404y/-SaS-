@@ -191,6 +191,9 @@ class EventStore:
     def mark_display_phase(self, event_id, phase):
         self.conn.execute('UPDATE game_events SET display_phase=?,banner_url=NULL WHERE id=?', (phase, event_id))
 
+    def mark_card_missing(self, event_id):
+        self.conn.execute('UPDATE game_events SET message_id=NULL,banner_url=NULL,display_phase=NULL WHERE id=?', (event_id,))
+
     def cards_to_refresh(self, now=None):
         now = int(datetime.now(timezone.utc).timestamp()) if now is None else now
         return self.conn.execute(
@@ -588,22 +591,25 @@ class EventCenter:
             event_id = self.store.create(interaction.guild_id, channel.id, title, category, notes, starts_at, interaction.user.id, now, ends_at)
             event = self.store.event(event_id)
             embed = self.build_embed(event)
-            kwargs = dict(embed=embed, view=EventReminderView(self), allowed_mentions=discord.AllowedMentions.none())
+            view = EventReminderView(self) if event_phase(event) == 'Upcoming' else None
             try:
-                kwargs['file'] = discord.File(event_banner(title, category, 'upcoming', starts_at, ends_at), filename='sas_event.png')
-                embed.set_image(url='attachment://sas_event.png')
-            except Exception:
-                log.exception('Unable to render event banner for %s', event_id)
-            try:
-                message = await channel.send(**kwargs)
+                message = await channel.send(embed=embed, view=view, allowed_mentions=discord.AllowedMentions.none())
             except discord.HTTPException:
                 log.exception('Could not publish SaS event %s', event_id)
                 self.store.cancel(event_id, interaction.guild_id)
                 return await interaction.followup.send('The event could not be published. Check channel permissions.', ephemeral=True)
-            banner_url = message.attachments[0].url if message.attachments else None
-            self.store.set_message(event_id, message.id, banner_url)
-            await self.refresh_board_safe(interaction.guild_id)
-            await interaction.followup.send(f"Scheduled **{clean(title, 100)}** in {channel.mention} from <t:{starts_at}:F> to <t:{ends_at}:F>. Event ID: {event_id}.", ephemeral=True)
+            self.store.set_message(event_id, message.id)
+            board = await self.refresh_board_safe(interaction.guild_id, create=True)
+            if board:
+                await interaction.followup.send(
+                    f"Added **{clean(title, 100)}** to the shared Events calendar: {board.jump_url}\nEvent details: {message.jump_url}\nEvent ID: {event_id}",
+                    ephemeral=True
+                )
+            else:
+                await interaction.followup.send(
+                    f"Event #{event_id} was saved and posted in {channel.mention}, but the shared calendar could not be updated. Check bot permissions and run /event calendar publish:True.",
+                    ephemeral=True
+                )
 
         @group.command(name='calendar', description='View a game-style seven-day calendar with server times')
         @app_commands.describe(week_offset='Weeks backward or forward (-12 to +12)', publish='Staff: post calendar to the event channel')
@@ -635,22 +641,13 @@ class EventCenter:
                 return await interaction.response.send_message(str(error), ephemeral=True)
             await interaction.response.defer(ephemeral=True)
             updated = self.store.event(event_id)
-            channel = interaction.guild.get_channel(updated['channel_id'])
-            if isinstance(channel, discord.TextChannel) and updated['message_id']:
+            if updated['message_id']:
                 try:
-                    message = await channel.fetch_message(updated['message_id'])
-                    embed = self.build_embed(updated)
-                    attachments = []
-                    try:
-                        attachments = [discord.File(event_banner(updated['title'], updated['category'], 'upcoming', updated['starts_at'], updated['ends_at']), filename='sas_event.png')]
-                        embed.set_image(url='attachment://sas_event.png')
-                    except Exception:
-                        log.exception('Unable to update banner for event %s', event_id)
-                    edited = await message.edit(embed=embed, attachments=attachments, view=EventReminderView(self))
-                    if edited and edited.attachments:
-                        self.store.set_message(event_id, edited.id, edited.attachments[0].url)
+                    await self.sync_event_card(updated)
+                except discord.NotFound:
+                    self.store.mark_card_missing(event_id)
                 except discord.HTTPException:
-                    log.exception('Unable to update existing event message %s',event_id)
+                    log.exception('Unable to update event details for %s', event_id)
             await self.refresh_board_safe(interaction.guild_id)
             await interaction.followup.send(f'Event #{event_id} updated. Reminders follow the new start time if rescheduled.', ephemeral=True)
 
@@ -667,11 +664,11 @@ class EventCenter:
             if not self.store.cancel(event_id, interaction.guild_id):
                 return await interaction.response.send_message('Active event not found.', ephemeral=True)
             event = self.store.event(event_id)
-            channel = interaction.guild.get_channel(event['channel_id'])
-            if channel and event['message_id']:
+            if event['message_id']:
                 try:
-                    message = await channel.fetch_message(event['message_id'])
-                    await message.edit(embed=self.build_embed(event, 'cancelled'), view=None)
+                    await self.sync_event_card(event)
+                except discord.NotFound:
+                    self.store.mark_card_missing(event_id)
                 except discord.HTTPException:
                     log.exception('Could not update cancelled event %s', event_id)
             await self.refresh_board_safe(interaction.guild_id)
