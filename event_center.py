@@ -16,7 +16,8 @@ from event_graphics import weekly_calendar, event_board
 log = logging.getLogger('sas.events')
 DEFAULT_EVENT_BOARD_CHANNEL_ID = 1568424573836464208
 DEFAULT_EVENT_TEXT_CHANNEL_ID = 1568431370747908291
-STAGES = (('24h', 86400), ('1h', 3600), ('15m', 900), ('start', 0))
+DEFAULT_EVENT_MEMBER_ROLE_ID = 1562535352290250842
+STAGES = (('1h', 3600),)
 CATEGORIES = ('Alliance', 'Events', 'Deals', 'Port Inspection', 'Other')
 
 
@@ -99,6 +100,8 @@ class EventStore:
         if 'display_phase' not in columns:
             self.conn.execute('ALTER TABLE game_events ADD COLUMN display_phase TEXT')
         self.conn.execute('UPDATE game_events SET ends_at=starts_at+3600 WHERE ends_at IS NULL')
+        self.conn.execute("UPDATE event_reminders SET state='skipped' WHERE state='pending' AND stage!='1h'")
+        self.conn.execute("UPDATE event_dm_jobs SET state='skipped' WHERE state='pending'")
 
     def set_channel(self, guild_id, channel_id, role_id):
         self.conn.execute(
@@ -457,6 +460,7 @@ class EventCenter:
         self.text_lock = asyncio.Lock()
         self.board_channel_id = int(os.getenv('EVENT_BOARD_CHANNEL_ID', str(DEFAULT_EVENT_BOARD_CHANNEL_ID)))
         self.text_channel_id = int(os.getenv('EVENT_TEXT_CHANNEL_ID', str(DEFAULT_EVENT_TEXT_CHANNEL_ID)))
+        self.member_role_id = int(os.getenv('EVENT_MEMBER_ROLE_ID', str(DEFAULT_EVENT_MEMBER_ROLE_ID)))
 
     def is_staff(self, interaction):
         return bool(
