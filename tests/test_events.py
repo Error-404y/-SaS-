@@ -558,7 +558,8 @@ class EventCreationIntegrationTests(unittest.IsolatedAsyncioTestCase):
             request = channel.send.await_args.kwargs
             self.assertIn('<@&1562535352290250842>', request['content'])
             self.assertIn('Oilfield Strike', request['content'])
-            self.assertIn('starts in 1 hour', request['content'])
+            self.assertIn('1-hour event reminder', request['content'])
+            self.assertIn('UTC', request['content'])
             self.assertTrue(request['allowed_mentions'].roles)
             self.assertEqual(request['allowed_mentions'].roles[0].id, role.id)
             self.assertFalse(request['allowed_mentions'].everyone)
