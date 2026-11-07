@@ -78,12 +78,12 @@ If earlier versions removed Member from someone incorrectly, restore Member manu
 
 The bot maintains **two shared messages**, not one new Discord message per event:
 
-- **Graphical Events overview:** Channel `1568424573836464208` (configured by `EVENT_BOARD_CHANNEL_ID`). Multiple events appear on one image, each on its own colored bar.
+- **Graphical Events overview:** Channel `1568424573836464208` (configured by `EVENT_BOARD_CHANNEL_ID`). Multiple events appear on one image. Each event now has a professionally formatted card with its **name, color-coded category, status, and exact UTC start/end timestamps**, rather than just an unlabeled colored bar.
 - **Written Event Updates:** Channel `1568431370747908291` (configured by `EVENT_TEXT_CHANNEL_ID`). This is **one editable Discord embed** containing the title, category, status, exact start/end times, countdown, and description of each event. For example, Port Inspection, Work Log, and Oilfield Strike appear as entries in the same text message.
 
 Running `/event create` adds the new event to both existing messages. `/event edit` updates them; `/event cancel` removes it from the active list. The update operation stores each shared message ID in the SQLite database, preventing duplicate posts on repeated updates or restarts. Each text embed displays up to 14 active/upcoming events; the graphical overview displays up to 24 and both indicate if additional events exist. The bot refreshes the shared messages on state transitions and approximately hourly.
 
-Older individual event messages created by earlier bot versions are gradually removed once the shared text message is successfully present. Deletions apply only to messages authored by the same bot; event database records and reminder subscriptions are retained.
+Older individual event messages created by earlier bot versions are gradually removed once the shared text message is successfully present. Deletions apply only to messages authored by the same bot; event database records are preserved.
 
 ### Commands
 
@@ -95,20 +95,22 @@ Use `/event setup` once if you have not previously configured the event service.
 - `/event updates`: staff can publish or refresh the written overview
 - `/event upcoming`: displays a private list of event IDs and times
 - `/event calendar`: opens a private navigable seven-day calendar; `/event calendar publish:True` refreshes the graphical overview
-- `/event remind event_id:8`: subscribes the member to **private DM reminders** for a future event
-- `/event unremind event_id:8`: removes the member's DM subscription
 
 Times must be entered in **UTC server time** as `YYYY-MM-DD HH:MM:SS`; minute-only input also works. Discord displays Discord timestamps in the reader's local timezone.
 
-### Reminder behavior
+### Automatic Member role ping
 
-The previous behavior of publishing **individual channel messages** at event creation and again at 24 hours, 1 hour, 15 minutes and start has been removed. Instead, due reminders update the **same written Event Updates message**, including a **LATEST REMINDERS** section for the affected events. This avoids flooding the server.
+Every new event schedules **one @Member role ping** in the **Event Updates channel `1568431370747908291`**, approximately one hour before its exact UTC start. This uses the role ID `1562535352290250842` (set by `EVENT_MEMBER_ROLE_ID`). The bot checks every 30 seconds and posts a short new message mentioning that role and naming the event. Posting a new message is required for a reliable Discord notification; editing the shared embed does not reliably notify members.
 
-Members who explicitly subscribe using `/event remind` still receive personal DMs 1 hour and 15 minutes before an event starts, where appropriate. No member is subscribed by default. Stage deadlines are stored and survive restarts. Notifications overdue by more than 10 minutes are skipped to prevent stale alerts. Role pings have been disabled in unified-message mode because editing an existing Discord message is not a reliable way to issue a new role ping; the bot does not send separate ping messages.
+The graphical Events overview in channel `1568424573836464208` and the shared written Events list are still single, editable messages. No per-event announcement is posted at event creation. **Only the 1-hour alert is an additional public message.**
+
+No `/event remind` or `/event unremind` commands, reminder buttons, opt-in subscriptions or DM alerts are used. Old pending 24-hour, 15-minute, start, and DM jobs are disabled when the upgraded bot opens its existing database; pending 1-hour notices remain eligible. Only events created more than one hour before their start can receive the 1-hour notice. Reminders overdue by more than 10 minutes are skipped, and past or cancelled events do not get alerted. Successfully delivered reminders are marked as sent in SQLite to prevent normal duplicate pings after restarts.
+
+The bot must have **Mention @everyone, @here, and All Roles** permission in the Event Updates channel, unless the Member role is configured as mentionable, in addition to normal send permissions. A role mention notifies users according to their own Discord notification settings; the bot does not individually DM role members.
 
 ### Requirements
 
-The bot must be able to View Channel, Send Messages, Embed Links and Read Message History in **both** overview channels, plus Attach Files in the graphics channel. It needs Manage Messages only for removal of old messages if they were not authored by the bot (the migration intentionally never removes other users' messages).
+The bot must be able to View Channel, Send Messages, Embed Links and Read Message History in **both** overview channels, plus Attach Files in the graphics channel. It does not delete other users' messages. Manage Messages is not required to delete the bot's own old messages.
 
 The event database `data/events.sqlite3` must be on persistent storage. Only one process should use it. Both the graphics and text are based on staff-entered events; there is **no automatic Police Chief game API integration**. Each message is a static Discord embed or picture, not a live ticking clock.
 
