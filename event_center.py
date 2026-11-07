@@ -16,7 +16,8 @@ from event_graphics import weekly_calendar, event_board
 log = logging.getLogger('sas.events')
 DEFAULT_EVENT_BOARD_CHANNEL_ID = 1568424573836464208
 DEFAULT_EVENT_TEXT_CHANNEL_ID = 1568431370747908291
-STAGES = (('24h', 86400), ('1h', 3600), ('15m', 900), ('start', 0))
+DEFAULT_EVENT_MEMBER_ROLE_ID = 1562535352290250842
+STAGES = (('1h', 3600),)
 CATEGORIES = ('Alliance', 'Events', 'Deals', 'Port Inspection', 'Other')
 
 
@@ -99,6 +100,8 @@ class EventStore:
         if 'display_phase' not in columns:
             self.conn.execute('ALTER TABLE game_events ADD COLUMN display_phase TEXT')
         self.conn.execute('UPDATE game_events SET ends_at=starts_at+3600 WHERE ends_at IS NULL')
+        self.conn.execute("UPDATE event_reminders SET state='skipped' WHERE state='pending' AND stage!='1h'")
+        self.conn.execute("UPDATE event_dm_jobs SET state='skipped' WHERE state='pending'")
 
     def set_channel(self, guild_id, channel_id, role_id):
         self.conn.execute(
@@ -319,11 +322,6 @@ class EventStore:
             'UPDATE event_reminders SET state=?,message_id=? WHERE event_id=? AND stage=? AND state=?',
             (state, message_id, event_id, stage, 'pending')
         )
-        if state == 'sent' and stage in ('1h', '15m'):
-            self.conn.execute(
-                "INSERT OR IGNORE INTO event_dm_jobs(event_id,stage,user_id) SELECT s.event_id,?,s.user_id FROM event_subscribers s JOIN game_events e ON e.id=s.event_id WHERE s.event_id=? AND s.joined_at<=? AND e.state='active'",
-                (stage, event_id, self.conn.execute('SELECT due_at FROM event_reminders WHERE event_id=? AND stage=?',(event_id,stage)).fetchone()[0])
-            )
 
     def due_dm(self):
         return self.conn.execute(
@@ -383,36 +381,6 @@ def clean(value, limit):
     return discord.utils.escape_mentions(discord.utils.escape_markdown(str(value)))[:limit]
 
 
-class EventReminderView(discord.ui.View):
-    def __init__(self, manager):
-        super().__init__(timeout=None)
-        self.manager = manager
-
-    @discord.ui.button(label='Remind Me', style=discord.ButtonStyle.primary, custom_id='sas:event:subscribe:v1')
-    async def subscribe(self, interaction, button):
-        event = self.manager.store.by_message(interaction.message.id)
-        if not event or interaction.guild_id != event['guild_id']:
-            return await interaction.response.send_message('Event not found.', ephemeral=True)
-        if event['starts_at'] <= int(datetime.now(timezone.utc).timestamp()):
-            return await interaction.response.send_message('This event has already started. Pre-event reminders are no longer available.', ephemeral=True)
-        if self.manager.store.subscribe(event['id'], interaction.user.id):
-            await interaction.response.send_message('You are subscribed. The bot will DM you 1 hour and 15 minutes before the event, if you subscribe before those reminders are due.', ephemeral=True)
-        else:
-            await interaction.response.send_message('This event is no longer accepting subscriptions.', ephemeral=True)
-
-    @discord.ui.button(label='Stop Reminders', style=discord.ButtonStyle.secondary, custom_id='sas:event:unsubscribe:v1')
-    async def unsubscribe(self, interaction, button):
-        event = self.manager.store.by_message(interaction.message.id)
-        if not event or interaction.guild_id != event['guild_id']:
-            return await interaction.response.send_message('Event not found.', ephemeral=True)
-        self.manager.store.unsubscribe(event['id'], interaction.user.id)
-        await interaction.response.send_message('Your reminders for this event are disabled.', ephemeral=True)
-
-    @discord.ui.button(label='View Schedule', style=discord.ButtonStyle.secondary, custom_id='sas:event:list:v1')
-    async def schedule(self, interaction, button):
-        await self.manager.show_calendar(interaction)
-
-
 class CalendarNavigation(discord.ui.View):
     def __init__(self, manager, user_id, week_offset=0):
         super().__init__(timeout=240)
@@ -457,6 +425,7 @@ class EventCenter:
         self.text_lock = asyncio.Lock()
         self.board_channel_id = int(os.getenv('EVENT_BOARD_CHANNEL_ID', str(DEFAULT_EVENT_BOARD_CHANNEL_ID)))
         self.text_channel_id = int(os.getenv('EVENT_TEXT_CHANNEL_ID', str(DEFAULT_EVENT_TEXT_CHANNEL_ID)))
+        self.member_role_id = int(os.getenv('EVENT_MEMBER_ROLE_ID', str(DEFAULT_EVENT_MEMBER_ROLE_ID)))
 
     def is_staff(self, interaction):
         return bool(
@@ -584,7 +553,7 @@ class EventCenter:
             return None
         return channel
 
-    def text_payload(self, guild_id, alerts=None, now=None):
+    def text_payload(self, guild_id, now=None):
         now = int(datetime.now(timezone.utc).timestamp()) if now is None else now
         items = self.store.board_events(guild_id, now=now, limit=14)
         total = self.store.board_event_count(guild_id, now=now)
@@ -593,15 +562,6 @@ class EventCenter:
             description=f'**Active and upcoming events:** {total}\nThis is the live event list. New events are added here automatically.',
             color=discord.Color.from_rgb(93, 170, 227)
         )
-        if alerts:
-            labels = {'24h': '24 hours until start', '1h': '1 hour until start', '15m': '15 minutes until start', 'start': 'Starting now'}
-            lines = []
-            for item in alerts[:8]:
-                record = self.store.event(item['event_id'])
-                if record:
-                    lines.append(f"**{clean(record['title'], 65)}** — {labels[item['stage']]}")
-            if lines:
-                embed.add_field(name='LATEST REMINDERS', value='\n'.join(lines)[:1024], inline=False)
         for event in items:
             phase = event_phase(event, now)
             start = datetime.fromtimestamp(event['starts_at'], timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
@@ -616,11 +576,11 @@ class EventCenter:
             embed.add_field(name='Schedule', value='No active or upcoming events.', inline=False)
         if total > len(items):
             embed.add_field(name='More events', value=f'{total-len(items)} more — see /event upcoming or /event calendar.', inline=False)
-        embed.set_footer(text='SaS Event Updates | Shared schedule | Times in UTC | Use /event remind to subscribe')
+        embed.set_footer(text='SaS Event Updates | Shared schedule | Times in UTC')
         embed.timestamp = datetime.fromtimestamp(now, timezone.utc)
         return embed
 
-    async def ensure_text_feed(self, guild_id, create=False, alerts=None):
+    async def ensure_text_feed(self, guild_id, create=False):
         async with self.text_lock:
             settings = self.store.settings(guild_id)
             if settings is None:
@@ -637,18 +597,18 @@ class EventCenter:
                 except discord.NotFound:
                     self.store.set_text_message(guild_id, None, None)
                 else:
-                    await message.edit(embed=self.text_payload(guild_id, alerts), allowed_mentions=discord.AllowedMentions.none())
+                    await message.edit(embed=self.text_payload(guild_id), allowed_mentions=discord.AllowedMentions.none())
                     self.store.set_text_message(guild_id, message.id, channel.id)
                     return message
             if create or old_id:
-                message = await channel.send(embed=self.text_payload(guild_id, alerts), allowed_mentions=discord.AllowedMentions.none())
+                message = await channel.send(embed=self.text_payload(guild_id), allowed_mentions=discord.AllowedMentions.none())
                 self.store.set_text_message(guild_id, message.id, channel.id)
                 return message
             return None
 
-    async def refresh_text_safe(self, guild_id, create=False, alerts=None):
+    async def refresh_text_safe(self, guild_id, create=False):
         try:
-            return await self.ensure_text_feed(guild_id, create=create, alerts=alerts)
+            return await self.ensure_text_feed(guild_id, create=create)
         except (discord.HTTPException, OSError, ValueError):
             log.exception('Unable to update shared text events in channel %s', self.text_channel_id)
             return None
@@ -763,7 +723,7 @@ class EventCenter:
     def register(self):
         if self.group_registered:
             return
-        group = app_commands.Group(name='event', description='SaS event calendar and reminders')
+        group = app_commands.Group(name='event', description='SaS event calendar and one-hour member alerts')
 
         @group.command(name='setup', description='Configure legacy event settings and the shared event feeds')
         async def setup(interaction: discord.Interaction, channel: discord.TextChannel, notify_role: discord.Role = None):
@@ -773,7 +733,7 @@ class EventCenter:
             if not all((permissions.view_channel, permissions.send_messages, permissions.embed_links, permissions.attach_files, permissions.read_message_history)):
                 return await interaction.response.send_message('The bot needs View Channel, Send Messages, Embed Links, Attach Files and Read Message History.', ephemeral=True)
             self.store.set_channel(interaction.guild_id, channel.id, notify_role.id if notify_role else None)
-            await interaction.response.send_message(f"Event administration configured. The combined text list posts in <#{self.text_channel_id}> and the graphic posts in <#{self.board_channel_id}>. Individual channel reminders and role pings are disabled; private opt-in reminders remain available.", ephemeral=True)
+            await interaction.response.send_message(f"Event Updates posts in <#{self.text_channel_id}> and the graphic in <#{self.board_channel_id}>. Members with role <@&{self.member_role_id}> are pinged once, around 1 hour before each event. No subscriptions or reminder buttons are required.", ephemeral=True)
 
         @group.command(name='create', description='Schedule an event using the in-game server time in UTC')
         @app_commands.describe(title='Event name', start_utc='Start YYYY-MM-DD HH:MM:SS UTC', category='Event color category', notes='Optional event details', end_utc='Optional end YYYY-MM-DD HH:MM:SS UTC')
@@ -884,53 +844,46 @@ class EventCenter:
                 )
             await interaction.followup.send(f'Shared event list updated: {message.jump_url}', ephemeral=True)
 
-        @group.command(name='remind', description='Subscribe to private reminders for one event')
-        async def remind(interaction: discord.Interaction, event_id: int):
-            if interaction.guild_id != getattr(self.bot.guild, 'id', None):
-                return await interaction.response.send_message('Only available in the SaS server.', ephemeral=True)
-            event = self.store.event(event_id)
-            if not event or event['guild_id'] != interaction.guild_id:
-                return await interaction.response.send_message('Event not found.', ephemeral=True)
-            if not self.store.subscribe(event_id, interaction.user.id):
-                return await interaction.response.send_message('This event is no longer accepting reminders.', ephemeral=True)
-            await interaction.response.send_message(
-                f'Private reminders enabled for event #{event_id}. You will receive DMs 1 hour and 15 minutes before start if subscribed before those deadlines.',
-                ephemeral=True
-            )
-
-        @group.command(name='unremind', description='Disable your private reminders for one event')
-        async def unremind(interaction: discord.Interaction, event_id: int):
-            if interaction.guild_id != getattr(self.bot.guild, 'id', None):
-                return await interaction.response.send_message('Only available in the SaS server.', ephemeral=True)
-            event = self.store.event(event_id)
-            if not event or event['guild_id'] != interaction.guild_id:
-                return await interaction.response.send_message('Event not found.', ephemeral=True)
-            self.store.unsubscribe(event_id, interaction.user.id)
-            await interaction.response.send_message(f'Private reminders disabled for event #{event_id}.', ephemeral=True)
-
         self.bot.tree.add_command(group, guild=self.bot.guild)
         self.group_registered = True
+
+    async def send_member_ping(self, event):
+        channel = self.text_channel()
+        role = self.bot.guild.get_role(self.member_role_id)
+        if channel is None or role is None:
+            log.error('One-hour event ping cannot be sent: channel %s or Member role %s unavailable', self.text_channel_id, self.member_role_id)
+            return None
+        member = self.bot.guild.me
+        if member is not None:
+            permissions = channel.permissions_for(member)
+            if not (permissions.view_channel and permissions.send_messages and (role.mentionable or permissions.mention_everyone)):
+                log.error('Bot must be able to mention Member role %s in channel %s', self.member_role_id, self.text_channel_id)
+                return None
+        utc_start = datetime.fromtimestamp(event['starts_at'], timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+        return await channel.send(
+            content=f"{role.mention} **1-hour event reminder | {clean(event['title'], 100)}**\n**Starts:** {utc_start} UTC (<t:{event['starts_at']}:R>)",
+            allowed_mentions=discord.AllowedMentions(everyone=False, users=False, roles=[role])
+        )
 
     @tasks.loop(seconds=30)
     async def scheduler(self):
         if not self.bot.configured:
             return
         now = int(datetime.now(timezone.utc).timestamp())
-        notifications = []
         for reminder in self.store.due(now):
             event = self.store.event(reminder['event_id'])
-            stage = reminder['stage']
-            if (event['state'] != 'active' or now >= event['ends_at']
-                    or now - reminder['due_at'] > 600
-                    or (stage != 'start' and now >= event['starts_at'])):
-                self.store.reminder_state(event['id'], stage, 'skipped')
+            if (reminder['stage'] != '1h' or not event or event['state'] != 'active'
+                    or now >= event['starts_at'] or now >= event['ends_at']
+                    or now - reminder['due_at'] > 600):
+                self.store.reminder_state(reminder['event_id'], reminder['stage'], 'skipped')
                 continue
-            notifications.append(reminder)
-        if notifications:
-            feed = await self.refresh_text_safe(self.bot.guild.id, create=True, alerts=notifications)
-            if feed:
-                for reminder in notifications:
-                    self.store.reminder_state(reminder['event_id'], reminder['stage'], 'sent', feed.id)
+            try:
+                message = await self.send_member_ping(event)
+            except discord.HTTPException:
+                log.exception('Failed to ping Member role for event #%s', event['id'])
+                continue
+            if message is not None:
+                self.store.reminder_state(event['id'], '1h', 'sent', message.id)
         settings = self.store.settings(self.bot.guild.id)
         if settings and not settings['text_message_id'] and self.store.upcoming(self.bot.guild.id, now):
             await self.refresh_text_safe(self.bot.guild.id, create=True)
@@ -943,25 +896,6 @@ class EventCenter:
             await self.refresh_board_safe(self.bot.guild.id, create=True)
         for item in self.store.boards_to_refresh(now, self.board_channel_id):
             await self.refresh_board_safe(item['guild_id'])
-        for job in self.store.due_dm():
-            event = self.store.event(job['event_id'])
-            if event['state'] != 'active':
-                self.store.dm_state(job['event_id'], job['stage'], job['user_id'], 'skipped')
-                continue
-            if int(datetime.now(timezone.utc).timestamp()) >= event['starts_at']:
-                self.store.dm_state(job['event_id'], job['stage'], job['user_id'], 'skipped')
-                continue
-            message = self.build_embed(event,job['stage'])
-            try:
-                user = await self.bot.fetch_user(job['user_id'])
-                await user.send(embed=message)
-            except (discord.Forbidden,discord.NotFound):
-                self.store.dm_state(job['event_id'],job['stage'],job['user_id'],'blocked')
-            except discord.HTTPException:
-                log.exception('Could not send event DM for event %s',event['id'])
-            else:
-                self.store.dm_state(job['event_id'],job['stage'],job['user_id'],'sent')
-
     @scheduler.before_loop
     async def before_scheduler(self):
         await self.bot.wait_until_ready()
