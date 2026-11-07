@@ -95,6 +95,28 @@ class EventStoreTests(unittest.IsolatedAsyncioTestCase):
         row = self.store.event(original)
         self.assertEqual(row['ends_at'], row['starts_at'] + 3600)
 
+    def test_restart_disables_old_multi_stage_and_private_dm_notifications(self):
+        event_id = self.create()
+        for stage, offset in (('24h', 86400), ('15m', 900), ('start', 0)):
+            self.store.conn.execute(
+                'INSERT INTO event_reminders(event_id,stage,due_at) VALUES(?,?,?)',
+                (event_id, stage, self.now + 90000 - offset)
+            )
+        self.store.conn.execute(
+            "INSERT INTO event_dm_jobs(event_id,stage,user_id) VALUES(?,?,?)",
+            (event_id, '1h', 42)
+        )
+        self.store.close()
+        self.store = EventStore(Path(self.directory.name) / 'events.sqlite3')
+        rows = self.store.conn.execute(
+            'SELECT stage,state FROM event_reminders WHERE event_id=? ORDER BY stage',
+            (event_id,)
+        ).fetchall()
+        phases = {row['stage']:row['state'] for row in rows}
+        self.assertEqual(phases['1h'], 'pending')
+        self.assertEqual([stage for stage,state in phases.items() if state == 'pending'], ['1h'])
+        self.assertEqual(self.store.conn.execute('SELECT state FROM event_dm_jobs').fetchone()['state'], 'skipped')
+
     def test_public_calendar_board_persists_and_refreshes(self):
         self.store.set_channel(1, 88, None)
         self.store.set_board(1, 445, self.now)
