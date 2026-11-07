@@ -723,7 +723,7 @@ class EventCenter:
     def register(self):
         if self.group_registered:
             return
-        group = app_commands.Group(name='event', description='SaS event calendar and reminders')
+        group = app_commands.Group(name='event', description='SaS event calendar and one-hour member alerts')
 
         @group.command(name='setup', description='Configure legacy event settings and the shared event feeds')
         async def setup(interaction: discord.Interaction, channel: discord.TextChannel, notify_role: discord.Role = None):
@@ -733,7 +733,7 @@ class EventCenter:
             if not all((permissions.view_channel, permissions.send_messages, permissions.embed_links, permissions.attach_files, permissions.read_message_history)):
                 return await interaction.response.send_message('The bot needs View Channel, Send Messages, Embed Links, Attach Files and Read Message History.', ephemeral=True)
             self.store.set_channel(interaction.guild_id, channel.id, notify_role.id if notify_role else None)
-            await interaction.response.send_message(f"Event administration configured. The combined text list posts in <#{self.text_channel_id}> and the graphic posts in <#{self.board_channel_id}>. Individual channel reminders and role pings are disabled; private opt-in reminders remain available.", ephemeral=True)
+            await interaction.response.send_message(f"Event Updates posts in <#{self.text_channel_id}> and the graphic in <#{self.board_channel_id}>. Members with role <@&{self.member_role_id}> are pinged once, around 1 hour before each event. No subscriptions or reminder buttons are required.", ephemeral=True)
 
         @group.command(name='create', description='Schedule an event using the in-game server time in UTC')
         @app_commands.describe(title='Event name', start_utc='Start YYYY-MM-DD HH:MM:SS UTC', category='Event color category', notes='Optional event details', end_utc='Optional end YYYY-MM-DD HH:MM:SS UTC')
@@ -843,30 +843,6 @@ class EventCenter:
                     ephemeral=True
                 )
             await interaction.followup.send(f'Shared event list updated: {message.jump_url}', ephemeral=True)
-
-        @group.command(name='remind', description='Subscribe to private reminders for one event')
-        async def remind(interaction: discord.Interaction, event_id: int):
-            if interaction.guild_id != getattr(self.bot.guild, 'id', None):
-                return await interaction.response.send_message('Only available in the SaS server.', ephemeral=True)
-            event = self.store.event(event_id)
-            if not event or event['guild_id'] != interaction.guild_id:
-                return await interaction.response.send_message('Event not found.', ephemeral=True)
-            if not self.store.subscribe(event_id, interaction.user.id):
-                return await interaction.response.send_message('This event is no longer accepting reminders.', ephemeral=True)
-            await interaction.response.send_message(
-                f'Private reminders enabled for event #{event_id}. You will receive DMs 1 hour and 15 minutes before start if subscribed before those deadlines.',
-                ephemeral=True
-            )
-
-        @group.command(name='unremind', description='Disable your private reminders for one event')
-        async def unremind(interaction: discord.Interaction, event_id: int):
-            if interaction.guild_id != getattr(self.bot.guild, 'id', None):
-                return await interaction.response.send_message('Only available in the SaS server.', ephemeral=True)
-            event = self.store.event(event_id)
-            if not event or event['guild_id'] != interaction.guild_id:
-                return await interaction.response.send_message('Event not found.', ephemeral=True)
-            self.store.unsubscribe(event_id, interaction.user.id)
-            await interaction.response.send_message(f'Private reminders disabled for event #{event_id}.', ephemeral=True)
 
         self.bot.tree.add_command(group, guild=self.bot.guild)
         self.group_registered = True
