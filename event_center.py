@@ -392,28 +392,56 @@ class EventCenter:
             and isinstance(interaction.user, discord.Member) and self.bot.is_reviewer(interaction.user)
         )
 
-    def build_embed(self, event, stage='upcoming'):
-        name = clean(event['title'], 200)
-        now = int(datetime.now(timezone.utc).timestamp())
-        in_progress = event['starts_at'] <= now < event['ends_at'] and event['state'] == 'active'
-        status = 'Cancelled' if event['state'] == 'cancelled' else 'Starting Now' if stage == 'start' else 'In Progress' if in_progress else 'Completed' if now >= event['ends_at'] else 'Scheduled'
-        color = 0xC74949 if event['state'] == 'cancelled' else 0xE5B75E if in_progress or stage in ('1h','15m','start') else 0x318BCE
-        description = clean(event['notes'], 1400) or 'Check the in-game Events calendar for the event details.'
-        result = discord.Embed(title=f"SaS | {name}", description=description, color=color)
+    def build_embed(self, event, stage=None, now=None):
+        now = int(datetime.now(timezone.utc).timestamp()) if now is None else now
+        phase = event_phase(event, now)
+        title = clean(event['title'], 200)
+        description = clean(event['notes'], 1400) or 'See the in-game Events calendar for further information.'
+        color = {
+            'Upcoming': 0x318BCE,
+            'In Progress': 0xE5B75E,
+            'Completed': 0x738499,
+            'Cancelled': 0xC74949
+        }[phase]
+        heading = f"SaS | {title}"
+        stage_names = {'24h': '24-Hour Reminder', '1h': '1-Hour Reminder', '15m': '15-Minute Reminder', 'start': 'Event Start'}
+        if stage in stage_names:
+            heading = f"SaS | {stage_names[stage]} | {title}"
+        result = discord.Embed(title=heading, description=description, color=color)
         result.add_field(name='EVENT TYPE', value=clean(event['category'], 60), inline=True)
+        result.add_field(name='STATUS', value=phase, inline=True)
         result.add_field(name='SERVER START', value=f"<t:{event['starts_at']}:F>", inline=True)
         result.add_field(name='SERVER END', value=f"<t:{event['ends_at']}:F>", inline=True)
-        result.add_field(name='ENDS IN' if in_progress else 'COUNTDOWN', value=f"<t:{event['ends_at'] if in_progress else event['starts_at']}:R>", inline=True)
-        server_start = datetime.fromtimestamp(event['starts_at'], timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-        server_end = datetime.fromtimestamp(event['ends_at'], timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-        result.add_field(name='IN-GAME SERVER TIME', value=f"{server_start} - {server_end}", inline=False)
-        result.add_field(name='STATUS', value=status, inline=True)
-        reminder_info = 'Already in progress. Past pre-event reminders will not be sent.' if in_progress else '24h / 1h / 15m / Start\nPersonal DM: 1h and 15m, opt-in only.'
-        result.add_field(name='REMINDERS', value=reminder_info, inline=False)
-        result.set_footer(text=f"SaS Event Center | Event #{event['id']} | {stage}")
-        if event['banner_url'] and stage in ('upcoming','cancelled'):
-            result.set_image(url=event['banner_url'])
+        if phase == 'Upcoming':
+            result.add_field(name='STARTS IN', value=f"<t:{event['starts_at']}:R>", inline=True)
+        elif phase == 'In Progress':
+            result.add_field(name='ENDS IN', value=f"<t:{event['ends_at']}:R>", inline=True)
+        server_start = datetime.fromtimestamp(event['starts_at'], timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+        server_end = datetime.fromtimestamp(event['ends_at'], timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+        result.add_field(name='IN-GAME SERVER TIME (UTC)', value=f"{server_start} — {server_end}", inline=False)
+        reminders = {
+            'Upcoming': 'Channel: 24h, 1h, 15m, start. Opt-in DMs: 1h and 15m.',
+            'In Progress': 'The event has started. No earlier reminders will be sent.',
+            'Completed': 'The event has ended. All reminders are closed.',
+            'Cancelled': 'This event was cancelled. All reminders are disabled.'
+        }
+        result.add_field(name='REMINDERS', value=reminders[phase], inline=False)
+        result.set_footer(text=f"SaS Event Center | Event #{event['id']} | {phase}")
         return result
+
+    async def sync_event_card(self, event, message=None):
+        if not event['message_id']:
+            return None
+        channel = self.bot.guild.get_channel(event['channel_id'])
+        if not isinstance(channel, discord.TextChannel):
+            return None
+        if message is None:
+            message = await channel.fetch_message(event['message_id'])
+        phase = event_phase(event)
+        view = EventReminderView(self) if phase == 'Upcoming' else None
+        await message.edit(embed=self.build_embed(event), attachments=[], view=view, allowed_mentions=discord.AllowedMentions.none())
+        self.store.mark_display_phase(event['id'], phase)
+        return message
 
     def upcoming_embed(self, rows):
         result = discord.Embed(title='SaS | Upcoming Events', color=0x318BCE)
@@ -421,7 +449,7 @@ class EventCenter:
             for event in rows[:10]:
                 result.add_field(
                     name=f"#{event['id']} | {clean(event['title'], 90)}",
-                    value=f"{clean(event['category'], 50)} | <t:{event['starts_at']}:F> - <t:{event['ends_at']}:F> (<t:{event['starts_at']}:R>)",
+                    value=f"{clean(event['category'], 50)} | **{event_phase(event)}** | <t:{event['starts_at']}:F> — <t:{event['ends_at']}:F> | <t:{event['ends_at'] if event_phase(event) == 'In Progress' else event['starts_at']}:R>",
                     inline=False
                 )
         else:
