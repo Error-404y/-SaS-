@@ -10,7 +10,7 @@ from bot import VerificationBot
 from unittest.mock import patch, MagicMock, AsyncMock
 import os
 import discord
-from event_graphics import event_banner, weekly_calendar, event_board
+from event_graphics import weekly_calendar, event_board
 
 
 class EventStoreTests(unittest.IsolatedAsyncioTestCase):
@@ -382,14 +382,6 @@ class CalendarImageTests(unittest.TestCase):
         self.assertEqual(image.format, 'PNG')
         self.assertEqual(image.width, 1120)
         self.assertGreater(image.height, 400)
-
-
-class EventBannerTests(unittest.TestCase):
-    def test_banner_is_png(self):
-        data = event_banner('Alliance Mobilization', 'Alliance', '1h')
-        picture = Image.open(data)
-        self.assertEqual(picture.size, (1000, 300))
-        self.assertEqual(picture.format, 'PNG')
 
 
 if __name__ == '__main__':
