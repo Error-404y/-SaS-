@@ -53,43 +53,6 @@ def png(image):
     return output
 
 
-def event_banner(title, category, stage, starts_at=None, ends_at=None, server_now=None):
-    server_now = datetime.now(timezone.utc) if server_now is None else server_now
-    width, height = 1000, 300
-    image = Image.new('RGB', (width, height), (62, 49, 41))
-    draw = ImageDraw.Draw(image)
-    draw.rounded_rectangle((0, 0, width - 1, height - 1), radius=18, fill=(76, 62, 52), outline=(151, 121, 84), width=3)
-    draw.rounded_rectangle((13, 13, width - 13, 68), radius=12, fill=(95, 78, 62))
-    draw.text((34, 24), 'EVENTS', font=typeface(30, True), fill=(255, 251, 238))
-    draw.text((800, 30), 'SaS  EVENT CENTER', font=typeface(16, True), fill=(251, 218, 154))
-    draw.rounded_rectangle((13, 75, width - 13, 139), radius=12, fill=(94, 173, 231), outline=(55, 128, 192), width=3)
-    label = 'Server Time ' + server_now.strftime('%Y-%m-%d %H:%M:%S') + ' UTC'
-    draw.text((48, 89), label, font=fit_text(draw, label, 910, 31, True), fill=(255, 255, 255), stroke_width=1, stroke_fill=(65, 115, 154))
-    draw.rounded_rectangle((15, 148, width - 15, height - 18), radius=13, fill=(178, 207, 230))
-    light, dark = PALETTE.get(category, PALETTE['Other'])
-    bx0, bx1, by0, by1 = 33, width - 31, 165, 230
-    draw.polygon(((bx0, by0), (bx1 - 29, by0), (bx1, (by0 + by1)//2), (bx1 - 29, by1), (bx0, by1)), fill=light, outline=dark, width=4)
-    draw.line((bx0 + 10, by0 + 4, bx1 - 38, by0 + 4), fill=(255, 246, 222), width=2)
-    event_name = ellipsis(draw, title, 820, typeface(30, True))
-    draw.text((54, 177), event_name, font=typeface(30, True), fill=(255, 255, 255), stroke_width=1, stroke_fill=(72, 64, 62))
-    stage_label = {
-        'upcoming': 'UPCOMING', '24h': '24 HOURS BEFORE', '1h': '1 HOUR BEFORE',
-        '15m': '15 MINUTES BEFORE', 'start': 'STARTING NOW', 'cancelled': 'CANCELLED'
-    }.get(stage, 'EVENT REMINDER')
-    draw.text((43, 247), stage_label, font=typeface(18, True), fill=(60, 85, 117))
-    if starts_at is not None:
-        start = datetime.fromtimestamp(int(starts_at), timezone.utc)
-        date_string = start.strftime('%m/%d %H:%M:%S')
-        if ends_at is not None:
-            finish = datetime.fromtimestamp(int(ends_at), timezone.utc)
-            date_string += '  -  ' + finish.strftime('%m/%d %H:%M:%S')
-        date_string += ' UTC'
-        label_font = fit_text(draw, date_string, 620, 18, True)
-        tw = draw.textbbox((0,0), date_string, font=label_font)[2]
-        draw.text((width - 36 - tw, 247), date_string, font=label_font, fill=(53, 80, 116))
-    return png(image)
-
-
 def event_board(events, server_now=None, total_count=None):
     if server_now is None:
         server_now = datetime.now(timezone.utc)
