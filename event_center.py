@@ -553,7 +553,7 @@ class EventCenter:
             return None
         return channel
 
-    def text_payload(self, guild_id, alerts=None, now=None):
+    def text_payload(self, guild_id, now=None):
         now = int(datetime.now(timezone.utc).timestamp()) if now is None else now
         items = self.store.board_events(guild_id, now=now, limit=14)
         total = self.store.board_event_count(guild_id, now=now)
@@ -562,15 +562,6 @@ class EventCenter:
             description=f'**Active and upcoming events:** {total}\nThis is the live event list. New events are added here automatically.',
             color=discord.Color.from_rgb(93, 170, 227)
         )
-        if alerts:
-            labels = {'24h': '24 hours until start', '1h': '1 hour until start', '15m': '15 minutes until start', 'start': 'Starting now'}
-            lines = []
-            for item in alerts[:8]:
-                record = self.store.event(item['event_id'])
-                if record:
-                    lines.append(f"**{clean(record['title'], 65)}** — {labels[item['stage']]}")
-            if lines:
-                embed.add_field(name='LATEST REMINDERS', value='\n'.join(lines)[:1024], inline=False)
         for event in items:
             phase = event_phase(event, now)
             start = datetime.fromtimestamp(event['starts_at'], timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
@@ -585,11 +576,11 @@ class EventCenter:
             embed.add_field(name='Schedule', value='No active or upcoming events.', inline=False)
         if total > len(items):
             embed.add_field(name='More events', value=f'{total-len(items)} more — see /event upcoming or /event calendar.', inline=False)
-        embed.set_footer(text='SaS Event Updates | Shared schedule | Times in UTC | Use /event remind to subscribe')
+        embed.set_footer(text='SaS Event Updates | Shared schedule | Times in UTC')
         embed.timestamp = datetime.fromtimestamp(now, timezone.utc)
         return embed
 
-    async def ensure_text_feed(self, guild_id, create=False, alerts=None):
+    async def ensure_text_feed(self, guild_id, create=False):
         async with self.text_lock:
             settings = self.store.settings(guild_id)
             if settings is None:
@@ -606,18 +597,18 @@ class EventCenter:
                 except discord.NotFound:
                     self.store.set_text_message(guild_id, None, None)
                 else:
-                    await message.edit(embed=self.text_payload(guild_id, alerts), allowed_mentions=discord.AllowedMentions.none())
+                    await message.edit(embed=self.text_payload(guild_id), allowed_mentions=discord.AllowedMentions.none())
                     self.store.set_text_message(guild_id, message.id, channel.id)
                     return message
             if create or old_id:
-                message = await channel.send(embed=self.text_payload(guild_id, alerts), allowed_mentions=discord.AllowedMentions.none())
+                message = await channel.send(embed=self.text_payload(guild_id), allowed_mentions=discord.AllowedMentions.none())
                 self.store.set_text_message(guild_id, message.id, channel.id)
                 return message
             return None
 
-    async def refresh_text_safe(self, guild_id, create=False, alerts=None):
+    async def refresh_text_safe(self, guild_id, create=False):
         try:
-            return await self.ensure_text_feed(guild_id, create=create, alerts=alerts)
+            return await self.ensure_text_feed(guild_id, create=create)
         except (discord.HTTPException, OSError, ValueError):
             log.exception('Unable to update shared text events in channel %s', self.text_channel_id)
             return None
