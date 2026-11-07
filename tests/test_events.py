@@ -115,7 +115,8 @@ class EventStoreTests(unittest.IsolatedAsyncioTestCase):
         self.store = EventStore(Path(self.directory.name) / 'events.sqlite3')
         self.assertEqual(self.store.settings(1)['calendar_message_id'], 445)
         self.store.set_channel(1, 99, None)
-        self.assertIsNone(self.store.settings(1)['calendar_message_id'])
+        self.assertEqual(self.store.settings(1)['calendar_message_id'], 445)
+        self.assertEqual(self.store.settings(1)['calendar_message_channel_id'], 88)
 
     def test_new_events_share_one_board_with_different_titles(self):
         ongoing = self.store.create(1, 2, 'Port Inspection', 'Port Inspection', '',
@@ -290,7 +291,8 @@ class SharedEventBoardTests(unittest.IsolatedAsyncioTestCase):
             guild.get_channel.return_value = channel
             bot = MagicMock()
             bot.guild = guild
-            manager = EventCenter(bot, Path(folder) / 'events.sqlite3')
+            with patch.dict(os.environ, {'EVENT_BOARD_CHANNEL_ID': '88'}):
+                manager = EventCenter(bot, Path(folder) / 'events.sqlite3')
             now = int(datetime.now(timezone.utc).timestamp())
             manager.store.set_channel(1, 88, None)
             manager.store.create(1, 88, 'Port Inspection', 'Port Inspection', '',
@@ -311,6 +313,65 @@ class SharedEventBoardTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(channel.send.await_count, 1)
             self.assertEqual(message.edit.await_count, 1)
             self.assertEqual(manager.store.settings(1)['calendar_message_id'], 12345)
+            manager.close()
+
+    async def test_existing_board_moves_to_requested_channel_and_removes_old_copy(self):
+        with tempfile.TemporaryDirectory() as folder:
+            reminders = MagicMock(spec=discord.TextChannel)
+            reminders.id = 88
+            board_channel = MagicMock(spec=discord.TextChannel)
+            board_channel.id = 1568424573836464208
+            old_message = MagicMock()
+            old_message.id = 1111
+            old_message.author.id = 777
+            old_message.delete = AsyncMock()
+            reminders.fetch_message = AsyncMock(return_value=old_message)
+            new_message = MagicMock()
+            new_message.id = 2222
+            new_message.jump_url = 'https://discord.com/channels/1/1568424573836464208/2222'
+            new_message.author.id = 777
+            new_message.edit = AsyncMock(return_value=new_message)
+            board_channel.send = AsyncMock(return_value=new_message)
+            board_channel.fetch_message = AsyncMock(return_value=new_message)
+            guild = MagicMock()
+            guild.id = 1
+            guild.get_channel.side_effect = lambda channel_id: {88: reminders, 1568424573836464208: board_channel}.get(channel_id)
+            bot = MagicMock()
+            bot.user.id = 777
+            bot.guild = guild
+            manager = EventCenter(bot, Path(folder) / 'events.sqlite3')
+            now = int(datetime.now(timezone.utc).timestamp())
+            manager.store.set_channel(1, 88, None)
+            manager.store.set_board(1, 1111, now=now)
+            self.assertEqual(manager.store.settings(1)['calendar_message_channel_id'], 88)
+            self.assertEqual([r['guild_id'] for r in manager.store.boards_to_refresh(now+60, manager.board_channel_id)], [1])
+            record_id = manager.store.create(1, 88, 'Work Log', 'Port Inspection', '', now-60, 5, now=now, ends_at=now+6000)
+            new = await manager.ensure_board(1, create=True)
+            self.assertEqual(new.id, 2222)
+            self.assertEqual(board_channel.send.await_count, 1)
+            self.assertEqual(reminders.send.await_count, 0)
+            self.assertEqual(old_message.delete.await_count, 1)
+            self.assertEqual(manager.store.settings(1)['calendar_message_id'], 2222)
+            self.assertEqual(manager.store.settings(1)['calendar_message_channel_id'], 1568424573836464208)
+            await manager.ensure_board(1, create=True)
+            self.assertEqual(board_channel.send.await_count, 1)
+            self.assertEqual(new_message.edit.await_count, 1)
+            manager.close()
+
+    async def test_invalid_board_channel_does_not_post_into_reminder_channel(self):
+        with tempfile.TemporaryDirectory() as folder:
+            reminders = MagicMock(spec=discord.TextChannel)
+            reminders.id = 88
+            reminders.send = AsyncMock()
+            guild = MagicMock()
+            guild.id = 1
+            guild.get_channel.side_effect = lambda channel_id: reminders if channel_id == 88 else None
+            bot = MagicMock()
+            bot.guild = guild
+            manager = EventCenter(bot, Path(folder) / 'events.sqlite3')
+            manager.store.set_channel(1, 88, None)
+            self.assertIsNone(await manager.ensure_board(1, create=True))
+            reminders.send.assert_not_awaited()
             manager.close()
 
     async def test_existing_event_image_removed_and_footer_fixed(self):
@@ -373,7 +434,8 @@ class EventCreationIntegrationTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as folder:
             with patch.dict(os.environ, {
                 'DATABASE_PATH':str(Path(folder) / 'verify.json'),
-                'EVENT_DATABASE_PATH':str(Path(folder) / 'events.sqlite3')
+                'EVENT_DATABASE_PATH':str(Path(folder) / 'events.sqlite3'),
+                'EVENT_BOARD_CHANNEL_ID':'88'
             }):
                 bot = VerificationBot()
                 guild = MagicMock()
@@ -430,6 +492,64 @@ class EventCreationIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 )
                 embeds = [event_one.kwargs['embed'], event_two.kwargs['embed']]
                 self.assertTrue(all(embed.footer.text.endswith('In Progress') for embed in embeds))
+                await bot.close()
+
+
+    async def test_event_create_posts_overview_to_specified_channel_only(self):
+        with tempfile.TemporaryDirectory() as folder:
+            with patch.dict(os.environ, {
+                'DATABASE_PATH':str(Path(folder) / 'verify.json'),
+                'EVENT_DATABASE_PATH':str(Path(folder) / 'events.sqlite3')
+            }):
+                bot = VerificationBot()
+                guild = MagicMock()
+                guild.id = 1
+                reminders = MagicMock(spec=discord.TextChannel)
+                reminders.id = 88
+                reminders.mention = '#event-reminders'
+                overview = MagicMock(spec=discord.TextChannel)
+                overview.id = 1568424573836464208
+                overview.mention = '#event-overview'
+                sent = []
+                async def send(channel_id, **kwargs):
+                    message = MagicMock()
+                    message.id = 400 + len(sent)
+                    message.jump_url = f'https://discord.com/channels/1/{channel_id}/{message.id}'
+                    message.edit = AsyncMock(return_value=message)
+                    sent.append((channel_id, message, kwargs))
+                    return message
+                async def send_reminder(**kwargs):
+                    return await send(88, **kwargs)
+                async def send_overview(**kwargs):
+                    return await send(1568424573836464208, **kwargs)
+                reminders.send = AsyncMock(side_effect=send_reminder)
+                overview.send = AsyncMock(side_effect=send_overview)
+                overview.fetch_message = AsyncMock(side_effect=lambda message_id: next(m for _,m,_ in sent if m.id==message_id))
+                guild.get_channel.side_effect = lambda channel_id: {88:reminders,1568424573836464208:overview}.get(channel_id)
+                bot.guild = guild
+                bot.events.is_staff = lambda interaction: True
+                bot.events.store.set_channel(1, 88, None)
+                bot.events.register()
+                command = bot.tree.get_commands(guild=guild)[0].get_command('create')
+                interaction = MagicMock()
+                interaction.guild_id = 1
+                interaction.guild = guild
+                interaction.user.id = 99
+                interaction.response.defer = AsyncMock()
+                interaction.followup.send = AsyncMock()
+                now = datetime.now(timezone.utc)
+                start = (now+timedelta(hours=6)).strftime('%Y-%m-%d %H:%M:%S')
+                end = (now+timedelta(hours=8)).strftime('%Y-%m-%d %H:%M:%S')
+                for title in ('Port Inspection', 'Work Log'):
+                    await command.callback(interaction, title=title, start_utc=start,
+                                           category='Port Inspection', notes='', end_utc=end)
+                self.assertEqual([id for id,_,_ in sent],[88,1568424573836464208,88])
+                self.assertEqual(reminders.send.await_count, 2)
+                self.assertEqual(overview.send.await_count, 1)
+                self.assertEqual(sent[1][2]['embed'].title, 'SaS | Event Center')
+                self.assertEqual(sent[1][1].edit.await_count, 1)
+                self.assertEqual(bot.events.store.settings(1)['calendar_message_channel_id'], 1568424573836464208)
+                self.assertEqual(bot.events.store.board_event_count(1), 2)
                 await bot.close()
 
 

@@ -78,13 +78,13 @@ If earlier versions removed Member from someone incorrectly, restore Member manu
 
 The bot publishes **one combined SaS Events graphic** inspired by Police Chief. Every active or upcoming event appears on its own color-coded bar beneath a single server clock. For example, **Port Inspection** and **Work Log** appear as two separate entries, even when both use the Port Inspection category. The board shows each event's exact start/end date and time, plus **Upcoming** or **In Progress**.
 
-The shared graphic is **created automatically on the first event** and updated, not reposted, whenever staff add, edit or cancel another event. Event start/end transitions also update the graphic, and a scheduled refresh updates its printed clock approximately once per hour. Discord cannot continuously animate the timestamp inside a static PNG.
+The shared graphic is posted in the dedicated Discord channel **1568424573836464208** (configurable with `EVENT_BOARD_CHANNEL_ID`). Event details and timed reminders stay in the `/event setup` reminder channel. The shared graphic is **created automatically on the first event** and updated, not reposted, whenever staff add, edit or cancel another event. Event start/end transitions also update the graphic, and a scheduled refresh updates its printed clock approximately once per hour. Discord cannot continuously animate the timestamp inside a static PNG.
 
 A separate **seven-day calendar** remains available privately with `/event calendar`, including **Previous Week**, **This Week**, **Next Week** and **Upcoming Events** controls. `/event calendar publish:True` creates or refreshes the combined Events board rather than creating another one-event picture.
 
 ### Staff setup and commands
 
-1. Configure `/event setup channel:#event-reminders notify_role:@SaS`. The role is optional and pinged only at event start.
+1. Configure `/event setup channel:#event-reminders notify_role:@SaS` for event details and timed reminders. The role is optional and pinged only at event start. The combined graphic goes to channel `1568424573836464208`, regardless of the reminder channel.
 2. Add events using `/event create title:Port Inspection start_utc:2026-11-06 00:00:00 end_utc:2026-11-08 23:59:59 category:Port Inspection`.
 3. Add another event such as `/event create title:Work Log start_utc:2026-11-06 00:00:00 end_utc:2026-11-08 23:59:59 category:Port Inspection`. The existing graphic automatically gains a second bar.
 4. Use `/event calendar` for the navigable weekly view and `/event upcoming` for event numbers and dates.
@@ -113,7 +113,7 @@ The scheduler checks approximately every 30 seconds, keeps event/subscriber/remi
 
 The bot **does not read Police Chief's game calendar automatically**. Staff must enter verified event times manually. The combined Events graphic shows up to 24 active/upcoming events at once, with the total count if there are more.
 
-The bot requires View Channel, Send Messages, Embed Links, Attach Files, and Read Message History permissions in its event channel; its application must be invited with the `applications.commands` scope.
+The bot requires View Channel, Send Messages, Embed Links, Attach Files, and Read Message History permissions in its reminder channel **and** the dedicated Event Center channel `1568424573836464208`. The bot needs Manage Messages only if you want it to remove an obsolete previous board message. The application must be invited with the `applications.commands` scope. If an older shared board exists in the reminder channel, the bot creates a fresh one in the dedicated channel, remembers the new message ID, and attempts to delete the old bot-owned overview after successful publication.
 
 Persist both `data/verification.json` and `data/events.sqlite3`. Run only one bot instance per event SQLite file to avoid duplicate notifications.
 

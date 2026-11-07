@@ -14,6 +14,7 @@ from event_graphics import weekly_calendar, event_board
 
 
 log = logging.getLogger('sas.events')
+DEFAULT_EVENT_BOARD_CHANNEL_ID = 1568424573836464208
 STAGES = (('24h', 86400), ('1h', 3600), ('15m', 900), ('start', 0))
 CATEGORIES = ('Alliance', 'Events', 'Deals', 'Port Inspection', 'Other')
 
@@ -33,7 +34,8 @@ class EventStore:
                 channel_id INTEGER NOT NULL,
                 role_id INTEGER,
                 calendar_message_id INTEGER,
-                calendar_refreshed_at INTEGER
+                calendar_refreshed_at INTEGER,
+                calendar_message_channel_id INTEGER
             );
             CREATE TABLE IF NOT EXISTS game_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -81,6 +83,9 @@ class EventStore:
             self.conn.execute('ALTER TABLE event_settings ADD COLUMN calendar_message_id INTEGER')
         if 'calendar_refreshed_at' not in settings_columns:
             self.conn.execute('ALTER TABLE event_settings ADD COLUMN calendar_refreshed_at INTEGER')
+        if 'calendar_message_channel_id' not in settings_columns:
+            self.conn.execute('ALTER TABLE event_settings ADD COLUMN calendar_message_channel_id INTEGER')
+        self.conn.execute('UPDATE event_settings SET calendar_message_channel_id=channel_id WHERE calendar_message_id IS NOT NULL AND calendar_message_channel_id IS NULL')
         columns = {row['name'] for row in self.conn.execute('PRAGMA table_info(game_events)')}
         if 'ends_at' not in columns:
             self.conn.execute('ALTER TABLE game_events ADD COLUMN ends_at INTEGER')
@@ -90,25 +95,35 @@ class EventStore:
 
     def set_channel(self, guild_id, channel_id, role_id):
         self.conn.execute(
-            'INSERT INTO event_settings(guild_id,channel_id,role_id) VALUES(?,?,?) ON CONFLICT(guild_id) DO UPDATE SET channel_id=excluded.channel_id,role_id=excluded.role_id,calendar_message_id=CASE WHEN channel_id=excluded.channel_id THEN calendar_message_id ELSE NULL END,calendar_refreshed_at=CASE WHEN channel_id=excluded.channel_id THEN calendar_refreshed_at ELSE NULL END',
+            'INSERT INTO event_settings(guild_id,channel_id,role_id) VALUES(?,?,?) ON CONFLICT(guild_id) DO UPDATE SET channel_id=excluded.channel_id,role_id=excluded.role_id',
             (guild_id, channel_id, role_id)
         )
 
     def settings(self, guild_id):
         return self.conn.execute('SELECT * FROM event_settings WHERE guild_id=?', (guild_id,)).fetchone()
 
-    def set_board(self, guild_id, message_id, now=None):
+    def set_board(self, guild_id, message_id, now=None, channel_id=None):
         now = int(datetime.now(timezone.utc).timestamp()) if now is None else now
+        if message_id is None:
+            channel_id = None
+        elif channel_id is None:
+            previous = self.settings(guild_id)
+            channel_id = previous['calendar_message_channel_id'] or previous['channel_id']
         self.conn.execute(
-            'UPDATE event_settings SET calendar_message_id=?,calendar_refreshed_at=? WHERE guild_id=?',
-            (message_id, now, guild_id)
+            'UPDATE event_settings SET calendar_message_id=?,calendar_refreshed_at=?,calendar_message_channel_id=? WHERE guild_id=?',
+            (message_id, now, channel_id, guild_id)
         )
 
-    def boards_to_refresh(self, now=None):
+    def boards_to_refresh(self, now=None, target_channel_id=None):
         now = int(datetime.now(timezone.utc).timestamp()) if now is None else now
+        if target_channel_id is None:
+            return self.conn.execute(
+                'SELECT * FROM event_settings WHERE calendar_message_id IS NOT NULL AND COALESCE(calendar_refreshed_at,0)<=?',
+                (now - 3600,)
+            ).fetchall()
         return self.conn.execute(
-            'SELECT * FROM event_settings WHERE calendar_message_id IS NOT NULL AND COALESCE(calendar_refreshed_at,0)<=?',
-            (now - 3600,)
+            'SELECT * FROM event_settings WHERE calendar_message_id IS NOT NULL AND (COALESCE(calendar_refreshed_at,0)<=? OR COALESCE(calendar_message_channel_id,channel_id)!=?)',
+            (now - 3600, target_channel_id)
         ).fetchall()
 
     def create(self, guild_id, channel_id, title, category, notes, starts_at, author_id, now=None, ends_at=None):
@@ -404,6 +419,7 @@ class EventCenter:
         self.store = EventStore(path)
         self.group_registered = False
         self.board_lock = asyncio.Lock()
+        self.board_channel_id = int(os.getenv('EVENT_BOARD_CHANNEL_ID', str(DEFAULT_EVENT_BOARD_CHANNEL_ID)))
 
     def is_staff(self, interaction):
         return bool(
@@ -525,29 +541,48 @@ class EventCenter:
         embed.timestamp = now
         return embed, file
 
+    def board_channel(self):
+        channel = self.bot.guild.get_channel(self.board_channel_id)
+        if not isinstance(channel, discord.TextChannel) or channel.id != self.board_channel_id:
+            return None
+        return channel
+
     async def ensure_board(self, guild_id, create=False):
         async with self.board_lock:
             settings = self.store.settings(guild_id)
             if settings is None:
                 return None
-            channel = self.bot.guild.get_channel(settings['channel_id'])
-            if not isinstance(channel, discord.TextChannel):
+            channel = self.board_channel()
+            if channel is None:
+                log.error('SaS Event Center channel %s is unavailable in this server', self.board_channel_id)
                 return None
-            message = None
-            if settings['calendar_message_id']:
+            previous_id = settings['calendar_message_id']
+            previous_channel_id = settings['calendar_message_channel_id'] or settings['channel_id']
+            same_channel = previous_channel_id == channel.id
+            if previous_id and same_channel:
                 try:
-                    message = await channel.fetch_message(settings['calendar_message_id'])
+                    message = await channel.fetch_message(previous_id)
                 except discord.NotFound:
                     self.store.set_board(guild_id, None)
-                if message:
+                else:
                     embed, file = self.board_payload(guild_id)
                     edited = await message.edit(embed=embed, attachments=[file], allowed_mentions=discord.AllowedMentions.none())
-                    self.store.set_board(guild_id, (edited or message).id)
-                    return edited or message
-            if create:
+                    result = edited or message
+                    self.store.set_board(guild_id, result.id, channel_id=channel.id)
+                    return result
+            if create or previous_id:
                 embed, file = self.board_payload(guild_id)
                 message = await channel.send(embed=embed, file=file, allowed_mentions=discord.AllowedMentions.none())
-                self.store.set_board(guild_id, message.id)
+                self.store.set_board(guild_id, message.id, channel_id=channel.id)
+                if previous_id and not same_channel:
+                    old_channel = self.bot.guild.get_channel(previous_channel_id)
+                    if isinstance(old_channel, discord.TextChannel):
+                        try:
+                            old_message = await old_channel.fetch_message(previous_id)
+                            if old_message.author.id == self.bot.user.id:
+                                await old_message.delete()
+                        except (discord.HTTPException, AttributeError):
+                            log.warning('Old SaS Event Center graphic could not be removed from channel %s', previous_channel_id)
                 return message
             return None
 
@@ -568,9 +603,9 @@ class EventCenter:
             settings = self.store.settings(interaction.guild_id)
             if settings is None:
                 return await interaction.response.send_message('Run /event setup first.', ephemeral=True)
-            channel = interaction.guild.get_channel(settings['channel_id'])
-            if not isinstance(channel, discord.TextChannel):
-                return await interaction.response.send_message('Configured calendar channel is unavailable.', ephemeral=True)
+            channel = self.board_channel()
+            if channel is None:
+                return await interaction.response.send_message(f'Event Center channel {self.board_channel_id} is unavailable. Check the channel ID and bot permissions.', ephemeral=True)
             await interaction.response.defer(ephemeral=True, thinking=True)
             try:
                 message = await self.ensure_board(interaction.guild_id, create=True)
@@ -645,7 +680,7 @@ class EventCenter:
                 )
             else:
                 await interaction.followup.send(
-                    f"Event #{event_id} was saved and posted in {channel.mention}, but the shared calendar could not be updated. Check bot permissions and run /event calendar publish:True.",
+                    f"Event #{event_id} was saved and posted in {channel.mention}, but the shared graphic could not be updated in <#{self.board_channel_id}>. Check bot permissions and run /event calendar publish:True.",
                     ephemeral=True
                 )
 
@@ -758,7 +793,7 @@ class EventCenter:
             await self.refresh_board_safe(self.bot.guild.id, create=True)
         elif phase_changed and settings and settings['calendar_message_id']:
             await self.refresh_board_safe(self.bot.guild.id)
-        for settings in self.store.boards_to_refresh(now):
+        for settings in self.store.boards_to_refresh(now, self.board_channel_id):
             await self.refresh_board_safe(settings['guild_id'])
         for job in self.store.due_dm():
             event = self.store.event(job['event_id'])
