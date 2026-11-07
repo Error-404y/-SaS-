@@ -10,7 +10,7 @@ import discord
 from discord import app_commands
 from discord.ext import tasks
 
-from event_graphics import event_banner, weekly_calendar
+from event_graphics import weekly_calendar
 
 
 log = logging.getLogger('sas.events')
@@ -685,38 +685,36 @@ class EventCenter:
         for reminder in self.store.due(now):
             event = self.store.event(reminder['event_id'])
             stage = reminder['stage']
-            if event['state'] != 'active' or now - reminder['due_at'] > 600:
+            if (event['state'] != 'active' or now >= event['ends_at']
+                    or now - reminder['due_at'] > 600
+                    or (stage != 'start' and now >= event['starts_at'])):
                 self.store.reminder_state(event['id'], stage, 'skipped')
                 continue
             channel = self.bot.guild.get_channel(event['channel_id'])
             if not isinstance(channel, discord.TextChannel):
                 continue
-            result = self.build_embed(event, stage)
-            extra = {}
-            try:
-                extra['file'] = discord.File(event_banner(event['title'], event['category'], stage, event['starts_at'], event['ends_at']), filename='sas_event_reminder.png')
-                result.set_image(url='attachment://sas_event_reminder.png')
-            except Exception:
-                log.exception('Unable to render reminder banner for event %s', event['id'])
             settings = self.store.settings(event['guild_id'])
             role = self.bot.guild.get_role(settings['role_id']) if settings and settings['role_id'] and stage == 'start' else None
             try:
                 message = await channel.send(
                     content=role.mention if role else None,
-                    embed=result,
-                    allowed_mentions=discord.AllowedMentions(roles=[role] if role else [], users=False, everyone=False),
-                    **extra
+                    embed=self.build_embed(event, stage),
+                    allowed_mentions=discord.AllowedMentions(roles=[role] if role else [], users=False, everyone=False)
                 )
             except discord.HTTPException:
-                log.exception('Failed to send event %s stage %s',event['id'],stage)
+                log.exception('Failed to send event %s stage %s', event['id'], stage)
                 continue
-            self.store.reminder_state(event['id'],stage,'sent',message.id)
-            if stage == 'start' and event['message_id']:
-                try:
-                    original = await channel.fetch_message(event['message_id'])
-                    await original.edit(embed=self.build_embed(event, 'start'), view=None)
-                except discord.HTTPException:
-                    log.exception('Could not close event panel %s',event['id'])
+            self.store.reminder_state(event['id'], stage, 'sent', message.id)
+        for event in self.store.cards_to_refresh(now):
+            try:
+                await self.sync_event_card(event)
+            except discord.NotFound:
+                self.store.mark_card_missing(event['id'])
+            except discord.HTTPException:
+                log.exception('Unable to refresh status on event #%s', event['id'])
+        settings = self.store.settings(self.bot.guild.id)
+        if settings and not settings['calendar_message_id'] and self.store.upcoming(self.bot.guild.id, now):
+            await self.refresh_board_safe(self.bot.guild.id, create=True)
         for settings in self.store.boards_to_refresh(now):
             await self.refresh_board_safe(settings['guild_id'])
         for job in self.store.due_dm():
@@ -724,7 +722,7 @@ class EventCenter:
             if event['state'] != 'active':
                 self.store.dm_state(job['event_id'], job['stage'], job['user_id'], 'skipped')
                 continue
-            if int(datetime.now(timezone.utc).timestamp()) >= event['starts_at'] + 300:
+            if int(datetime.now(timezone.utc).timestamp()) >= event['starts_at']:
                 self.store.dm_state(job['event_id'], job['stage'], job['user_id'], 'skipped')
                 continue
             message = self.build_embed(event,job['stage'])
