@@ -5,7 +5,7 @@ from pathlib import Path
 
 from PIL import Image
 
-from event_center import EventStore, EventReminderView, EventCenter, CalendarNavigation, parse_utc, event_phase
+from event_center import EventStore, EventCenter, CalendarNavigation, parse_utc, event_phase
 from bot import VerificationBot
 from unittest.mock import patch, MagicMock, AsyncMock
 import os
@@ -26,45 +26,36 @@ class EventStoreTests(unittest.IsolatedAsyncioTestCase):
     def create(self, start_offset=90000):
         return self.store.create(1, 2, 'Alliance Training', 'Alliance', 'Prepare your team.', self.now + start_offset, 5, self.now)
 
-    def test_all_four_reminder_times(self):
+    def test_only_one_hour_member_ping_is_scheduled(self):
         event_id = self.create()
         reminders = self.store.conn.execute(
-            'SELECT stage,due_at FROM event_reminders WHERE event_id=? ORDER BY due_at',
+            'SELECT stage,due_at FROM event_reminders WHERE event_id=?',
             (event_id,)
         ).fetchall()
-        self.assertEqual([row['stage'] for row in reminders], ['24h', '1h', '15m', 'start'])
-        self.assertEqual([row['due_at'] for row in reminders],
-                         [self.now + 3600, self.now + 86400, self.now + 89100, self.now + 90000])
+        self.assertEqual([(row['stage'], row['due_at']) for row in reminders],
+                         [('1h', self.now + 86400)])
 
-    def test_late_creation_skips_missed_reminders(self):
+    def test_no_member_ping_if_event_begins_less_than_one_hour_away(self):
         event_id = self.create(1800)
         stages = [row['stage'] for row in self.store.conn.execute(
             'SELECT stage FROM event_reminders WHERE event_id=?', (event_id,)
         )]
-        self.assertEqual(stages, ['15m', 'start'])
+        self.assertEqual(stages, [])
 
-    def test_subscriptions_and_dm_delivery_are_opt_in(self):
+    def test_member_ping_state_is_persistent_and_once_only(self):
         event_id = self.create()
-        self.assertTrue(self.store.subscribe(event_id, 42, self.now))
-        self.store.reminder_state(event_id, '1h', 'sent', 123)
-        jobs = self.store.conn.execute('SELECT * FROM event_dm_jobs WHERE event_id=?',(event_id,)).fetchall()
-        self.assertEqual([(job['user_id'],job['stage']) for job in jobs], [(42,'1h')])
-        self.store.unsubscribe(event_id, 42)
-        self.assertEqual(self.store.subscriber_count(event_id), 0)
-        self.assertEqual(self.store.conn.execute('SELECT state FROM event_dm_jobs').fetchone()['state'],'skipped')
-
-    def test_one_reminder_can_only_be_marked_once(self):
-        event_id = self.create()
-        self.store.reminder_state(event_id,'24h','sent',100)
-        self.store.reminder_state(event_id,'24h','sent',200)
-        row = self.store.conn.execute('SELECT * FROM event_reminders WHERE event_id=? AND stage=?',(event_id,'24h')).fetchone()
-        self.assertEqual(row['message_id'],100)
+        self.store.reminder_state(event_id, '1h', 'sent', 100)
+        self.store.reminder_state(event_id, '1h', 'sent', 200)
+        row = self.store.conn.execute(
+            "SELECT state,message_id FROM event_reminders WHERE event_id=? AND stage='1h'",
+            (event_id,)
+        ).fetchone()
+        self.assertEqual((row['state'],row['message_id']), ('sent',100))
+        self.assertEqual(self.store.due(self.now + 86401), [])
 
     def test_cancel_stops_all_pending(self):
         event_id = self.create()
-        self.store.subscribe(event_id, 42, self.now)
         self.assertTrue(self.store.cancel(event_id, 1))
-        self.assertFalse(self.store.subscribe(event_id, 42, self.now))
         self.assertFalse(self.store.cancel(event_id, 1))
         states = {row['state'] for row in self.store.conn.execute('SELECT state FROM event_reminders')}
         self.assertEqual(states, {'skipped'})
@@ -80,20 +71,19 @@ class EventStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(event_id, [row['id'] for row in rows])
         self.assertEqual(self.store.event(event_id)['ends_at'], self.now + 4 * 86400)
 
-    def test_rescheduling_rebuilds_reminders_preserving_subscribers(self):
+    def test_rescheduling_rebuilds_one_hour_member_alert(self):
         event_id = self.create()
-        self.store.subscribe(event_id, 19, self.now)
-        self.store.reminder_state(event_id, '24h', 'sent', 884)
+        self.store.reminder_state(event_id, '1h', 'sent', 884)
         new_start = self.now + 100000
         self.assertTrue(self.store.edit(event_id, 1, 'Alliance Training', 'Alliance', 'Ready',
                                         new_start, new_start + 7200, now=self.now))
         self.assertEqual(self.store.event(event_id)['title'], 'Alliance Training')
-        self.assertEqual(self.store.subscriber_count(event_id), 1)
         scheduled = self.store.conn.execute(
             'SELECT stage,state,due_at FROM event_reminders WHERE event_id=?',
             (event_id,)
         ).fetchall()
-        self.assertEqual(len(scheduled), 4)
+        self.assertEqual(len(scheduled), 1)
+        self.assertEqual(scheduled[0]['stage'], '1h')
         self.assertTrue(all(row['state'] == 'pending' for row in scheduled))
         self.assertFalse(self.store.edit(event_id, 999, 'a', 'Other', '', new_start, new_start + 7200, now=self.now))
 
@@ -228,13 +218,6 @@ class EventStoreTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             parse_utc('2020-01-01 18:00',now=1800000000)
 
-    async def test_preview_view_is_persistent(self):
-        class Stub:
-            pass
-        buttons = EventReminderView(Stub())
-        self.assertEqual([c.label for c in buttons.children], ['Remind Me', 'Stop Reminders', 'View Schedule'])
-        self.assertTrue(buttons.is_persistent())
-
 
 
 class EventCommandTests(unittest.IsolatedAsyncioTestCase):
@@ -249,7 +232,7 @@ class EventCommandTests(unittest.IsolatedAsyncioTestCase):
                 group = next(command for command in commands if command.name == 'event')
                 self.assertEqual(
                     sorted(command.name for command in group.commands),
-                    ['calendar', 'cancel', 'create', 'edit', 'remind', 'setup', 'unremind', 'upcoming', 'updates']
+                    ['calendar', 'cancel', 'create', 'edit', 'setup', 'upcoming', 'updates']
                 )
                 await bot.close()
 
@@ -498,8 +481,8 @@ class EventCreationIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(bot.events.store.settings(1)['text_message_id'], text_message.id)
                 self.assertEqual(bot.events.store.settings(1)['text_message_channel_id'], 1568431370747908291)
                 self.assertEqual(bot.events.store.board_event_count(1), 2)
-                self.assertEqual(group.get_command('remind').name, 'remind')
-                self.assertEqual(group.get_command('unremind').name, 'unremind')
+                self.assertIsNone(group.get_command('remind'))
+                self.assertIsNone(group.get_command('unremind'))
                 await bot.close()
 
     async def test_shared_text_feed_migrates_without_duplicates(self):
