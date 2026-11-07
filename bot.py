@@ -17,7 +17,7 @@ from delivery import EditDeferred, EditPacer
 from time_utils import zurich_time, ZurichFormatter
 from views import VerifyView, ReviewView, PauseControls, embed, reply, valid_username
 from identity import nickname, profile_from_member, clean_clan, valid_clan
-from event_center import EventCenter, EventReminderView
+from event_center import EventCenter
 
 load_dotenv()
 log = logging.getLogger('verification')
@@ -62,7 +62,6 @@ class VerificationBot(discord.Client):
         self.add_view(VerifyView(self))
         self.add_view(ReviewView(self))
         self.add_view(PauseControls(self))
-        self.add_view(EventReminderView(self.events))
 
     def public_context(self, interaction):
         return bool(self.configured and self.guild and interaction.guild_id == self.guild.id
