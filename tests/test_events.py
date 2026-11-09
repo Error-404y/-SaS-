@@ -53,6 +53,49 @@ class EventStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((row['state'],row['message_id']), ('sent',100))
         self.assertEqual(self.store.due(self.now + 86401), [])
 
+    def test_pings_expire_exactly_24_hours_after_send(self):
+        event_id = self.create()
+        self.assertTrue(self.store.record_sent_ping(event_id, 999, 1568431370747908291, sent_at=self.now))
+        self.assertEqual(self.store.expired_pings(self.now + 86399), [])
+        due = self.store.expired_pings(self.now + 86400)
+        self.assertEqual([(row['message_id'], row['channel_id']) for row in due],
+                         [(999, 1568431370747908291)])
+        self.store.ping_cleanup_state(999, 'deleted')
+        self.assertEqual(self.store.expired_pings(self.now + 86401), [])
+        self.store.close()
+        self.store = EventStore(Path(self.directory.name) / 'events.sqlite3')
+        self.assertEqual(self.store.expired_pings(self.now + 86402), [])
+
+    def test_rescheduling_and_cancelling_cannot_orphan_reminder_cleanup(self):
+        first = self.create()
+        self.store.record_sent_ping(first, 998, 1568431370747908291, sent_at=self.now)
+        new_start = self.now + 101000
+        self.assertTrue(self.store.edit(first, 1, 'Changed time', 'Alliance', '',
+                                        new_start, new_start + 3600, now=self.now))
+        self.assertEqual([row['message_id'] for row in self.store.expired_pings(self.now+86400)], [998])
+        second = self.create()
+        self.store.record_sent_ping(second, 997, 1568431370747908291, sent_at=self.now)
+        self.store.cancel(second, 1)
+        self.assertEqual(set(row['message_id'] for row in self.store.expired_pings(self.now+86400)),
+                         {997, 998})
+
+    def test_old_sent_ping_records_are_migrated_but_shared_embeds_are_excluded(self):
+        self.store.set_channel(1, 88, None)
+        self.store.set_text_message(1, 111, 1568431370747908291, now=self.now)
+        self.store.set_board(1, 222, now=self.now, channel_id=1568424573836464208)
+        for message_id in (111, 222, 333):
+            eid = self.create()
+            self.store.reminder_state(eid, '1h', 'sent', message_id)
+        self.store.close()
+        self.store = EventStore(Path(self.directory.name) / 'events.sqlite3')
+        due = self.store.expired_pings(self.now + 172800)
+        self.assertEqual([row['message_id'] for row in due], [333])
+        self.assertEqual(due[0]['channel_id'], 1568431370747908291)
+        self.store.ping_cleanup_state(333, 'deleted')
+        self.store.close()
+        self.store = EventStore(Path(self.directory.name) / 'events.sqlite3')
+        self.assertEqual(self.store.expired_pings(self.now + 172800), [])
+
     def test_cancel_stops_all_pending(self):
         event_id = self.create()
         self.assertTrue(self.store.cancel(event_id, 1))
@@ -590,6 +633,12 @@ class EventCreationIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 (event_id,)
             ).fetchone()
             self.assertEqual((record['state'],record['message_id']), ('sent',9876))
+            tracked = manager.store.conn.execute(
+                'SELECT channel_id,status FROM event_ping_messages WHERE message_id=?',
+                (9876,)
+            ).fetchone()
+            self.assertEqual((tracked['channel_id'],tracked['status']),
+                             (1568431370747908291,'pending'))
             await manager.scheduler.coro(manager)
             self.assertEqual(channel.send.await_count, 2)
             bot.fetch_user.assert_not_awaited()
@@ -650,6 +699,104 @@ class EventCreationIntegrationTests(unittest.IsolatedAsyncioTestCase):
             message.delete.assert_awaited_once()
             self.assertIsNone(manager.store.event(record)['message_id'])
             manager.close()
+
+class EventPingCleanupTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.channel = MagicMock(spec=discord.TextChannel)
+        self.channel.id = 1568431370747908291
+        self.channel.fetch_message = AsyncMock()
+        self.guild = MagicMock()
+        self.guild.id = 1
+        self.guild.get_channel.side_effect = lambda cid: self.channel if cid == self.channel.id else None
+        self.bot = MagicMock()
+        self.bot.guild = self.guild
+        self.bot.user.id = 2020
+        self.manager = EventCenter(self.bot, Path(self.directory.name) / 'events.sqlite3')
+        self.now = int(datetime.now(timezone.utc).timestamp())
+        self.manager.store.set_channel(1, 88, None)
+
+    def tearDown(self):
+        self.manager.close()
+        self.directory.cleanup()
+
+    def track(self, message_id, sent_at):
+        event_id = self.manager.store.create(
+            1, 88, 'Oilfield Strike', 'Alliance', '',
+            self.now + 90000, 5, now=self.now,
+            ends_at=self.now + 92000
+        )
+        self.manager.store.record_sent_ping(
+            event_id, message_id, self.channel.id, sent_at=sent_at
+        )
+        return event_id
+
+    async def test_deletes_expired_bot_ping_once_at_24_hours(self):
+        self.track(2021, self.now - 86400)
+        ping = MagicMock()
+        ping.author.id = self.bot.user.id
+        ping.content = '<@&1562535352290250842> **1-hour event reminder | Oilfield Strike**'
+        ping.delete = AsyncMock()
+        self.channel.fetch_message.return_value = ping
+        await self.manager.cleanup_expired_member_pings(self.now-1)
+        self.channel.fetch_message.assert_not_awaited()
+        await self.manager.cleanup_expired_member_pings(self.now)
+        self.channel.fetch_message.assert_awaited_once_with(2021)
+        ping.delete.assert_awaited_once()
+        self.assertEqual(self.manager.store.conn.execute(
+            'SELECT status FROM event_ping_messages WHERE message_id=2021'
+        ).fetchone()['status'], 'deleted')
+        await self.manager.cleanup_expired_member_pings(self.now + 100)
+        ping.delete.assert_awaited_once()
+
+    async def test_does_not_delete_shared_list_or_someone_elses_message(self):
+        self.track(2022, self.now - 86401)
+        self.track(2023, self.now - 86401)
+        shared_list = MagicMock()
+        shared_list.author.id = self.bot.user.id
+        shared_list.content = ''
+        shared_list.delete = AsyncMock()
+        stranger = MagicMock()
+        stranger.author.id = 1234
+        stranger.content = '**1-hour event reminder | Imposter**'
+        stranger.delete = AsyncMock()
+        self.channel.fetch_message.side_effect = [shared_list, stranger]
+        await self.manager.cleanup_expired_member_pings(self.now)
+        shared_list.delete.assert_not_awaited()
+        stranger.delete.assert_not_awaited()
+        rows = self.manager.store.conn.execute(
+            "SELECT status FROM event_ping_messages ORDER BY message_id"
+        ).fetchall()
+        self.assertEqual([r['status'] for r in rows], ['ignored', 'ignored'])
+
+    async def test_missing_ping_is_marked_cleaned(self):
+        self.track(2024, self.now - 86400)
+        response = MagicMock()
+        response.status = 404
+        response.reason = 'Not Found'
+        self.channel.fetch_message.side_effect = discord.NotFound(response, 'Unknown Message')
+        await self.manager.cleanup_expired_member_pings(self.now)
+        self.assertEqual(self.manager.store.conn.execute(
+            'SELECT status FROM event_ping_messages WHERE message_id=2024'
+        ).fetchone()['status'], 'missing')
+
+    async def test_transient_fetch_failure_retries_instead_of_abandoning_cleanup(self):
+        self.track(2025, self.now - 86400)
+        response = MagicMock()
+        response.status = 503
+        response.reason = 'Unavailable'
+        self.channel.fetch_message.side_effect = discord.HTTPException(response, 'Temporarily unavailable')
+        await self.manager.cleanup_expired_member_pings(self.now)
+        self.assertEqual([r['message_id'] for r in self.manager.store.expired_pings(self.now)], [2025])
+        message = MagicMock()
+        message.author.id = self.bot.user.id
+        message.content = '<@&1562535352290250842> **1-hour event reminder | Oilfield Strike**'
+        message.delete = AsyncMock()
+        self.channel.fetch_message.side_effect = None
+        self.channel.fetch_message.return_value = message
+        await self.manager.cleanup_expired_member_pings(self.now + 1)
+        message.delete.assert_awaited_once()
+
 
 class CalendarImageTests(unittest.TestCase):
     def test_illustrated_calendar_shows_week_and_event_ranges(self):

@@ -18,6 +18,7 @@ DEFAULT_EVENT_BOARD_CHANNEL_ID = 1568424573836464208
 DEFAULT_EVENT_TEXT_CHANNEL_ID = 1568431370747908291
 DEFAULT_EVENT_MEMBER_ROLE_ID = 1562535352290250842
 STAGES = (('1h', 3600),)
+PING_RETENTION_SECONDS = 24 * 3600
 CATEGORIES = ('Alliance', 'Events', 'Deals', 'Port Inspection', 'Other')
 
 
@@ -82,6 +83,16 @@ class EventStore:
                 PRIMARY KEY(event_id,stage,user_id),
                 FOREIGN KEY(event_id) REFERENCES game_events(id)
             );
+            CREATE TABLE IF NOT EXISTS event_ping_messages (
+                message_id INTEGER PRIMARY KEY,
+                event_id INTEGER NOT NULL,
+                channel_id INTEGER NOT NULL,
+                sent_at INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                FOREIGN KEY(event_id) REFERENCES game_events(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_event_ping_cleanup
+                ON event_ping_messages(status, sent_at);
         """)
         settings_columns = {row['name'] for row in self.conn.execute('PRAGMA table_info(event_settings)')}
         if 'calendar_message_id' not in settings_columns:
@@ -102,6 +113,17 @@ class EventStore:
         self.conn.execute('UPDATE game_events SET ends_at=starts_at+3600 WHERE ends_at IS NULL')
         self.conn.execute("UPDATE event_reminders SET state='skipped' WHERE state='pending' AND stage!='1h'")
         self.conn.execute("UPDATE event_dm_jobs SET state='skipped' WHERE state='pending'")
+        self.conn.execute("""
+            INSERT OR IGNORE INTO event_ping_messages(message_id, event_id, channel_id, sent_at, status)
+            SELECT r.message_id, r.event_id,
+                   COALESCE(s.text_message_channel_id, ?), r.due_at, 'pending'
+            FROM event_reminders r
+            JOIN game_events e ON e.id=r.event_id
+            LEFT JOIN event_settings s ON s.guild_id=e.guild_id
+            WHERE r.stage='1h' AND r.state='sent' AND r.message_id IS NOT NULL
+              AND (s.text_message_id IS NULL OR s.text_message_id!=r.message_id)
+              AND (s.calendar_message_id IS NULL OR s.calendar_message_id!=r.message_id)
+        """, (DEFAULT_EVENT_TEXT_CHANNEL_ID,))
 
     def set_channel(self, guild_id, channel_id, role_id):
         self.conn.execute(
@@ -321,6 +343,43 @@ class EventStore:
         self.conn.execute(
             'UPDATE event_reminders SET state=?,message_id=? WHERE event_id=? AND stage=? AND state=?',
             (state, message_id, event_id, stage, 'pending')
+        )
+
+    def record_sent_ping(self, event_id, message_id, channel_id, sent_at=None):
+        sent_at = int(datetime.now(timezone.utc).timestamp()) if sent_at is None else sent_at
+        self.conn.execute('BEGIN IMMEDIATE')
+        try:
+            cursor = self.conn.execute(
+                """UPDATE event_reminders SET state='sent', message_id=?
+                   WHERE event_id=? AND stage='1h' AND state='pending'""",
+                (message_id, event_id)
+            )
+            self.conn.execute(
+                """INSERT OR IGNORE INTO event_ping_messages
+                   (message_id, event_id, channel_id, sent_at) VALUES(?,?,?,?)""",
+                (message_id, event_id, channel_id, sent_at)
+            )
+            self.conn.execute('COMMIT')
+            return cursor.rowcount == 1
+        except Exception:
+            self.conn.execute('ROLLBACK')
+            raise
+
+    def expired_pings(self, now=None, limit=20):
+        now = int(datetime.now(timezone.utc).timestamp()) if now is None else now
+        return self.conn.execute(
+            """SELECT * FROM event_ping_messages
+               WHERE status='pending' AND sent_at<=?
+               ORDER BY sent_at, message_id LIMIT ?""",
+            (now - PING_RETENTION_SECONDS, limit)
+        ).fetchall()
+
+    def ping_cleanup_state(self, message_id, status):
+        if status not in ('deleted', 'missing', 'ignored', 'blocked'):
+            raise ValueError('Invalid ping cleanup state.')
+        self.conn.execute(
+            "UPDATE event_ping_messages SET status=? WHERE message_id=? AND status='pending'",
+            (status, message_id)
         )
 
     def due_dm(self):
@@ -865,6 +924,43 @@ class EventCenter:
             allowed_mentions=discord.AllowedMentions(everyone=False, users=False, roles=[role])
         )
 
+    async def cleanup_expired_member_pings(self, now=None):
+        now = int(datetime.now(timezone.utc).timestamp()) if now is None else now
+        for ping in self.store.expired_pings(now):
+            channel = self.bot.guild.get_channel(ping['channel_id'])
+            if not isinstance(channel, discord.TextChannel):
+                log.warning('Event ping #%s cleanup delayed: channel %s unavailable', ping['message_id'], ping['channel_id'])
+                continue
+            try:
+                message = await channel.fetch_message(ping['message_id'])
+            except discord.NotFound:
+                self.store.ping_cleanup_state(ping['message_id'], 'missing')
+                continue
+            except discord.Forbidden:
+                log.error('Cannot fetch old Event ping #%s: channel permissions denied', ping['message_id'])
+                self.store.ping_cleanup_state(ping['message_id'], 'blocked')
+                continue
+            except discord.HTTPException:
+                log.exception('Temporary failure fetching expired ping #%s', ping['message_id'])
+                continue
+
+            if (self.bot.user is None
+                    or message.author.id != self.bot.user.id
+                    or '1-hour event reminder |' not in (message.content or '')):
+                self.store.ping_cleanup_state(ping['message_id'], 'ignored')
+                continue
+            try:
+                await message.delete()
+            except discord.NotFound:
+                self.store.ping_cleanup_state(ping['message_id'], 'missing')
+            except discord.Forbidden:
+                log.error('Cannot delete expired Event ping #%s: channel permissions denied', ping['message_id'])
+                self.store.ping_cleanup_state(ping['message_id'], 'blocked')
+            except discord.HTTPException:
+                log.exception('Temporary failure deleting expired ping #%s', ping['message_id'])
+            else:
+                self.store.ping_cleanup_state(ping['message_id'], 'deleted')
+
     @tasks.loop(seconds=30)
     async def scheduler(self):
         if not self.bot.configured:
@@ -883,7 +979,7 @@ class EventCenter:
                 log.exception('Failed to ping Member role for event #%s', event['id'])
                 continue
             if message is not None:
-                self.store.reminder_state(event['id'], '1h', 'sent', message.id)
+                self.store.record_sent_ping(event['id'], message.id, self.text_channel_id)
         settings = self.store.settings(self.bot.guild.id)
         if settings and not settings['text_message_id'] and self.store.upcoming(self.bot.guild.id, now):
             await self.refresh_text_safe(self.bot.guild.id, create=True)
@@ -896,6 +992,7 @@ class EventCenter:
             await self.refresh_board_safe(self.bot.guild.id, create=True)
         for item in self.store.boards_to_refresh(now, self.board_channel_id):
             await self.refresh_board_safe(item['guild_id'])
+        await self.cleanup_expired_member_pings(now)
     @scheduler.before_loop
     async def before_scheduler(self):
         await self.bot.wait_until_ready()

@@ -106,6 +106,8 @@ The graphical Events overview in channel `1568424573836464208` and the shared wr
 
 No `/event remind` or `/event unremind` commands, reminder buttons, opt-in subscriptions or DM alerts are used. Old pending 24-hour, 15-minute, start, and DM jobs are disabled when the upgraded bot opens its existing database; pending 1-hour notices remain eligible. Only events created more than one hour before their start can receive the 1-hour notice. Reminders overdue by more than 10 minutes are skipped, and past or cancelled events do not get alerted. Successfully delivered reminders are marked as sent in SQLite to prevent normal duplicate pings after restarts.
 
+**Automatic cleanup:** Each one-hour @Member ping is automatically deleted **24 hours after it was posted**. The scheduler checks for expired pings approximately every 30 seconds. It deletes only bot-authored messages containing the one-hour event reminder marker, never the permanent Event Updates embed, graphic, or messages from others. If someone already removed a ping, the bot records it as cleaned without error. Temporary Discord errors are retried, and cleanup resumes after downtime/restarts. Legacy one-hour pings already recorded by earlier versions are imported safely using their scheduled send time as an approximate timestamp; the bot preserves existing shared-message IDs. Cleanup tracking remains valid even if an event is rescheduled or cancelled.
+
 The bot must have **Mention @everyone, @here, and All Roles** permission in the Event Updates channel, unless the Member role is configured as mentionable, in addition to normal send permissions. A role mention notifies users according to their own Discord notification settings; the bot does not individually DM role members.
 
 ### Requirements
