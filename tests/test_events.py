@@ -53,6 +53,49 @@ class EventStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((row['state'],row['message_id']), ('sent',100))
         self.assertEqual(self.store.due(self.now + 86401), [])
 
+    def test_pings_expire_exactly_24_hours_after_send(self):
+        event_id = self.create()
+        self.assertTrue(self.store.record_sent_ping(event_id, 999, 1568431370747908291, sent_at=self.now))
+        self.assertEqual(self.store.expired_pings(self.now + 86399), [])
+        due = self.store.expired_pings(self.now + 86400)
+        self.assertEqual([(row['message_id'], row['channel_id']) for row in due],
+                         [(999, 1568431370747908291)])
+        self.store.ping_cleanup_state(999, 'deleted')
+        self.assertEqual(self.store.expired_pings(self.now + 86401), [])
+        self.store.close()
+        self.store = EventStore(Path(self.directory.name) / 'events.sqlite3')
+        self.assertEqual(self.store.expired_pings(self.now + 86402), [])
+
+    def test_rescheduling_and_cancelling_cannot_orphan_reminder_cleanup(self):
+        first = self.create()
+        self.store.record_sent_ping(first, 998, 1568431370747908291, sent_at=self.now)
+        new_start = self.now + 101000
+        self.assertTrue(self.store.edit(first, 1, 'Changed time', 'Alliance', '',
+                                        new_start, new_start + 3600, now=self.now))
+        self.assertEqual([row['message_id'] for row in self.store.expired_pings(self.now+86400)], [998])
+        second = self.create()
+        self.store.record_sent_ping(second, 997, 1568431370747908291, sent_at=self.now)
+        self.store.cancel(second, 1)
+        self.assertEqual(set(row['message_id'] for row in self.store.expired_pings(self.now+86400)),
+                         {997, 998})
+
+    def test_old_sent_ping_records_are_migrated_but_shared_embeds_are_excluded(self):
+        self.store.set_channel(1, 88, None)
+        self.store.set_text_message(1, 111, 1568431370747908291, now=self.now)
+        self.store.set_board(1, 222, now=self.now, channel_id=1568424573836464208)
+        for message_id in (111, 222, 333):
+            eid = self.create()
+            self.store.reminder_state(eid, '1h', 'sent', message_id)
+        self.store.close()
+        self.store = EventStore(Path(self.directory.name) / 'events.sqlite3')
+        due = self.store.expired_pings(self.now + 90000)
+        self.assertEqual([row['message_id'] for row in due], [333])
+        self.assertEqual(due[0]['channel_id'], 1568431370747908291)
+        self.store.ping_cleanup_state(333, 'deleted')
+        self.store.close()
+        self.store = EventStore(Path(self.directory.name) / 'events.sqlite3')
+        self.assertEqual(self.store.expired_pings(self.now + 90000), [])
+
     def test_cancel_stops_all_pending(self):
         event_id = self.create()
         self.assertTrue(self.store.cancel(event_id, 1))
@@ -590,6 +633,12 @@ class EventCreationIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 (event_id,)
             ).fetchone()
             self.assertEqual((record['state'],record['message_id']), ('sent',9876))
+            tracked = manager.store.conn.execute(
+                'SELECT channel_id,status FROM event_ping_messages WHERE message_id=?',
+                (9876,)
+            ).fetchone()
+            self.assertEqual((tracked['channel_id'],tracked['status']),
+                             (1568431370747908291,'pending'))
             await manager.scheduler.coro(manager)
             self.assertEqual(channel.send.await_count, 2)
             bot.fetch_user.assert_not_awaited()
