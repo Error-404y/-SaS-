@@ -356,12 +356,11 @@ class EventStore:
                    WHERE event_id=? AND stage='1h' AND state='pending'""",
                 (message_id, event_id)
             )
-            if cursor.rowcount:
-                self.conn.execute(
-                    """INSERT OR IGNORE INTO event_ping_messages
-                       (message_id, event_id, channel_id, sent_at) VALUES(?,?,?,?)""",
-                    (message_id, event_id, channel_id, sent_at)
-                )
+            self.conn.execute(
+                """INSERT OR IGNORE INTO event_ping_messages
+                   (message_id, event_id, channel_id, sent_at) VALUES(?,?,?,?)""",
+                (message_id, event_id, channel_id, sent_at)
+            )
             self.conn.execute('COMMIT')
             return cursor.rowcount == 1
         except Exception:
@@ -927,6 +926,44 @@ class EventCenter:
             allowed_mentions=discord.AllowedMentions(everyone=False, users=False, roles=[role])
         )
 
+    async def cleanup_expired_member_pings(self, now=None):
+        now = int(datetime.now(timezone.utc).timestamp()) if now is None else now
+        for ping in self.store.expired_pings(now):
+            channel = self.bot.guild.get_channel(ping['channel_id'])
+            if not isinstance(channel, discord.TextChannel):
+                log.warning('Event ping #%s cleanup delayed: channel %s unavailable', ping['message_id'], ping['channel_id'])
+                continue
+            try:
+                message = await channel.fetch_message(ping['message_id'])
+            except discord.NotFound:
+                self.store.ping_cleanup_state(ping['message_id'], 'missing')
+                continue
+            except discord.Forbidden:
+                log.error('Cannot fetch old Event ping #%s: channel permissions denied', ping['message_id'])
+                self.store.ping_cleanup_state(ping['message_id'], 'blocked')
+                continue
+            except discord.HTTPException:
+                log.exception('Temporary failure fetching expired ping #%s', ping['message_id'])
+                continue
+
+            # Never remove the shared event list, graphic, or messages from other users.
+            if (self.bot.user is None
+                    or message.author.id != self.bot.user.id
+                    or '1-hour event reminder |' not in (message.content or '')):
+                self.store.ping_cleanup_state(ping['message_id'], 'ignored')
+                continue
+            try:
+                await message.delete()
+            except discord.NotFound:
+                self.store.ping_cleanup_state(ping['message_id'], 'missing')
+            except discord.Forbidden:
+                log.error('Cannot delete expired Event ping #%s: channel permissions denied', ping['message_id'])
+                self.store.ping_cleanup_state(ping['message_id'], 'blocked')
+            except discord.HTTPException:
+                log.exception('Temporary failure deleting expired ping #%s', ping['message_id'])
+            else:
+                self.store.ping_cleanup_state(ping['message_id'], 'deleted')
+
     @tasks.loop(seconds=30)
     async def scheduler(self):
         if not self.bot.configured:
@@ -945,7 +982,7 @@ class EventCenter:
                 log.exception('Failed to ping Member role for event #%s', event['id'])
                 continue
             if message is not None:
-                self.store.reminder_state(event['id'], '1h', 'sent', message.id)
+                self.store.record_sent_ping(event['id'], message.id, self.text_channel_id)
         settings = self.store.settings(self.bot.guild.id)
         if settings and not settings['text_message_id'] and self.store.upcoming(self.bot.guild.id, now):
             await self.refresh_text_safe(self.bot.guild.id, create=True)
@@ -958,6 +995,7 @@ class EventCenter:
             await self.refresh_board_safe(self.bot.guild.id, create=True)
         for item in self.store.boards_to_refresh(now, self.board_channel_id):
             await self.refresh_board_safe(item['guild_id'])
+        await self.cleanup_expired_member_pings(now)
     @scheduler.before_loop
     async def before_scheduler(self):
         await self.bot.wait_until_ready()
