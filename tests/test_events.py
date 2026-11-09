@@ -88,13 +88,13 @@ class EventStoreTests(unittest.IsolatedAsyncioTestCase):
             self.store.reminder_state(eid, '1h', 'sent', message_id)
         self.store.close()
         self.store = EventStore(Path(self.directory.name) / 'events.sqlite3')
-        due = self.store.expired_pings(self.now + 90000)
+        due = self.store.expired_pings(self.now + 172800)
         self.assertEqual([row['message_id'] for row in due], [333])
         self.assertEqual(due[0]['channel_id'], 1568431370747908291)
         self.store.ping_cleanup_state(333, 'deleted')
         self.store.close()
         self.store = EventStore(Path(self.directory.name) / 'events.sqlite3')
-        self.assertEqual(self.store.expired_pings(self.now + 90000), [])
+        self.assertEqual(self.store.expired_pings(self.now + 172800), [])
 
     def test_cancel_stops_all_pending(self):
         event_id = self.create()
