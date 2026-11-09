@@ -43,6 +43,7 @@ class IncidentBroadcastTests(unittest.IsolatedAsyncioTestCase):
             permissions.view_channel = True
             permissions.send_messages = True
             permissions.embed_links = True
+            permissions.read_message_history = True
 
             async def send_message(cid=channel_id, **kwargs):
                 message = MagicMock()
