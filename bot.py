@@ -59,7 +59,7 @@ class VerificationBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
         events_path = os.getenv('EVENT_DATABASE_PATH', str(Path(self.db.path).with_name('events.sqlite3')))
         self.events = EventCenter(self, events_path)
-        self.incident_broadcast = IncidentBroadcast(self)
+        self.incident_broadcast = IncidentBroadcast(self, os.getenv('INCIDENT_DATABASE_PATH', 'data/sas_incidents.sqlite3'))
 
     async def setup_hook(self):
         self.add_view(VerifyView(self))
