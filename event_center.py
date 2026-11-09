@@ -113,8 +113,6 @@ class EventStore:
         self.conn.execute('UPDATE game_events SET ends_at=starts_at+3600 WHERE ends_at IS NULL')
         self.conn.execute("UPDATE event_reminders SET state='skipped' WHERE state='pending' AND stage!='1h'")
         self.conn.execute("UPDATE event_dm_jobs SET state='skipped' WHERE state='pending'")
-        # Existing role pings were sent before cleanup tracking existed.
-        # Do not import older reminders pointing at the shared embed or graphic.
         self.conn.execute("""
             INSERT OR IGNORE INTO event_ping_messages(message_id, event_id, channel_id, sent_at, status)
             SELECT r.message_id, r.event_id,
@@ -946,7 +944,6 @@ class EventCenter:
                 log.exception('Temporary failure fetching expired ping #%s', ping['message_id'])
                 continue
 
-            # Never remove the shared event list, graphic, or messages from other users.
             if (self.bot.user is None
                     or message.author.id != self.bot.user.id
                     or '1-hour event reminder |' not in (message.content or '')):
