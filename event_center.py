@@ -18,6 +18,7 @@ DEFAULT_EVENT_BOARD_CHANNEL_ID = 1568424573836464208
 DEFAULT_EVENT_TEXT_CHANNEL_ID = 1568431370747908291
 DEFAULT_EVENT_MEMBER_ROLE_ID = 1562535352290250842
 STAGES = (('1h', 3600),)
+PING_RETENTION_SECONDS = 24 * 3600
 CATEGORIES = ('Alliance', 'Events', 'Deals', 'Port Inspection', 'Other')
 
 
@@ -82,6 +83,16 @@ class EventStore:
                 PRIMARY KEY(event_id,stage,user_id),
                 FOREIGN KEY(event_id) REFERENCES game_events(id)
             );
+            CREATE TABLE IF NOT EXISTS event_ping_messages (
+                message_id INTEGER PRIMARY KEY,
+                event_id INTEGER NOT NULL,
+                channel_id INTEGER NOT NULL,
+                sent_at INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                FOREIGN KEY(event_id) REFERENCES game_events(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_event_ping_cleanup
+                ON event_ping_messages(status, sent_at);
         """)
         settings_columns = {row['name'] for row in self.conn.execute('PRAGMA table_info(event_settings)')}
         if 'calendar_message_id' not in settings_columns:
@@ -102,6 +113,19 @@ class EventStore:
         self.conn.execute('UPDATE game_events SET ends_at=starts_at+3600 WHERE ends_at IS NULL')
         self.conn.execute("UPDATE event_reminders SET state='skipped' WHERE state='pending' AND stage!='1h'")
         self.conn.execute("UPDATE event_dm_jobs SET state='skipped' WHERE state='pending'")
+        # Existing role pings were sent before cleanup tracking existed.
+        # Do not import older reminders pointing at the shared embed or graphic.
+        self.conn.execute("""
+            INSERT OR IGNORE INTO event_ping_messages(message_id, event_id, channel_id, sent_at, status)
+            SELECT r.message_id, r.event_id,
+                   COALESCE(s.text_message_channel_id, ?), r.due_at, 'pending'
+            FROM event_reminders r
+            JOIN game_events e ON e.id=r.event_id
+            LEFT JOIN event_settings s ON s.guild_id=e.guild_id
+            WHERE r.stage='1h' AND r.state='sent' AND r.message_id IS NOT NULL
+              AND (s.text_message_id IS NULL OR s.text_message_id!=r.message_id)
+              AND (s.calendar_message_id IS NULL OR s.calendar_message_id!=r.message_id)
+        """, (DEFAULT_EVENT_TEXT_CHANNEL_ID,))
 
     def set_channel(self, guild_id, channel_id, role_id):
         self.conn.execute(
@@ -321,6 +345,44 @@ class EventStore:
         self.conn.execute(
             'UPDATE event_reminders SET state=?,message_id=? WHERE event_id=? AND stage=? AND state=?',
             (state, message_id, event_id, stage, 'pending')
+        )
+
+    def record_sent_ping(self, event_id, message_id, channel_id, sent_at=None):
+        sent_at = int(datetime.now(timezone.utc).timestamp()) if sent_at is None else sent_at
+        self.conn.execute('BEGIN IMMEDIATE')
+        try:
+            cursor = self.conn.execute(
+                """UPDATE event_reminders SET state='sent', message_id=?
+                   WHERE event_id=? AND stage='1h' AND state='pending'""",
+                (message_id, event_id)
+            )
+            if cursor.rowcount:
+                self.conn.execute(
+                    """INSERT OR IGNORE INTO event_ping_messages
+                       (message_id, event_id, channel_id, sent_at) VALUES(?,?,?,?)""",
+                    (message_id, event_id, channel_id, sent_at)
+                )
+            self.conn.execute('COMMIT')
+            return cursor.rowcount == 1
+        except Exception:
+            self.conn.execute('ROLLBACK')
+            raise
+
+    def expired_pings(self, now=None, limit=20):
+        now = int(datetime.now(timezone.utc).timestamp()) if now is None else now
+        return self.conn.execute(
+            """SELECT * FROM event_ping_messages
+               WHERE status='pending' AND sent_at<=?
+               ORDER BY sent_at, message_id LIMIT ?""",
+            (now - PING_RETENTION_SECONDS, limit)
+        ).fetchall()
+
+    def ping_cleanup_state(self, message_id, status):
+        if status not in ('deleted', 'missing', 'ignored', 'blocked'):
+            raise ValueError('Invalid ping cleanup state.')
+        self.conn.execute(
+            "UPDATE event_ping_messages SET status=? WHERE message_id=? AND status='pending'",
+            (status, message_id)
         )
 
     def due_dm(self):
