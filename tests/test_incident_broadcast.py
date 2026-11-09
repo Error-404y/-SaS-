@@ -10,6 +10,10 @@ from incident_broadcast import (
     CONTROL_CHANNEL_ID,
     CONTROL_GUILD_ID,
     ERROR_TITLE,
+    LEGACY_ERROR_TITLE,
+    LEGACY_RESTORED_TITLE,
+    LEGACY_ERROR_DESCRIPTION,
+    PREVIOUS_RESTORED_DESCRIPTION,
     FIX_KEYWORD,
     RESTORED_TITLE,
     START_KEYWORD,
@@ -159,14 +163,35 @@ class IncidentBroadcastTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.incident.cleanup_once(due), 8)
         self.assertEqual(self.incident.state()["status"], "idle")
 
-    def test_message_copy_is_short_professional_and_marks_simulation(self):
+    async def test_cleanup_accepts_older_incident_templates_after_upgrade(self):
+        self.assertEqual(await self.incident.activate(), 4)
+        self.assertEqual(await self.incident.resolve(), 4)
+        alerts = [msg for msg in self.messages.values() if msg.embeds[0].title == ERROR_TITLE]
+        recovery = [msg for msg in self.messages.values() if msg.embeds[0].title == RESTORED_TITLE]
+        alerts[0].embeds[0].title = LEGACY_ERROR_TITLE
+        alerts[0].embeds[0].description = LEGACY_ERROR_DESCRIPTION
+        alerts[0].embeds[0].set_footer(text="System Communications | Simulated Incident")
+        recovery[0].embeds[0].title = LEGACY_RESTORED_TITLE
+        recovery[0].embeds[0].description = PREVIOUS_RESTORED_DESCRIPTION
+        recovery[0].embeds[0].set_footer(text="System Communications | Simulated Incident")
+        due = self.incident.state()["cleanup_due"]
+        self.assertEqual(await self.incident.cleanup_once(due), 8)
+        self.assertEqual(self.incident.state()["status"], "idle")
+
+    def test_message_copy_is_technical_and_has_no_footer_or_embed_timestamp(self):
         alert = incident_embed()
         restored = incident_embed(recovered=True)
-        self.assertIn("DATABASE", alert.title)
-        self.assertLess(len(alert.description), 280)
-        self.assertLess(len(restored.description), 120)
-        self.assertEqual(alert.footer.text, "System Communications | Simulated Incident")
-        self.assertEqual(restored.footer.text, "System Communications | Simulated Incident")
+        self.assertIn("PERSISTENCE", alert.title)
+        self.assertIn("connection-pool", alert.description)
+        self.assertIn("transaction", restored.description)
+        self.assertLess(len(alert.description), 310)
+        self.assertLess(len(restored.description), 160)
+        self.assertEqual(alert.fields[1].value, "CONTROLLED EXERCISE")
+        self.assertEqual(restored.fields[1].value, "CONTROLLED EXERCISE")
+        self.assertIsNone(alert.footer.text)
+        self.assertIsNone(restored.footer.text)
+        self.assertIsNone(alert.timestamp)
+        self.assertIsNone(restored.timestamp)
 
 
 if __name__ == "__main__":
