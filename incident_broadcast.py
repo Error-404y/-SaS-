@@ -92,7 +92,8 @@ class IncidentBroadcast:
                 continue
             for channel in guild.text_channels:
                 permissions = channel.permissions_for(me)
-                if permissions.view_channel and permissions.send_messages and permissions.embed_links:
+                if (permissions.view_channel and permissions.send_messages and permissions.embed_links
+                        and permissions.read_message_history):
                     targets.append((guild.id, channel))
         return targets
 
