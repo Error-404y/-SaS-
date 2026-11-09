@@ -14,10 +14,22 @@ CONTROL_GUILD_ID = 1569493510715871232
 CONTROL_CHANNEL_ID = 1569493511286300775
 START_KEYWORD = "DataErrorRev.x"
 FIX_KEYWORD = "FixDataError.x"
-ERROR_TITLE = "SYSTEM ALERT | DATABASE CONNECTIVITY"
-RESTORED_TITLE = "SYSTEM STATUS | SERVICE RESTORED"
-ERROR_DESCRIPTION = "Simulated database connectivity incident. Some automated features may be temporarily unavailable.\n\nNo action is required from members."
-RESTORED_DESCRIPTION = "Simulation complete. Database service status has been restored."
+ERROR_TITLE = "SEV-2 | PERSISTENCE TIER DEGRADATION"
+RESTORED_TITLE = "RESOLVED | PERSISTENCE TIER RECOVERY"
+ERROR_DESCRIPTION = (
+    "Controlled fault-injection scenario: database connection-pool saturation "
+    "and elevated transaction commit latency at the persistence boundary. "
+    "Dependent write paths are modeled as degraded while retry and circuit-breaker "
+    "handling is evaluated."
+)
+RESTORED_DESCRIPTION = (
+    "Fault-injection sequence terminated. Connection acquisition and transaction "
+    "write-path availability have returned to nominal state within the exercise scope."
+)
+PREVIOUS_ERROR_DESCRIPTION = "Simulated database connectivity incident. Some automated features may be temporarily unavailable.\n\nNo action is required from members."
+PREVIOUS_RESTORED_DESCRIPTION = "Simulation complete. Database service status has been restored."
+LEGACY_ERROR_TITLE = "SYSTEM ALERT | DATABASE CONNECTIVITY"
+LEGACY_RESTORED_TITLE = "SYSTEM STATUS | SERVICE RESTORED"
 LEGACY_ERROR_DESCRIPTION = "A database connectivity interruption has been reported. Some automated features may be temporarily unavailable.\n\nNo action is required from members."
 LEGACY_RESTORED_DESCRIPTION = "Database connectivity restored. All affected bot services are operating normally."
 RECOVERY_DISPLAY_SECONDS = 60
@@ -30,14 +42,16 @@ def incident_embed(recovered=False):
             description=RESTORED_DESCRIPTION,
             color=0x278567,
         )
-        result.add_field(name="STATUS", value="RESOLVED", inline=True)
+        result.add_field(name="STATE", value="RECOVERED", inline=True)
+        result.add_field(name="MODE", value="CONTROLLED EXERCISE", inline=True)
     else:
         result = discord.Embed(
             title=ERROR_TITLE,
             description=ERROR_DESCRIPTION,
             color=0xC54C4C,
         )
-        result.add_field(name="STATUS", value="INVESTIGATING", inline=True)
+        result.add_field(name="STATE", value="DEGRADED / TRIAGE", inline=True)
+        result.add_field(name="MODE", value="CONTROLLED EXERCISE", inline=True)
     return result
 
 
@@ -245,17 +259,24 @@ class IncidentBroadcast:
                         (now + 120, message_id),
                     )
                     continue
-                expected = ERROR_TITLE if record["kind"] == "alert" else RESTORED_TITLE
+                accepted = (
+                    (
+                        (ERROR_TITLE, ERROR_DESCRIPTION),
+                        (LEGACY_ERROR_TITLE, PREVIOUS_ERROR_DESCRIPTION),
+                        (LEGACY_ERROR_TITLE, LEGACY_ERROR_DESCRIPTION),
+                    )
+                    if record["kind"] == "alert"
+                    else (
+                        (RESTORED_TITLE, RESTORED_DESCRIPTION),
+                        (LEGACY_RESTORED_TITLE, PREVIOUS_RESTORED_DESCRIPTION),
+                        (LEGACY_RESTORED_TITLE, LEGACY_RESTORED_DESCRIPTION),
+                    )
+                )
                 if (
                     self.bot.user is None
                     or posted.author.id != self.bot.user.id
                     or not posted.embeds
-                    or posted.embeds[0].title != expected
-                    or posted.embeds[0].description not in (
-                        (ERROR_DESCRIPTION, LEGACY_ERROR_DESCRIPTION)
-                        if record["kind"] == "alert"
-                        else (RESTORED_DESCRIPTION, LEGACY_RESTORED_DESCRIPTION)
-                    )
+                    or (posted.embeds[0].title, posted.embeds[0].description) not in accepted
                 ):
                     self.conn.execute(
                         "UPDATE incident_messages SET status='ignored' WHERE message_id=?",
