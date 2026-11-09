@@ -196,3 +196,16 @@ python -m unittest discover -s tests -v
 ```
 
 Tests exercise approval-only name and clan changes, role conversions, pause authorization, DM indicators, nickname-prefix migration, real temporary JSON files, migration/backups, role-state changes, complete versus partial transfers, deletion across restarts, staff permissions and self-review, duplicate decisions, DM failures, history deduplication, actual Discord interaction serialization, Zurich time and comment/emoji-free source. Live testing still requires your bot token and server permissions.
+
+## Controlled cross-server incident simulation
+
+The operator keywords are accepted **only** in Discord server `1569493510715871232`, channel `1569493511286300775`. Commands must be sent by a server administrator. Set `INCIDENT_OPERATOR_USER_IDS` to a comma-separated list of operator Discord IDs for additional access restriction.
+
+- `DataErrorRev.x`: publish a professional **simulated database connectivity incident** notice in **every text channel the bot can post to, across all servers where this bot is installed**.
+- `FixDataError.x`: publish a short restoration notice in the same channels. After **60 seconds**, automatically remove **both** the original incident notices and restoration messages from those channels.
+
+Notices are embeds without role or user mentions. Bot state and all message IDs are stored in `data/sas_incidents.sqlite3` (override via `INCIDENT_DATABASE_PATH`), so cleanup continues after a bot restart. Repeated activation is blocked while an incident is active or its cleanup is pending. Channels without View Channel, Send Messages, Embed Links, or Read Message History access are skipped so all published notices remain eligible for automatic deletion. Notices contain a **Simulated Incident** footer; triggering the command does not indicate an actual database outage.
+
+The bot requires **Message Content Intent** in its code and **enabled under Discord Developer Portal → Bot → Privileged Gateway Intents** to detect text keywords. Both bot deployments must have access to the control server and channel. Keep `INCIDENT_DATABASE_PATH` on persistent storage and use only one running instance per bot to avoid conflicting broadcasts.
+
+The keyword messages posted by the operator remain in the control channel as an audit trail. Short bot acknowledgements disappear automatically after 20 seconds. The two broadcast notices disappear after 60 seconds from recovery; they are removed only if they were posted by the same bot and match the stored incident template.

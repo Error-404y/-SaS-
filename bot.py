@@ -18,6 +18,7 @@ from time_utils import zurich_time, ZurichFormatter
 from views import VerifyView, ReviewView, PauseControls, embed, reply, valid_username
 from identity import nickname, profile_from_member, clean_clan, valid_clan
 from event_center import EventCenter
+from incident_broadcast import IncidentBroadcast
 
 load_dotenv()
 log = logging.getLogger('verification')
@@ -43,6 +44,7 @@ class VerificationBot(discord.Client):
     def __init__(self):
         intents = discord.Intents.default()
         intents.members = True
+        intents.message_content = True
         trace = aiohttp.TraceConfig()
         trace.on_request_end.append(self.observe_edit_response)
         super().__init__(intents=intents, allowed_mentions=discord.AllowedMentions.none(), http_trace=trace)
@@ -57,6 +59,7 @@ class VerificationBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
         events_path = os.getenv('EVENT_DATABASE_PATH', str(Path(self.db.path).with_name('events.sqlite3')))
         self.events = EventCenter(self, events_path)
+        self.incident_broadcast = IncidentBroadcast(self, os.getenv('INCIDENT_DATABASE_PATH', 'data/sas_incidents.sqlite3'))
 
     async def setup_hook(self):
         self.add_view(VerifyView(self))
@@ -379,7 +382,11 @@ class VerificationBot(discord.Client):
         self.db.panel(message.id)
         self.db.panel_synced()
 
+    async def on_message(self, message):
+        await self.incident_broadcast.handle_message(message)
+
     async def on_ready(self):
+        self.incident_broadcast.start()
         async with self.lock:
             if self.configured:
                 return
@@ -759,6 +766,7 @@ class VerificationBot(discord.Client):
         if self.refresh_messages.is_running():
             self.refresh_messages.cancel()
         self.events.close()
+        self.incident_broadcast.close()
         if self.prefix_task and not self.prefix_task.done():
             self.prefix_task.cancel()
         if self.recover.is_running():
