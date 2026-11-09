@@ -16,6 +16,10 @@ START_KEYWORD = "DataErrorRev.x"
 FIX_KEYWORD = "FixDataError.x"
 ERROR_TITLE = "SYSTEM ALERT | DATABASE CONNECTIVITY"
 RESTORED_TITLE = "SYSTEM STATUS | SERVICE RESTORED"
+ERROR_DESCRIPTION = "Simulated database connectivity incident. Some automated features may be temporarily unavailable.\n\nNo action is required from members."
+RESTORED_DESCRIPTION = "Simulation complete. Database service status has been restored."
+LEGACY_ERROR_DESCRIPTION = "A database connectivity interruption has been reported. Some automated features may be temporarily unavailable.\n\nNo action is required from members."
+LEGACY_RESTORED_DESCRIPTION = "Database connectivity restored. All affected bot services are operating normally."
 RECOVERY_DISPLAY_SECONDS = 60
 
 
@@ -23,19 +27,17 @@ def incident_embed(recovered=False):
     if recovered:
         result = discord.Embed(
             title=RESTORED_TITLE,
-            description="Database connectivity restored. All affected bot services are operating normally.",
+            description=RESTORED_DESCRIPTION,
             color=0x278567,
         )
         result.add_field(name="STATUS", value="RESOLVED", inline=True)
     else:
         result = discord.Embed(
             title=ERROR_TITLE,
-            description="A database connectivity interruption has been reported. Some automated features may be temporarily unavailable.\n\nNo action is required from members.",
+            description=ERROR_DESCRIPTION,
             color=0xC54C4C,
         )
         result.add_field(name="STATUS", value="INVESTIGATING", inline=True)
-    result.set_footer(text="System Communications | Simulated Incident")
-    result.timestamp = discord.utils.utcnow()
     return result
 
 
@@ -249,7 +251,11 @@ class IncidentBroadcast:
                     or posted.author.id != self.bot.user.id
                     or not posted.embeds
                     or posted.embeds[0].title != expected
-                    or posted.embeds[0].footer.text != "System Communications | Simulated Incident"
+                    or posted.embeds[0].description not in (
+                        (ERROR_DESCRIPTION, LEGACY_ERROR_DESCRIPTION)
+                        if record["kind"] == "alert"
+                        else (RESTORED_DESCRIPTION, LEGACY_RESTORED_DESCRIPTION)
+                    )
                 ):
                     self.conn.execute(
                         "UPDATE incident_messages SET status='ignored' WHERE message_id=?",
