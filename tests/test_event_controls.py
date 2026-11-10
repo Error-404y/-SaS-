@@ -215,8 +215,8 @@ class CrossServerEventPanelTests(unittest.IsolatedAsyncioTestCase):
         records = self.manager.store.manage_events(self.target.id)
         self.assertEqual(len(records), 25)
         view = EventPickerView(self.manager, 'inspect', records, user_id=83)
-        self.assertEqual(len(view.children[0].options), 25)
-        self.assertEqual(view.children[1].label, 'Enter Event ID')
+        self.assertEqual(len(next(item for item in view.children if isinstance(item, discord.ui.Select)).options), 25)
+        self.assertEqual(next(item.label for item in view.children if isinstance(item, discord.ui.Button)), 'Enter Event ID')
         self.assertIsNotNone(selected_event(self.manager, records[24]['id']))
         self.assertIsNotNone(selected_event(self.manager, records[0]['id'] + 29))
         bad = self.manager.store.create(
