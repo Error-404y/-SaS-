@@ -14,15 +14,26 @@ CONTROL_GUILD_ID = 1569493510715871232
 CONTROL_CHANNEL_ID = 1569493511286300775
 START_KEYWORD = "DataErrorRev.x"
 FIX_KEYWORD = "FixDataError.x"
-ERROR_TITLE = "SEV-2 | PERSISTENCE TIER DEGRADATION"
-RESTORED_TITLE = "RESOLVED | PERSISTENCE TIER RECOVERY"
+ERROR_TITLE = "OPERATIONS ADVISORY | PERSISTENCE SERVICES"
+RESTORED_TITLE = "ADVISORY CLEARED | PERSISTENCE SERVICES"
 ERROR_DESCRIPTION = (
+    "An operator-issued service advisory is active for database-dependent workflows. "
+    "Connection acquisition, transaction commits, and write-path availability may be "
+    "subject to elevated latency or transient failures. Please avoid duplicate submissions."
+)
+RESTORED_DESCRIPTION = (
+    "The operator-issued service advisory has been closed. "
+    "Report any remaining persistence or transaction anomalies through the usual support channel."
+)
+TECHNICAL_ERROR_TITLE = "SEV-2 | PERSISTENCE TIER DEGRADATION"
+TECHNICAL_RESTORED_TITLE = "RESOLVED | PERSISTENCE TIER RECOVERY"
+TECHNICAL_ERROR_DESCRIPTION = (
     "Controlled fault-injection scenario: database connection-pool saturation "
     "and elevated transaction commit latency at the persistence boundary. "
     "Dependent write paths are modeled as degraded while retry and circuit-breaker "
     "handling is evaluated."
 )
-RESTORED_DESCRIPTION = (
+TECHNICAL_RESTORED_DESCRIPTION = (
     "Fault-injection sequence terminated. Connection acquisition and transaction "
     "write-path availability have returned to nominal state within the exercise scope."
 )
@@ -42,16 +53,16 @@ def incident_embed(recovered=False):
             description=RESTORED_DESCRIPTION,
             color=0x278567,
         )
-        result.add_field(name="STATE", value="RECOVERED", inline=True)
-        result.add_field(name="MODE", value="CONTROLLED EXERCISE", inline=True)
+        result.add_field(name="STATE", value="ADVISORY CLOSED", inline=True)
+        result.add_field(name="SOURCE", value="OPERATIONS", inline=True)
     else:
         result = discord.Embed(
             title=ERROR_TITLE,
             description=ERROR_DESCRIPTION,
             color=0xC54C4C,
         )
-        result.add_field(name="STATE", value="DEGRADED / TRIAGE", inline=True)
-        result.add_field(name="MODE", value="CONTROLLED EXERCISE", inline=True)
+        result.add_field(name="STATE", value="ADVISORY ACTIVE", inline=True)
+        result.add_field(name="SOURCE", value="OPERATIONS", inline=True)
     return result
 
 
@@ -262,12 +273,14 @@ class IncidentBroadcast:
                 accepted = (
                     (
                         (ERROR_TITLE, ERROR_DESCRIPTION),
+                        (TECHNICAL_ERROR_TITLE, TECHNICAL_ERROR_DESCRIPTION),
                         (LEGACY_ERROR_TITLE, PREVIOUS_ERROR_DESCRIPTION),
                         (LEGACY_ERROR_TITLE, LEGACY_ERROR_DESCRIPTION),
                     )
                     if record["kind"] == "alert"
                     else (
                         (RESTORED_TITLE, RESTORED_DESCRIPTION),
+                        (TECHNICAL_RESTORED_TITLE, TECHNICAL_RESTORED_DESCRIPTION),
                         (LEGACY_RESTORED_TITLE, PREVIOUS_RESTORED_DESCRIPTION),
                         (LEGACY_RESTORED_TITLE, LEGACY_RESTORED_DESCRIPTION),
                     )
