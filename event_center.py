@@ -4,10 +4,8 @@ import os
 import sqlite3
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Literal
 
 import discord
-from discord import app_commands
 from discord.ext import tasks
 
 from event_graphics import weekly_calendar, event_board
@@ -17,6 +15,9 @@ log = logging.getLogger('sas.events')
 DEFAULT_EVENT_BOARD_CHANNEL_ID = 1568424573836464208
 DEFAULT_EVENT_TEXT_CHANNEL_ID = 1568431370747908291
 DEFAULT_EVENT_MEMBER_ROLE_ID = 1562535352290250842
+DEFAULT_EVENT_TARGET_GUILD_ID = 1562533697121550356
+DEFAULT_EVENT_CONTROL_GUILD_ID = 1569493510715871232
+DEFAULT_EVENT_CONTROL_CHANNEL_ID = 1569564237129322677
 STAGES = (('1h', 3600),)
 PING_RETENTION_SECONDS = 24 * 3600
 CATEGORIES = ('Alliance', 'Events', 'Deals', 'Port Inspection', 'Other')
@@ -93,6 +94,11 @@ class EventStore:
             );
             CREATE INDEX IF NOT EXISTS idx_event_ping_cleanup
                 ON event_ping_messages(status, sent_at);
+            CREATE TABLE IF NOT EXISTS event_control_panels (
+                guild_id INTEGER PRIMARY KEY,
+                channel_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL
+            );
         """)
         settings_columns = {row['name'] for row in self.conn.execute('PRAGMA table_info(event_settings)')}
         if 'calendar_message_id' not in settings_columns:
@@ -124,6 +130,27 @@ class EventStore:
               AND (s.text_message_id IS NULL OR s.text_message_id!=r.message_id)
               AND (s.calendar_message_id IS NULL OR s.calendar_message_id!=r.message_id)
         """, (DEFAULT_EVENT_TEXT_CHANNEL_ID,))
+
+    def control_panel(self, guild_id):
+        return self.conn.execute(
+            'SELECT * FROM event_control_panels WHERE guild_id=?', (guild_id,)
+        ).fetchone()
+
+    def set_control_panel(self, guild_id, channel_id, message_id):
+        self.conn.execute(
+            """INSERT INTO event_control_panels(guild_id,channel_id,message_id)
+               VALUES(?,?,?) ON CONFLICT(guild_id) DO UPDATE SET
+               channel_id=excluded.channel_id,message_id=excluded.message_id""",
+            (guild_id, channel_id, message_id)
+        )
+
+    def manage_events(self, guild_id, now=None, limit=25):
+        now = int(datetime.now(timezone.utc).timestamp()) if now is None else now
+        return self.conn.execute(
+            """SELECT * FROM game_events WHERE guild_id=? AND state='active'
+               AND ends_at>? ORDER BY starts_at,id LIMIT ?""",
+            (guild_id, now, limit)
+        ).fetchall()
 
     def set_channel(self, guild_id, channel_id, role_id):
         self.conn.execute(
@@ -449,7 +476,7 @@ class CalendarNavigation(discord.ui.View):
 
     async def interaction_check(self, interaction):
         if interaction.user.id != self.user_id:
-            await interaction.response.send_message('Open your own calendar with /event calendar.', ephemeral=True)
+            await interaction.response.send_message('Open your own calendar from the Event Command Center.', ephemeral=True)
             return False
         return True
 
@@ -470,7 +497,7 @@ class CalendarNavigation(discord.ui.View):
 
     @discord.ui.button(label='Upcoming Events', style=discord.ButtonStyle.secondary)
     async def upcoming(self, interaction, button):
-        rows = self.manager.store.upcoming(interaction.guild_id)
+        rows = self.manager.store.upcoming(self.manager.target_guild_id)
         result = self.manager.upcoming_embed(rows)
         await interaction.response.send_message(embed=result, ephemeral=True)
 
@@ -479,7 +506,16 @@ class EventCenter:
     def __init__(self, bot, path):
         self.bot = bot
         self.store = EventStore(path)
-        self.group_registered = False
+        self.panel_registered = False
+        self.panel_lock = asyncio.Lock()
+        self.panel_last_update = 0
+        self.target_guild_id = int(os.getenv('EVENT_TARGET_GUILD_ID', str(DEFAULT_EVENT_TARGET_GUILD_ID)))
+        self.control_guild_id = int(os.getenv('EVENT_CONTROL_GUILD_ID', str(DEFAULT_EVENT_CONTROL_GUILD_ID)))
+        self.control_channel_id = int(os.getenv('EVENT_CONTROL_CHANNEL_ID', str(DEFAULT_EVENT_CONTROL_CHANNEL_ID)))
+        self.control_role_ids = {
+            int(value.strip()) for value in os.getenv('EVENT_CONTROL_ROLE_IDS', '').split(',')
+            if value.strip().isdigit()
+        }
         self.board_lock = asyncio.Lock()
         self.text_lock = asyncio.Lock()
         self.board_channel_id = int(os.getenv('EVENT_BOARD_CHANNEL_ID', str(DEFAULT_EVENT_BOARD_CHANNEL_ID)))
@@ -487,10 +523,125 @@ class EventCenter:
         self.member_role_id = int(os.getenv('EVENT_MEMBER_ROLE_ID', str(DEFAULT_EVENT_MEMBER_ROLE_ID)))
 
     def is_staff(self, interaction):
-        return bool(
-            self.bot.configured and self.bot.guild and interaction.guild_id == self.bot.guild.id
-            and isinstance(interaction.user, discord.Member) and self.bot.is_reviewer(interaction.user)
+        if not (
+            self.bot.configured and self.bot.guild
+            and self.bot.guild.id == self.target_guild_id
+            and interaction.guild_id == self.control_guild_id
+            and interaction.channel_id == self.control_channel_id
+            and isinstance(interaction.user, discord.Member)
+        ):
+            return False
+        member = interaction.user
+        return (
+            member.guild_permissions.administrator
+            or any(role.id in self.control_role_ids for role in member.roles)
         )
+
+    def bootstrap(self):
+        if self.bot.guild is None or self.bot.guild.id != self.target_guild_id:
+            raise RuntimeError('The configured SaS target server does not match the verification server.')
+        if self.store.settings(self.target_guild_id) is None:
+            self.store.set_channel(self.target_guild_id, self.text_channel_id, self.member_role_id)
+
+    def panel_embed(self):
+        now = int(datetime.now(timezone.utc).timestamp())
+        records = self.store.manage_events(self.target_guild_id, now, limit=1)
+        count = self.store.board_event_count(self.target_guild_id, now)
+        result = discord.Embed(
+            title='SaS | Event Command Center',
+            description=(
+                'Centralized event administration for the SaS server. '
+                'Use the controls below to manage the live event schedule without commands.\n\n'
+                '**All event times are UTC.** Changes synchronize with the SaS Event Updates '
+                'feed, graphical overview, and one-hour Member reminder scheduler.'
+            ),
+            color=0x234C73
+        )
+        result.add_field(name='TARGET SERVER', value=str(self.target_guild_id), inline=True)
+        result.add_field(name='ACTIVE / UPCOMING', value=str(count), inline=True)
+        if records:
+            next_event = records[0]
+            result.add_field(
+                name='NEXT SCHEDULED',
+                value=f"#{next_event['id']} | {clean(next_event['title'], 70)}\n"
+                      f"<t:{next_event['starts_at']}:F> | {event_phase(next_event, now)}",
+                inline=False
+            )
+        else:
+            result.add_field(name='NEXT SCHEDULED', value='No active or upcoming events.', inline=False)
+        result.add_field(
+            name='MANAGEMENT',
+            value='Create | Edit | Postpone | Cancel | Inspect\n'
+                  'Upcoming | Calendar | Refresh',
+            inline=False
+        )
+        result.set_footer(text='SaS Event Command Center | Authorized officers only')
+        return result
+
+    async def control_channel(self):
+        channel = self.bot.get_channel(self.control_channel_id)
+        if channel is None:
+            try:
+                channel = await self.bot.fetch_channel(self.control_channel_id)
+            except discord.HTTPException:
+                log.exception('Event management channel %s could not be resolved', self.control_channel_id)
+                return None
+        if (
+            not isinstance(channel, discord.TextChannel)
+            or channel.guild.id != self.control_guild_id
+        ):
+            log.error('Event management channel is not in the authorized control server')
+            return None
+        member = channel.guild.me
+        if member is None:
+            return None
+        permissions = channel.permissions_for(member)
+        if not all((permissions.view_channel, permissions.send_messages,
+                    permissions.embed_links, permissions.read_message_history)):
+            log.error('Event management channel requires View, Send, Embed and Read History permissions')
+            return None
+        return channel
+
+    async def ensure_management_panel(self, create=True):
+        async with self.panel_lock:
+            channel = await self.control_channel()
+            if channel is None:
+                return None
+            existing = self.store.control_panel(self.control_guild_id)
+            message = None
+            if existing and existing['channel_id'] == channel.id:
+                try:
+                    message = await channel.fetch_message(existing['message_id'])
+                    if message.author.id != self.bot.user.id:
+                        message = None
+                except discord.NotFound:
+                    message = None
+            if message is None and create:
+                async for item in channel.history(limit=70):
+                    if (
+                        item.author.id == self.bot.user.id
+                        and item.embeds and item.embeds[0].title == 'SaS | Event Command Center'
+                    ):
+                        message = item
+                        break
+            from event_controls import EventControlView
+            if message is not None:
+                await message.edit(embed=self.panel_embed(), view=EventControlView(self),
+                                   allowed_mentions=discord.AllowedMentions.none())
+            elif create:
+                message = await channel.send(embed=self.panel_embed(),
+                                             view=EventControlView(self),
+                                             allowed_mentions=discord.AllowedMentions.none())
+            if message is not None:
+                self.store.set_control_panel(self.control_guild_id, channel.id, message.id)
+            return message
+
+    async def refresh_management_panel_safe(self, create=True):
+        try:
+            return await self.ensure_management_panel(create)
+        except (discord.HTTPException, OSError, ValueError):
+            log.exception('Unable to refresh the SaS Event Command Center')
+            return None
 
     def build_embed(self, event, stage=None, now=None):
         now = int(datetime.now(timezone.utc).timestamp()) if now is None else now
@@ -557,7 +708,7 @@ class EventCenter:
         return result
 
     async def upcoming_message(self, interaction):
-        await interaction.response.send_message(embed=self.upcoming_embed(self.store.upcoming(interaction.guild_id)), ephemeral=True)
+        await interaction.response.send_message(embed=self.upcoming_embed(self.store.upcoming(self.target_guild_id)), ephemeral=True)
 
     def calendar_payload(self, guild_id, week_offset=0):
         now = datetime.now(timezone.utc)
@@ -598,7 +749,7 @@ class EventCenter:
         file = discord.File(event_board(entries, now, total), filename='sas_events_overview.png')
         embed = discord.Embed(
             title='SaS | Event Center',
-            description=f"**Server Time:** {now.strftime('%Y-%m-%d %H:%M:%S')} UTC\n**Active and upcoming events:** {total}\nNew events are automatically added to this graphic. Use /event calendar to browse the seven-day timeline.",
+            description=f"**Server Time:** {now.strftime('%Y-%m-%d %H:%M:%S')} UTC\n**Active and upcoming events:** {total}\nNew events are automatically added to this graphic. Events are managed from the separate SaS Event Command Center.",
             color=0x5DAAE3
         )
         embed.set_image(url='attachment://sas_events_overview.png')
@@ -634,7 +785,7 @@ class EventCenter:
         if not items:
             embed.add_field(name='Schedule', value='No active or upcoming events.', inline=False)
         if total > len(items):
-            embed.add_field(name='More events', value=f'{total-len(items)} more — see /event upcoming or /event calendar.', inline=False)
+            embed.add_field(name='More events', value=f'{total-len(items)} more — officers can inspect them in the Event Command Center.', inline=False)
         embed.set_footer(text='SaS Event Updates | Shared schedule | Times in UTC')
         embed.timestamp = datetime.fromtimestamp(now, timezone.utc)
         return embed
@@ -753,158 +904,30 @@ class EventCenter:
             return None
 
     async def show_calendar(self, interaction, week_offset=0, update=False, view=None, publish=False):
-        if interaction.guild_id != getattr(self.bot.guild, 'id', None):
-            return await interaction.response.send_message('Only available in the SaS server.', ephemeral=True)
+        if not self.is_staff(interaction):
+            return await interaction.response.send_message('Event administration is restricted to the control channel.', ephemeral=True)
         if publish:
-            settings = self.store.settings(interaction.guild_id)
-            if settings is None:
-                return await interaction.response.send_message('Run /event setup first.', ephemeral=True)
-            channel = self.board_channel()
-            if channel is None:
-                return await interaction.response.send_message(f'Event Center channel {self.board_channel_id} is unavailable. Check the channel ID and bot permissions.', ephemeral=True)
             await interaction.response.defer(ephemeral=True, thinking=True)
-            try:
-                message = await self.ensure_board(interaction.guild_id, create=True)
-                if not message:
-                    return await interaction.followup.send('Calendar channel is unavailable.', ephemeral=True)
-            except discord.HTTPException:
-                log.exception('Unable to publish SaS weekly calendar')
-                return await interaction.followup.send('Calendar could not be posted. Check channel permissions.', ephemeral=True)
-            return await interaction.followup.send(f'Combined event calendar updated in {channel.mention}: {message.jump_url}', ephemeral=True)
-        embed, banner = self.calendar_payload(interaction.guild_id, week_offset)
+            board = await self.refresh_board_safe(self.target_guild_id, create=True)
+            return await interaction.followup.send(
+                f'Graphic refreshed in the SaS server: {board.jump_url}' if board
+                else 'The SaS graphical overview could not be refreshed.',
+                ephemeral=True
+            )
+        result, banner = self.calendar_payload(self.target_guild_id, week_offset)
         if view is None:
             view = CalendarNavigation(self, interaction.user.id, week_offset)
         if update:
-            await interaction.response.edit_message(embed=embed, attachments=[banner], view=view)
+            await interaction.response.edit_message(embed=result, attachments=[banner], view=view)
         else:
-            await interaction.response.send_message(embed=embed, file=banner, view=view, ephemeral=True)
+            await interaction.response.send_message(embed=result, file=banner, view=view, ephemeral=True)
 
     def register(self):
-        if self.group_registered:
+        if self.panel_registered:
             return
-        group = app_commands.Group(name='event', description='SaS event calendar and one-hour member alerts')
-
-        @group.command(name='setup', description='Configure legacy event settings and the shared event feeds')
-        async def setup(interaction: discord.Interaction, channel: discord.TextChannel, notify_role: discord.Role = None):
-            if not self.is_staff(interaction):
-                return await interaction.response.send_message('Staff access required.', ephemeral=True)
-            permissions = channel.permissions_for(interaction.guild.me)
-            if not all((permissions.view_channel, permissions.send_messages, permissions.embed_links, permissions.attach_files, permissions.read_message_history)):
-                return await interaction.response.send_message('The bot needs View Channel, Send Messages, Embed Links, Attach Files and Read Message History.', ephemeral=True)
-            self.store.set_channel(interaction.guild_id, channel.id, notify_role.id if notify_role else None)
-            await interaction.response.send_message(f"Event Updates posts in <#{self.text_channel_id}> and the graphic in <#{self.board_channel_id}>. Members with role <@&{self.member_role_id}> are pinged once, around 1 hour before each event. No subscriptions or reminder buttons are required.", ephemeral=True)
-
-        @group.command(name='create', description='Schedule an event using the in-game server time in UTC')
-        @app_commands.describe(title='Event name', start_utc='Start YYYY-MM-DD HH:MM:SS UTC', category='Event color category', notes='Optional event details', end_utc='Optional end YYYY-MM-DD HH:MM:SS UTC')
-        async def create(interaction: discord.Interaction, title: str, start_utc: str, category: Literal['Alliance','Events','Deals','Port Inspection','Other'] = 'Alliance', notes: str = '', end_utc: str = ''):
-            if not self.is_staff(interaction):
-                return await interaction.response.send_message('Staff access required.', ephemeral=True)
-            settings = self.store.settings(interaction.guild_id)
-            if settings is None:
-                return await interaction.response.send_message('Run /event setup first.', ephemeral=True)
-            try:
-                starts_at = parse_utc(start_utc, future=False)
-                ends_at = parse_utc(end_utc, future=False) if end_utc.strip() else starts_at + 3600
-                validate_event_window(starts_at, ends_at, int(datetime.now(timezone.utc).timestamp()))
-            except ValueError as error:
-                return await interaction.response.send_message(str(error), ephemeral=True)
-            title = title.strip()
-            notes = notes.strip()
-            if len(title) < 3 or len(title) > 100 or len(notes) > 900 or category not in CATEGORIES:
-                return await interaction.response.send_message('Use a 3–100 character title, at most 900 characters of notes and a valid category.', ephemeral=True)
-            channel = interaction.guild.get_channel(settings['channel_id'])
-            if not isinstance(channel, discord.TextChannel):
-                return await interaction.response.send_message('The configured reminder channel no longer exists.', ephemeral=True)
-            await interaction.response.defer(ephemeral=True, thinking=True)
-            now = int(datetime.now(timezone.utc).timestamp())
-            event_id = self.store.create(interaction.guild_id, channel.id, title, category, notes, starts_at, interaction.user.id, now, ends_at)
-            feed = await self.refresh_text_safe(interaction.guild_id, create=True)
-            board = await self.refresh_board_safe(interaction.guild_id, create=True)
-            if feed and board:
-                return await interaction.followup.send(
-                    f"Event **{clean(title, 100)}** (#{event_id}) added to the shared updates: {feed.jump_url}\nGraphic: {board.jump_url}",
-                    ephemeral=True
-                )
-            if not feed:
-                return await interaction.followup.send(
-                    f"Event #{event_id} was saved, but the text overview could not be posted in <#{self.text_channel_id}>. Check bot permissions and use /event updates.",
-                    ephemeral=True
-                )
-            await interaction.followup.send(
-                f"Event #{event_id} is in {feed.jump_url}, but the graphic could not be refreshed in <#{self.board_channel_id}>.",
-                ephemeral=True
-            )
-
-        @group.command(name='calendar', description='Browse seven days or publish the combined Events overview')
-        @app_commands.describe(week_offset='Weeks backward or forward (-12 to +12)', publish='Staff: post calendar to the event channel')
-        async def calendar(interaction: discord.Interaction, week_offset: app_commands.Range[int,-12,12] = 0, publish: bool = False):
-            if publish and not self.is_staff(interaction):
-                return await interaction.response.send_message('Only staff can publish the calendar.', ephemeral=True)
-            await self.show_calendar(interaction, week_offset, publish=publish)
-
-        @group.command(name='edit', description='Edit or reschedule an existing event')
-        @app_commands.describe(event_id='Event number from /event upcoming', title='New title if changing', start_utc='Start YYYY-MM-DD HH:MM:SS UTC', end_utc='End YYYY-MM-DD HH:MM:SS UTC', category='New category if changing', notes='New event details if changing')
-        async def edit(interaction: discord.Interaction, event_id: int, title: str = '', start_utc: str = '', end_utc: str = '', category: str = '', notes: str = ''):
-            if not self.is_staff(interaction):
-                return await interaction.response.send_message('Staff access required.', ephemeral=True)
-            original = self.store.event(event_id)
-            if original is None or original['guild_id'] != interaction.guild_id or original['state'] != 'active':
-                return await interaction.response.send_message('Active event not found.', ephemeral=True)
-            new_title = title.strip() or original['title']
-            new_category = category.strip() or original['category']
-            new_notes = notes.strip() or original['notes']
-            try:
-                starts_at = parse_utc(start_utc, future=False) if start_utc.strip() else original['starts_at']
-                ends_at = parse_utc(end_utc, future=False) if end_utc.strip() else (starts_at + original['ends_at'] - original['starts_at'] if start_utc.strip() else original['ends_at'])
-                validate_event_window(starts_at, ends_at, int(datetime.now(timezone.utc).timestamp()))
-                if len(new_title) < 3 or len(new_title) > 100 or len(new_notes) > 900 or new_category not in CATEGORIES:
-                    raise ValueError('Invalid title, category or notes.')
-                if not self.store.edit(event_id, interaction.guild_id, new_title, new_category, new_notes, starts_at, ends_at):
-                    raise ValueError('Event no longer available.')
-            except ValueError as error:
-                return await interaction.response.send_message(str(error), ephemeral=True)
-            await interaction.response.defer(ephemeral=True)
-            feed = await self.refresh_text_safe(interaction.guild_id, create=True)
-            await self.refresh_board_safe(interaction.guild_id, create=True)
-            await interaction.followup.send(
-                f"Event #{event_id} updated in the shared list." + (f" {feed.jump_url}" if feed else " The text channel is currently unavailable."),
-                ephemeral=True
-            )
-
-        @group.command(name='upcoming', description='See the next scheduled SaS events')
-        async def upcoming(interaction: discord.Interaction):
-            if interaction.guild_id != getattr(self.bot.guild, 'id', None):
-                return await interaction.response.send_message('Only available in the SaS server.', ephemeral=True)
-            await self.upcoming_message(interaction)
-
-        @group.command(name='cancel', description='Cancel a scheduled event and stop future notifications')
-        async def cancel(interaction: discord.Interaction, event_id: int):
-            if not self.is_staff(interaction):
-                return await interaction.response.send_message('Staff access required.', ephemeral=True)
-            if not self.store.cancel(event_id, interaction.guild_id):
-                return await interaction.response.send_message('Active event not found.', ephemeral=True)
-            await self.refresh_text_safe(interaction.guild_id, create=True)
-            await self.refresh_board_safe(interaction.guild_id, create=True)
-            await interaction.response.send_message(
-                f'Event #{event_id} cancelled and removed from the shared active schedule.',
-                ephemeral=True
-            )
-
-        @group.command(name='updates', description='Publish or refresh the shared event text list')
-        async def updates(interaction: discord.Interaction):
-            if not self.is_staff(interaction):
-                return await interaction.response.send_message('Staff access required.', ephemeral=True)
-            await interaction.response.defer(ephemeral=True)
-            message = await self.refresh_text_safe(interaction.guild_id, create=True)
-            if not message:
-                return await interaction.followup.send(
-                    f'Event text channel <#{self.text_channel_id}> is unavailable. Check View Channel, Send Messages and Embed Links.',
-                    ephemeral=True
-                )
-            await interaction.followup.send(f'Shared event list updated: {message.jump_url}', ephemeral=True)
-
-        self.bot.tree.add_command(group, guild=self.bot.guild)
-        self.group_registered = True
+        from event_controls import EventControlView
+        self.bot.add_view(EventControlView(self))
+        self.panel_registered = True
 
     async def send_member_ping(self, event):
         channel = self.text_channel()
