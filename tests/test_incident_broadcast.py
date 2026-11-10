@@ -10,6 +10,10 @@ from incident_broadcast import (
     CONTROL_CHANNEL_ID,
     CONTROL_GUILD_ID,
     ERROR_TITLE,
+    TECHNICAL_ERROR_TITLE,
+    TECHNICAL_RESTORED_TITLE,
+    TECHNICAL_ERROR_DESCRIPTION,
+    TECHNICAL_RESTORED_DESCRIPTION,
     LEGACY_ERROR_TITLE,
     LEGACY_RESTORED_TITLE,
     LEGACY_ERROR_DESCRIPTION,
@@ -178,20 +182,35 @@ class IncidentBroadcastTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.incident.cleanup_once(due), 8)
         self.assertEqual(self.incident.state()["status"], "idle")
 
-    def test_message_copy_is_technical_and_has_no_footer_or_embed_timestamp(self):
+    async def test_cleanup_accepts_previous_technical_templates(self):
+        self.assertEqual(await self.incident.activate(), 4)
+        self.assertEqual(await self.incident.resolve(), 4)
+        alerts = [msg for msg in self.messages.values() if msg.embeds[0].title == ERROR_TITLE]
+        recovery = [msg for msg in self.messages.values() if msg.embeds[0].title == RESTORED_TITLE]
+        alerts[0].embeds[0].title = TECHNICAL_ERROR_TITLE
+        alerts[0].embeds[0].description = TECHNICAL_ERROR_DESCRIPTION
+        recovery[0].embeds[0].title = TECHNICAL_RESTORED_TITLE
+        recovery[0].embeds[0].description = TECHNICAL_RESTORED_DESCRIPTION
+        self.assertEqual(await self.incident.cleanup_once(self.incident.state()["cleanup_due"]), 8)
+        self.assertEqual(self.incident.state()["status"], "idle")
+
+    def test_operator_advisory_has_technical_terms_no_exercise_label_or_footer(self):
         alert = incident_embed()
         restored = incident_embed(recovered=True)
         self.assertIn("PERSISTENCE", alert.title)
-        self.assertIn("connection-pool", alert.description)
+        self.assertIn("operator-issued", alert.description)
         self.assertIn("transaction", restored.description)
         self.assertLess(len(alert.description), 310)
-        self.assertLess(len(restored.description), 160)
-        self.assertEqual(alert.fields[1].value, "CONTROLLED EXERCISE")
-        self.assertEqual(restored.fields[1].value, "CONTROLLED EXERCISE")
-        self.assertIsNone(alert.footer.text)
-        self.assertIsNone(restored.footer.text)
-        self.assertIsNone(alert.timestamp)
-        self.assertIsNone(restored.timestamp)
+        self.assertLess(len(restored.description), 180)
+        self.assertEqual(alert.fields[0].value, "ADVISORY ACTIVE")
+        self.assertEqual(restored.fields[0].value, "ADVISORY CLOSED")
+        self.assertEqual(alert.fields[1].value, "OPERATIONS")
+        self.assertEqual(restored.fields[1].value, "OPERATIONS")
+        for message in (alert, restored):
+            self.assertNotIn("simulat", str(message.to_dict()).lower())
+            self.assertNotIn("exercise", str(message.to_dict()).lower())
+            self.assertIsNone(message.footer.text)
+            self.assertIsNone(message.timestamp)
 
 
 if __name__ == "__main__":
