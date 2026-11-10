@@ -81,22 +81,31 @@ The bot maintains **two shared messages**, not one new Discord message per event
 - **Graphical Events overview:** Channel `1568424573836464208` (configured by `EVENT_BOARD_CHANNEL_ID`). Multiple events appear on one image. Each event now has a professionally formatted card with its **name, color-coded category, status, and exact UTC start/end timestamps**, rather than just an unlabeled colored bar.
 - **Written Event Updates:** Channel `1568431370747908291` (configured by `EVENT_TEXT_CHANNEL_ID`). This is **one editable Discord embed** containing the title, category, status, exact start/end times, countdown, and description of each event. For example, Port Inspection, Work Log, and Oilfield Strike appear as entries in the same text message.
 
-Running `/event create` adds the new event to both existing messages. `/event edit` updates them; `/event cancel` removes it from the active list. The update operation stores each shared message ID in the SQLite database, preventing duplicate posts on repeated updates or restarts. Each text embed displays up to 14 active/upcoming events; the graphical overview displays up to 24 and both indicate if additional events exist. The bot refreshes the shared messages on state transitions and approximately hourly.
+Event creation, editing, postponement, cancellation, and inspection are now administered **from a different Discord server** through a single persistent button panel. SaS events stay in the SaS server and the written and graphical overviews remain single editable messages. The panel updates automatically after staff actions and when event status changes. Each text embed displays up to 14 active/upcoming events; the graphical overview displays up to 24. Older individual event messages are retired after the shared text feed exists.
 
-Older individual event messages created by earlier bot versions are gradually removed once the shared text message is successfully present. Deletions apply only to messages authored by the same bot; event database records are preserved.
+### Officer Event Command Center
 
-### Commands
+- **Control server:** `1569493510715871232` (`EVENT_CONTROL_GUILD_ID`)
+- **Control channel:** `1569564237129322677` (`EVENT_CONTROL_CHANNEL_ID`)
+- **SaS target server:** `1562533697121550356` (`EVENT_TARGET_GUILD_ID`)
+- **SaS written feed:** `1568431370747908291`
+- **SaS graphical overview:** `1568424573836464208`
 
-Use `/event setup` once if you have not previously configured the event service. It saves legacy event settings. Events now publish directly to the two channels above, **regardless of the channel chosen during setup**.
+On startup the bot creates (or edits) **one persistent `SaS | Event Command Center` embed** in the control channel. The staff panel has two rows of buttons: **Create, Edit, Postpone, Cancel, Inspect, Upcoming, Calendar, Refresh Overviews**.
 
-- `/event create title:Oilfield Strike start_utc:2026-11-10 00:00:00 end_utc:2026-11-10 23:59:59 category:Alliance`: creates an event and updates both shared messages
-- `/event edit event_id:8 title:Oilfield Strike`: edits an existing event and both overviews
-- `/event cancel event_id:8`: cancels it, removing it from the active overviews
-- `/event updates`: staff can publish or refresh the written overview
-- `/event upcoming`: displays a private list of event IDs and times
-- `/event calendar`: opens a private navigable seven-day calendar; `/event calendar publish:True` refreshes the graphical overview
+- **Create:** opens a five-field form: name, UTC start, UTC end (optional; defaults to one hour), category, and details. Updates the SaS messages and schedules the 1-hour reminder.
+- **Edit:** select an active event from a private dropdown, then update its title, UTC start/end, category and details in a pre-filled modal.
+- **Postpone:** select an event and enter a new UTC start; its existing duration is kept unless a new end time is specified.
+- **Cancel:** select an event and confirm cancellation. The event is removed from active SaS overviews and pending notifications are stopped.
+- **Inspect:** view the full event information privately, without posting a new public message.
+- **Upcoming / Calendar:** privately view the next events and browse the seven-day event calendar.
+- **Refresh Overviews:** republish or edit the shared text and graphical messages in the SaS server without creating per-event posts.
 
-Times must be entered in **UTC server time** as `YYYY-MM-DD HH:MM:SS`; minute-only input also works. Discord displays Discord timestamps in the reader's local timezone.
+The default dropdown shows the next 25 active events. The **Enter Event ID** button makes it possible to access other event IDs as well. The panel and its interactions are **restricted to server administrators in the designated control server and channel**, or members with IDs of roles explicitly listed in `EVENT_CONTROL_ROLE_IDS` (comma-separated). The bot must be in **both servers**. It needs View Channel, Send Messages, Embed Links and Read Message History in the control channel, and its existing send/file permissions in the SaS event channels.
+
+**All `/event` slash commands have been removed.** The Discord command tree is synchronized at startup to delete the previously registered server-specific `/event` commands. No manual `/event setup` is needed: initial event settings are created automatically while existing event records and reminder history are preserved.
+
+All event dates are entered in UTC format `YYYY-MM-DD HH:MM:SS`. A new event must start at least five minutes in the future and at most 90 days ahead. Events may run up to 14 days.
 
 ### Automatic Member role ping
 
