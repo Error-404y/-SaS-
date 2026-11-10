@@ -93,7 +93,7 @@ class CreateEventModal(discord.ui.Modal, title='SaS | Create Event'):
         details = str(self.details.value or '').strip()
         now = int(datetime.now(timezone.utc).timestamp())
         try:
-            starts = parse_utc(str(self.start_time.value), now=now)
+            starts = parse_utc(str(self.start_time.value), now=now, future=False)
             ends = parse_utc(str(self.end_time.value or ''), now=now, future=False) if str(self.end_time.value or '').strip() else starts + 3600
             validate_event_window(starts, ends, now)
             if category not in CATEGORIES:
