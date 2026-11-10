@@ -180,6 +180,64 @@ class CrossServerEventPanelTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(self.manager.store.settings(self.target.id)['text_message_id'])
         self.assertIsNotNone(self.manager.store.settings(self.target.id)['calendar_message_id'])
 
+    async def test_create_ongoing_event_with_past_start_and_future_end(self):
+        interaction = self.interaction()
+        form = CreateEventModal(self.manager)
+        now = datetime.now(timezone.utc)
+        form.event_title._value = 'Chief Almighty'
+        form.start_time._value = (now - timedelta(hours=6)).strftime('%Y-%m-%d %H:%M:%S')
+        form.end_time._value = (now + timedelta(days=3)).strftime('%Y-%m-%d %H:%M:%S')
+        form.category._value = 'Alliance'
+        form.details._value = 'Ongoing event'
+        await form.on_submit(interaction)
+        interaction.response.send_message.assert_not_awaited()
+        interaction.followup.send.assert_awaited_once()
+        records = self.manager.store.manage_events(self.target.id)
+        self.assertEqual(len(records), 1)
+        event = records[0]
+        self.assertLess(event['starts_at'], int(now.timestamp()))
+        self.assertGreater(event['ends_at'], int(now.timestamp()))
+        from event_center import event_phase
+        self.assertEqual(event_phase(event), 'In Progress')
+        self.assertEqual(self.manager.store.conn.execute(
+            'SELECT COUNT(*) FROM event_reminders WHERE event_id=?',
+            (event['id'],)
+        ).fetchone()[0], 0)
+        self.assertEqual(
+            [cid for cid, _ in self.sent],
+            [DEFAULT_EVENT_TEXT_CHANNEL_ID, DEFAULT_EVENT_BOARD_CHANNEL_ID,
+             DEFAULT_EVENT_CONTROL_CHANNEL_ID]
+        )
+
+    async def test_future_events_still_require_five_minutes_notice(self):
+        interaction = self.interaction()
+        form = CreateEventModal(self.manager)
+        now = datetime.now(timezone.utc)
+        form.event_title._value = 'Early Start'
+        form.start_time._value = (now + timedelta(minutes=2)).strftime('%Y-%m-%d %H:%M:%S')
+        form.end_time._value = (now + timedelta(hours=2)).strftime('%Y-%m-%d %H:%M:%S')
+        form.category._value = 'Alliance'
+        form.details._value = ''
+        await form.on_submit(interaction)
+        error = interaction.response.send_message.await_args.args[0]
+        self.assertIn('at least 5 minutes', error)
+        self.assertEqual(self.manager.store.board_event_count(self.target.id), 0)
+        interaction.response.defer.assert_not_awaited()
+
+    async def test_completed_events_cannot_be_created(self):
+        interaction = self.interaction()
+        form = CreateEventModal(self.manager)
+        now = datetime.now(timezone.utc)
+        form.event_title._value = 'Already Ended'
+        form.start_time._value = (now - timedelta(days=3)).strftime('%Y-%m-%d %H:%M:%S')
+        form.end_time._value = (now - timedelta(hours=1)).strftime('%Y-%m-%d %H:%M:%S')
+        form.category._value = 'Alliance'
+        form.details._value = ''
+        await form.on_submit(interaction)
+        error = interaction.response.send_message.await_args.args[0]
+        self.assertIn('already ended', error)
+        self.assertEqual(self.manager.store.board_event_count(self.target.id), 0)
+
     async def test_edit_postpone_and_cancel_update_target_records(self):
         event_id = self.schedule()
         interaction = self.interaction()
