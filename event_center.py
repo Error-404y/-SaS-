@@ -475,8 +475,8 @@ class CalendarNavigation(discord.ui.View):
         self.week_offset = week_offset
 
     async def interaction_check(self, interaction):
-        if interaction.user.id != self.user_id:
-            await interaction.response.send_message('Open your own calendar from the Event Command Center.', ephemeral=True)
+        if interaction.user.id != self.user_id or not self.manager.is_staff(interaction):
+            await interaction.response.send_message('Access to this officer calendar is restricted.', ephemeral=True)
             return False
         return True
 
