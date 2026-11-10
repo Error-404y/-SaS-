@@ -65,6 +65,7 @@ class VerificationBot(discord.Client):
         self.add_view(VerifyView(self))
         self.add_view(ReviewView(self))
         self.add_view(PauseControls(self))
+        self.events.register()
 
     def public_context(self, interaction):
         return bool(self.configured and self.guild and interaction.guild_id == self.guild.id
@@ -397,10 +398,11 @@ class VerificationBot(discord.Client):
                 self.db.refresh_panels()
                 await self.attempt(self.ensure_panel)
                 await self.attempt(self.ensure_control_panel)
-                self.events.register()
+                self.events.bootstrap()
                 await self.tree.sync(guild=self.guild)
                 self.configured = True
                 self.events.start()
+                await self.events.refresh_management_panel_safe(create=True)
                 self.recover.start()
                 self.refresh_messages.start()
                 self.prefix_task = asyncio.create_task(self.discover_member_prefixes())
