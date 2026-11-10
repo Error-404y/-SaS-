@@ -509,6 +509,8 @@ class EventCenter:
         self.panel_registered = False
         self.panel_lock = asyncio.Lock()
         self.panel_last_update = 0
+        self.panel_last_attempt = 0
+        self.panel_last_snapshot = None
         self.target_guild_id = int(os.getenv('EVENT_TARGET_GUILD_ID', str(DEFAULT_EVENT_TARGET_GUILD_ID)))
         self.control_guild_id = int(os.getenv('EVENT_CONTROL_GUILD_ID', str(DEFAULT_EVENT_CONTROL_GUILD_ID)))
         self.control_channel_id = int(os.getenv('EVENT_CONTROL_CHANNEL_ID', str(DEFAULT_EVENT_CONTROL_CHANNEL_ID)))
@@ -542,6 +544,16 @@ class EventCenter:
             raise RuntimeError('The configured SaS target server does not match the verification server.')
         if self.store.settings(self.target_guild_id) is None:
             self.store.set_channel(self.target_guild_id, self.text_channel_id, self.member_role_id)
+
+    def panel_snapshot(self, now=None):
+        now = int(datetime.now(timezone.utc).timestamp()) if now is None else now
+        next_rows = self.store.manage_events(self.target_guild_id, now, limit=1)
+        next_event = next_rows[0] if next_rows else None
+        return (
+            self.store.board_event_count(self.target_guild_id, now),
+            next_event['id'] if next_event else None,
+            event_phase(next_event, now) if next_event else None
+        )
 
     def panel_embed(self):
         now = int(datetime.now(timezone.utc).timestamp())
@@ -634,6 +646,8 @@ class EventCenter:
                                              allowed_mentions=discord.AllowedMentions.none())
             if message is not None:
                 self.store.set_control_panel(self.control_guild_id, channel.id, message.id)
+                self.panel_last_snapshot = self.panel_snapshot()
+                self.panel_last_update = int(datetime.now(timezone.utc).timestamp())
             return message
 
     async def refresh_management_panel_safe(self, create=True):
@@ -1016,6 +1030,12 @@ class EventCenter:
         for item in self.store.boards_to_refresh(now, self.board_channel_id):
             await self.refresh_board_safe(item['guild_id'])
         await self.cleanup_expired_member_pings(now)
+        if self.bot.guild and self.bot.guild.id == self.target_guild_id:
+            snapshot = self.panel_snapshot(now)
+            if (snapshot != self.panel_last_snapshot or now - self.panel_last_update >= 3600):
+                if now - self.panel_last_attempt >= 90:
+                    self.panel_last_attempt = now
+                    await self.refresh_management_panel_safe(create=True)
     @scheduler.before_loop
     async def before_scheduler(self):
         await self.bot.wait_until_ready()
