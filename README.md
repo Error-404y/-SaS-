@@ -105,7 +105,7 @@ The default dropdown shows the next 25 active events. The **Enter Event ID** but
 
 **All `/event` slash commands have been removed.** The Discord command tree is synchronized at startup to delete the previously registered server-specific `/event` commands. No manual `/event setup` is needed: initial event settings are created automatically while existing event records and reminder history are preserved.
 
-All event dates are entered in UTC format `YYYY-MM-DD HH:MM:SS`. A new event must start at least five minutes in the future and at most 90 days ahead. Events may run up to 14 days.
+All event dates are entered in UTC format `YYYY-MM-DD HH:MM:SS`. **Already-running events can be added** with a start time in the past, provided the end time is still in the future. Future starts must be at least five minutes away and no more than 90 days ahead; event duration may not exceed 14 days. An ongoing event appears as **In Progress** in the SaS overviews. No retroactive one-hour Member ping is sent for events added after their reminder time has passed.
 
 ### Automatic Member role ping
 
