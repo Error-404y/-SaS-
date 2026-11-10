@@ -90,11 +90,11 @@ class CreateEventModal(discord.ui.Modal, title='SaS | Create Event'):
             return await permission_denied(interaction)
         title = str(self.event_title.value).strip()
         category = str(self.category.value).strip()
-        details = str(self.details.value).strip()
+        details = str(self.details.value or '').strip()
         now = int(datetime.now(timezone.utc).timestamp())
         try:
             starts = parse_utc(str(self.start_time.value), now=now)
-            ends = parse_utc(str(self.end_time.value), now=now, future=False) if str(self.end_time.value).strip() else starts + 3600
+            ends = parse_utc(str(self.end_time.value or ''), now=now, future=False) if str(self.end_time.value or '').strip() else starts + 3600
             validate_event_window(starts, ends, now)
             if category not in CATEGORIES:
                 raise ValueError('Category must be Alliance, Events, Deals, Port Inspection or Other.')
@@ -148,11 +148,11 @@ class EditEventModal(discord.ui.Modal, title='SaS | Edit Event'):
         now = int(datetime.now(timezone.utc).timestamp())
         try:
             starts = parse_utc(str(self.start_time.value), now=now, future=False)
-            ends = parse_utc(str(self.end_time.value), now=now, future=False)
+            ends = parse_utc(str(self.end_time.value or ''), now=now, future=False)
             validate_event_window(starts, ends, now)
             title = str(self.event_title.value).strip()
             category = str(self.category.value).strip()
-            details = str(self.details.value).strip()
+            details = str(self.details.value or '').strip()
             if len(title) < 3 or category not in CATEGORIES:
                 raise ValueError('Title must have 3–100 characters; choose a valid event category.')
         except ValueError as error:
@@ -194,8 +194,8 @@ class PostponeEventModal(discord.ui.Modal, title='SaS | Postpone Event'):
         try:
             starts = parse_utc(str(self.new_start.value), now=now)
             ends = (
-                parse_utc(str(self.new_end.value), now=now, future=False)
-                if str(self.new_end.value).strip()
+                parse_utc(str(self.new_end.value or ''), now=now, future=False)
+                if str(self.new_end.value or '').strip()
                 else starts + event['ends_at'] - event['starts_at']
             )
             validate_event_window(starts, ends, now)
