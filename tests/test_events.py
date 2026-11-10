@@ -286,19 +286,23 @@ class EventStoreTests(unittest.IsolatedAsyncioTestCase):
 
 
 class EventCommandTests(unittest.IsolatedAsyncioTestCase):
-    async def test_commands_register_as_server_group(self):
+    async def test_event_slash_group_is_removed_in_favor_of_persistent_buttons(self):
         with tempfile.TemporaryDirectory() as folder:
-            with patch.dict(os.environ, {'DATABASE_PATH': str(Path(folder) / 'verify.json')}):
+            with patch.dict(os.environ, {'DATABASE_PATH': str(Path(folder) / 'verify.json'),
+                                       'EVENT_DATABASE_PATH': str(Path(folder) / 'events.sqlite3')}):
+                from event_controls import EventControlView
                 bot = VerificationBot()
-                bot.guild = discord.Object(id=1234)
+                bot.guild = discord.Object(id=1562533697121550356)
                 bot.events.register()
-                commands = bot.tree.get_commands(guild=bot.guild)
-                self.assertIn('event', [command.name for command in commands])
-                group = next(command for command in commands if command.name == 'event')
+                self.assertEqual(bot.tree.get_commands(guild=bot.guild), [])
+                controls = EventControlView(bot.events)
                 self.assertEqual(
-                    sorted(command.name for command in group.commands),
-                    ['calendar', 'cancel', 'create', 'edit', 'setup', 'upcoming', 'updates']
+                    [button.label for button in controls.children],
+                    ['Create', 'Edit', 'Postpone', 'Cancel', 'Inspect',
+                     'Upcoming', 'Calendar', 'Refresh Overviews']
                 )
+                self.assertTrue(all(button.custom_id for button in controls.children))
+                self.assertIsNone(controls.timeout)
                 await bot.close()
 
 
@@ -513,24 +517,15 @@ class EventCreationIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     channels[channel_id] = channel
                 guild.get_channel.side_effect = channels.get
                 bot.guild = guild
-                bot.events.is_staff = lambda interaction: True
                 bot.events.store.set_channel(1, 88, None)
-                bot.events.register()
-                group = bot.tree.get_commands(guild=guild)[0]
-                create = group.get_command('create')
-                interaction = MagicMock()
-                interaction.guild_id = 1
-                interaction.guild = guild
-                interaction.user.id = 99
-                interaction.response.defer = AsyncMock()
-                interaction.response.send_message = AsyncMock()
-                interaction.followup.send = AsyncMock()
-                clock = datetime.now(timezone.utc)
-                start = (clock + timedelta(hours=6)).strftime('%Y-%m-%d %H:%M:%S')
-                end = (clock + timedelta(hours=8)).strftime('%Y-%m-%d %H:%M:%S')
+                now = int(datetime.now(timezone.utc).timestamp())
                 for title in ('Port Inspection', 'Oilfield Strike'):
-                    await create.callback(interaction, title=title, start_utc=start,
-                                          category='Alliance', notes='See in-game details', end_utc=end)
+                    bot.events.store.create(
+                        1, 88, title, 'Alliance', 'See in-game details',
+                        now + 21600, 99, now=now, ends_at=now + 28800
+                    )
+                    await bot.events.refresh_text_safe(1, create=True)
+                    await bot.events.refresh_board_safe(1, create=True)
                 self.assertEqual([cid for cid,_,_ in sent], [1568431370747908291, 1568424573836464208])
                 self.assertEqual(channels[88].send.await_count, 0)
                 self.assertEqual(channels[1568431370747908291].send.await_count, 1)
@@ -546,8 +541,6 @@ class EventCreationIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(bot.events.store.settings(1)['text_message_id'], text_message.id)
                 self.assertEqual(bot.events.store.settings(1)['text_message_channel_id'], 1568431370747908291)
                 self.assertEqual(bot.events.store.board_event_count(1), 2)
-                self.assertIsNone(group.get_command('remind'))
-                self.assertIsNone(group.get_command('unremind'))
                 await bot.close()
 
     async def test_shared_text_feed_migrates_without_duplicates(self):
