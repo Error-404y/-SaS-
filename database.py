@@ -3,7 +3,9 @@ from datetime import datetime, timedelta, timezone
 import json
 import math
 import os
+import shutil
 from pathlib import Path
+from uuid import uuid4
 import tempfile
 from identity import normalized_name
 
@@ -22,7 +24,7 @@ class Database:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if not self.path.exists():
-            self._save(dict(version=2, next_id=1, panel_message=None, applications={}, verified={}, histories={}, joins={}, profiles={}, pause={'active': False, 'reason': '', 'dirty': False, 'control_dirty': False}, nickname_jobs={}, control_panel=None, edit_limits={}))
+            self._save(dict(version=2, next_id=1, panel_message=None, applications={}, verified={}, histories={}, joins={}, profiles={}, pause={'active': False, 'reason': '', 'dirty': False, 'control_dirty': False}, nickname_jobs={}, control_panel=None, edit_limits={}, verification_refresh={'latched': False, 'pending': False, 'notice_claimed': False}))
             return
         try:
             original = self.path.read_text(encoding='utf-8')
@@ -43,6 +45,7 @@ class Database:
             data.setdefault('nickname_jobs', {})
             data.setdefault('control_panel', None)
             data.setdefault('edit_limits', {})
+            data.setdefault('verification_refresh', dict(latched=False, pending=False, notice_claimed=False))
             data['pause'].setdefault('control_dirty', False)
             for row in sorted(data['applications'].values(), key=lambda r: r['id'], reverse=True):
                 key = user_key(row['guild_id'], row['user_id'])
@@ -96,6 +99,9 @@ class Database:
                 raise ValueError('Invalid data structure')
         if type(data['pause'].get('active')) is not bool or type(data['pause'].get('dirty')) is not bool or not isinstance(data['pause'].get('reason'), str):
             raise ValueError('Invalid pause settings')
+        refresh = data['verification_refresh']
+        if not isinstance(refresh, dict) or any(type(refresh.get(k)) is not bool for k in ('latched', 'pending', 'notice_claimed')):
+            raise ValueError('Invalid verification refresh state')
         for key, profile in data['profiles'].items():
             guild_id, user_id = map(int, key.split(':'))
             if guild_id <= 0 or user_id <= 0 or profile['kind'] not in ('member', 'allies') or not isinstance(profile['username'], str) or not isinstance(profile['clan'], str):
@@ -157,6 +163,44 @@ class Database:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
         self.data = data
+
+    def prepare_verification_refresh(self, enabled):
+        state = self.data['verification_refresh']
+        if not enabled:
+            if state['latched']:
+                data = deepcopy(self.data)
+                data['verification_refresh']['latched'] = False
+                self._save(data)
+            return False
+        if state['latched']:
+            return state['pending']
+        backup = self.path.with_name(self.path.name + '.before-verify-refresh-' +
+                                     datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') +
+                                     '-' + uuid4().hex[:8] + '.bak')
+        shutil.copy2(self.path, backup)
+        data = deepcopy(self.data)
+        for key in ('applications', 'verified', 'histories', 'joins', 'profiles', 'nickname_jobs'):
+            data[key] = {}
+        data['pause'].update(active=False, reason='', dirty=True, control_dirty=True)
+        data['verification_refresh'] = dict(latched=True, pending=True, notice_claimed=False)
+        self._save(data)
+        return True
+
+    def finish_verification_refresh(self):
+        if not self.data['verification_refresh']['pending']:
+            return
+        data = deepcopy(self.data)
+        data['verification_refresh']['pending'] = False
+        self._save(data)
+
+    def claim_refresh_notice(self):
+        state = self.data['verification_refresh']
+        if not state['latched'] or state['pending'] or state['notice_claimed']:
+            return False
+        data = deepcopy(self.data)
+        data['verification_refresh']['notice_claimed'] = True
+        self._save(data)
+        return True
 
     def applications(self):
         return deepcopy(list(self.data['applications'].values()))
