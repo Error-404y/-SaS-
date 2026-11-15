@@ -1,6 +1,6 @@
 # SaS verification bot
 
-A Discord verification bot with a separate event-reminder service. Verification records use one local JSON file; the event calendar uses a separate embedded SQLite file. No database server is required. All messages use embeds. No comments, docstrings or emojis in the Python source.
+A Discord verification bot with persistent local JSON records. No database server is required. Verification messages use embeds. No comments, docstrings or emojis in the Python source.
 
 ## How it works
 
@@ -74,56 +74,17 @@ New joiners get Verify-Process. Previously accepted users get their saved Member
 
 If earlier versions removed Member from someone incorrectly, restore Member manually once. The nickname-prefix pass preserves it. Returning-member restoration uses saved accepted applications; it does not treat every historical role assignment as an acceptance.
 
-## SaS Event Center
+## One-time verification refresh
 
-The bot maintains **two shared messages**, not one new Discord message per event:
+Set `Verify-refresh=true` in the bot's `.env` and restart to require **all** people to verify again. The bot first saves a timestamped backup next to `data/verification.json`, clears previous verification approvals and applicant profiles from the active JSON database, then removes the **Member** and **Allies** roles from every non-bot user and adds **Verify-Process**. Other roles (including staff) are preserved. After every role update succeeds, it posts exactly one short `@everyone` announcement to the configured **Verify** channel:
 
-- **Graphical Events overview:** Channel `1568424573836464208` (configured by `EVENT_BOARD_CHANNEL_ID`). Multiple events appear on one image. Each event now has a professionally formatted card with its **name, color-coded category, status, and exact UTC start/end timestamps**, rather than just an unlabeled colored bar.
-- **Written Event Updates:** Channel `1568431370747908291` (configured by `EVENT_TEXT_CHANNEL_ID`). This is **one editable Discord embed** containing the title, category, status, exact start/end times, countdown, and description of each event. For example, Port Inspection, Work Log, and Oilfield Strike appear as entries in the same text message.
+> **Verification reset.** Please verify again using the buttons in this channel.
 
-Event creation, editing, postponement, cancellation, and inspection are now administered **from a different Discord server** through a single persistent button panel. SaS events stay in the SaS server and the written and graphical overviews remain single editable messages. The panel updates automatically after staff actions and when event status changes. Each text embed displays up to 14 active/upcoming events; the graphical overview displays up to 24. Older individual event messages are retired after the shared text feed exists.
+The bot needs **Server Members Intent**, **Manage Roles** (with its role above Member, Allies and Verify-Process), and **Mention @everyone** permission in the Verify channel. The bot does **not** actually lose its database: the notification accurately calls this an intentional verification reset.
 
-### Officer Event Command Center
+`Verify-refresh=false` leaves roles and verification records unchanged. To start a **new** refresh in the future, restart with `false` once to re-arm it, then change to `true` and restart. Leaving `true` across repeated restarts **does not repeat** the mass role removal or @everyone ping. If a role update fails, the bot does not announce success and will retry the remaining updates when restarted with `true`. Do not run multiple bot instances during this process. Keep the automatically created `.before-verify-refresh-*.bak` file as a rollback reference; the reset is **not** an automatic rollback and revoking verification roles can affect channel access.
 
-- **Control server:** `1569493510715871232` (`EVENT_CONTROL_GUILD_ID`)
-- **Control channel:** `1569564237129322677` (`EVENT_CONTROL_CHANNEL_ID`)
-- **SaS target server:** `1562533697121550356` (`EVENT_TARGET_GUILD_ID`)
-- **SaS written feed:** `1568431370747908291`
-- **SaS graphical overview:** `1568424573836464208`
-
-On startup the bot creates (or edits) **one persistent `SaS | Event Command Center` embed** in the control channel. The staff panel has two rows of buttons: **Create, Edit, Postpone, Cancel, Inspect, Upcoming, Calendar, Refresh Overviews**.
-
-- **Create:** opens a five-field form: name, UTC start, UTC end (optional; defaults to one hour), category, and details. Updates the SaS messages and schedules the 1-hour reminder.
-- **Edit:** select an active event from a private dropdown, then update its title, UTC start/end, category and details in a pre-filled modal.
-- **Postpone:** select an event and enter a new UTC start; its existing duration is kept unless a new end time is specified.
-- **Cancel:** select an event and confirm cancellation. The event is removed from active SaS overviews and pending notifications are stopped.
-- **Inspect:** view the full event information privately, without posting a new public message.
-- **Upcoming / Calendar:** privately view the next events and browse the seven-day event calendar.
-- **Refresh Overviews:** republish or edit the shared text and graphical messages in the SaS server without creating per-event posts.
-
-The default dropdown shows the next 25 active events. The **Enter Event ID** button makes it possible to access other event IDs as well. The panel and its interactions are **restricted to server administrators in the designated control server and channel**, or members with IDs of roles explicitly listed in `EVENT_CONTROL_ROLE_IDS` (comma-separated). The bot must be in **both servers**. It needs View Channel, Send Messages, Embed Links and Read Message History in the control channel, and its existing send/file permissions in the SaS event channels.
-
-**All `/event` slash commands have been removed.** The Discord command tree is synchronized at startup to delete the previously registered server-specific `/event` commands. No manual `/event setup` is needed: initial event settings are created automatically while existing event records and reminder history are preserved.
-
-All event dates are entered in UTC format `YYYY-MM-DD HH:MM:SS`. **Already-running events can be added** with a start time in the past, provided the end time is still in the future. Future starts must be at least five minutes away and no more than 90 days ahead; event duration may not exceed 14 days. An ongoing event appears as **In Progress** in the SaS overviews. No retroactive one-hour Member ping is sent for events added after their reminder time has passed.
-
-### Automatic Member role ping
-
-Every new event schedules **one @Member role ping** in the **Event Updates channel `1568431370747908291`**, approximately one hour before its exact UTC start. This uses the role ID `1562535352290250842` (set by `EVENT_MEMBER_ROLE_ID`). The bot checks every 30 seconds and posts a short new message mentioning that role and naming the event. Posting a new message is required for a reliable Discord notification; editing the shared embed does not reliably notify members.
-
-The graphical Events overview in channel `1568424573836464208` and the shared written Events list are still single, editable messages. No per-event announcement is posted at event creation. **Only the 1-hour alert is an additional public message.**
-
-No `/event remind` or `/event unremind` commands, reminder buttons, opt-in subscriptions or DM alerts are used. Old pending 24-hour, 15-minute, start, and DM jobs are disabled when the upgraded bot opens its existing database; pending 1-hour notices remain eligible. Only events created more than one hour before their start can receive the 1-hour notice. Reminders overdue by more than 10 minutes are skipped, and past or cancelled events do not get alerted. Successfully delivered reminders are marked as sent in SQLite to prevent normal duplicate pings after restarts.
-
-**Automatic cleanup:** Each one-hour @Member ping is automatically deleted **24 hours after it was posted**. The scheduler checks for expired pings approximately every 30 seconds. It deletes only bot-authored messages containing the one-hour event reminder marker, never the permanent Event Updates embed, graphic, or messages from others. If someone already removed a ping, the bot records it as cleaned without error. Temporary Discord errors are retried, and cleanup resumes after downtime/restarts. Legacy one-hour pings already recorded by earlier versions are imported safely using their scheduled send time as an approximate timestamp; the bot preserves existing shared-message IDs. Cleanup tracking remains valid even if an event is rescheduled or cancelled.
-
-The bot must have **Mention @everyone, @here, and All Roles** permission in the Event Updates channel, unless the Member role is configured as mentionable, in addition to normal send permissions. A role mention notifies users according to their own Discord notification settings; the bot does not individually DM role members.
-
-### Requirements
-
-The bot must be able to View Channel, Send Messages, Embed Links and Read Message History in **both** overview channels, plus Attach Files in the graphics channel. It does not delete other users' messages. Manage Messages is not required to delete the bot's own old messages.
-
-The event database `data/events.sqlite3` must be on persistent storage. Only one process should use it. Both the graphics and text are based on staff-entered events; there is **no automatic Police Chief game API integration**. Each message is a static Discord embed or picture, not a live ticking clock.
+The separate SaS **website Event Center** continues independently. The Discord bot no longer maintains Event Center data, calendar images, reminders, command buttons, or event control interfaces. Existing event posts and the old events SQLite file can be removed manually if no longer needed; the bot does not delete other messages or your historical event database.
 
 ## Server configuration
 
@@ -165,7 +126,7 @@ Copy-Item .env.example .env
 
 Edit `.env` and set `DISCORD_TOKEN`, then run `python main.py` with the virtual environment active. On Windows you can also use `.\.venv\Scripts\python.exe main.py` directly.
 
-For the hosting panel, set **STARTUP_FILE** to `main.py`. `bot.py` also works. Keep `data/verification.json` and `data/events.sqlite3` across deployments. Never put the token in GitHub.
+For the hosting panel, set **STARTUP_FILE** to `main.py`. `bot.py` also works. Keep `data/verification.json` and its refresh backups across deployments. Never put the token in GitHub.
 
 Docker:
 
@@ -182,7 +143,7 @@ Stop the bot and back up `data/verification.json`, then deploy and restart. The 
 
 Completed reviews are not rewritten on every restart. Pending updates resume when their saved state requires it. Missing messages stay deleted. Legacy pending records without a message ID are closed conservatively so the bot cannot accidentally recreate a deleted request; those users may apply again. Existing successful applications do not create a burst of history posts during migration.
 
-The active configuration contains the token, JSON path, channel IDs, category IDs, role IDs and rejection cooldown. Old rules, language, queue and extra-question settings are ignored and may be removed from `.env`.
+The active configuration contains the token, JSON path, channel IDs, category IDs, role IDs, rejection cooldown and `Verify-refresh` flag. Old rules, language, queue and extra-question settings are ignored and may be removed from `.env`.
 
 ## Message updates and rate limits
 

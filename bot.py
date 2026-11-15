@@ -3,7 +3,6 @@ from datetime import datetime, timedelta, timezone
 import logging
 import os
 import re
-from pathlib import Path
 
 import aiohttp
 
@@ -17,7 +16,6 @@ from delivery import EditDeferred, EditPacer
 from time_utils import zurich_time, ZurichFormatter
 from views import VerifyView, ReviewView, PauseControls, embed, reply, valid_username
 from identity import nickname, profile_from_member, clean_clan, valid_clan
-from event_center import EventCenter
 from incident_broadcast import IncidentBroadcast
 
 load_dotenv()
@@ -51,21 +49,19 @@ class VerificationBot(discord.Client):
         self.ids = {key: int(os.getenv(key, value)) for key, value in DEFAULTS.items()}
         self.db = Database(os.getenv('DATABASE_PATH', 'data/verification.json'), os.getenv('REJECTION_COOLDOWN_SECONDS', '600'))
         self.lock = asyncio.Lock()
+        self.verify_refresh_enabled = os.getenv('Verify-refresh', 'false').strip().lower() == 'true'
         self.guild = None
         self.configured = False
         self.prefix_task = None
         self.edit_locks = {}
         self.edit_pacer = EditPacer(lambda: self.db)
         self.tree = app_commands.CommandTree(self)
-        events_path = os.getenv('EVENT_DATABASE_PATH', str(Path(self.db.path).with_name('events.sqlite3')))
-        self.events = EventCenter(self, events_path)
         self.incident_broadcast = IncidentBroadcast(self, os.getenv('INCIDENT_DATABASE_PATH', 'data/sas_incidents.sqlite3'))
 
     async def setup_hook(self):
         self.add_view(VerifyView(self))
         self.add_view(ReviewView(self))
         self.add_view(PauseControls(self))
-        self.events.register()
 
     def public_context(self, interaction):
         return bool(self.configured and self.guild and interaction.guild_id == self.guild.id
@@ -386,6 +382,44 @@ class VerificationBot(discord.Client):
     async def on_message(self, message):
         await self.incident_broadcast.handle_message(message)
 
+    async def refresh_verification_roles(self):
+        verified_roles = (self.guild.get_role(self.ids['MEMBER_ROLE_ID']),
+                          self.guild.get_role(self.ids['ALLIES_ROLE_ID']))
+        progress = self.guild.get_role(self.ids['PROGRESS_ROLE_ID'])
+        failures = []
+        removed = 0
+        async for member in self.guild.fetch_members(limit=None):
+            if member.bot:
+                continue
+            roles = {role.id for role in member.roles}
+            old = [role for role in verified_roles if role.id in roles]
+            try:
+                if old:
+                    await member.remove_roles(*old, reason='SaS verification refresh')
+                    removed += 1
+                if progress.id not in roles:
+                    await member.add_roles(progress, reason='SaS re-verification required')
+            except discord.HTTPException:
+                failures.append(member.id)
+                log.exception('Verification refresh could not update member %s', member.id)
+        if failures:
+            raise RuntimeError(f'Could not complete verification refresh for {len(failures)} members. Restart to retry.')
+        self.db.finish_verification_refresh()
+        log.info('Verification refresh complete. Removed verified roles from %d members.', removed)
+
+    async def notify_verification_refresh(self):
+        if not self.verify_refresh_enabled:
+            return
+        permissions = self.verify_channel.permissions_for(self.guild.me)
+        if not permissions.mention_everyone:
+            raise RuntimeError('The bot needs Mention @everyone permission in the Verify channel for the reset notice.')
+        if not self.db.claim_refresh_notice():
+            return
+        await self.verify_channel.send(
+            '@everyone **Verification reset.** Please verify again using the buttons in this channel.',
+            allowed_mentions=discord.AllowedMentions(everyone=True, users=False, roles=False)
+        )
+
     async def on_ready(self):
         self.incident_broadcast.start()
         async with self.lock:
@@ -395,14 +429,14 @@ class VerificationBot(discord.Client):
                 await self.validate()
                 await self.validate_log_channel()
                 await self.validate_control_channel()
+                if self.db.prepare_verification_refresh(self.verify_refresh_enabled):
+                    await self.refresh_verification_roles()
                 self.db.refresh_panels()
                 await self.attempt(self.ensure_panel)
                 await self.attempt(self.ensure_control_panel)
-                self.events.bootstrap()
                 await self.tree.sync(guild=self.guild)
+                await self.notify_verification_refresh()
                 self.configured = True
-                self.events.start()
-                await self.events.refresh_management_panel_safe(create=True)
                 self.recover.start()
                 self.refresh_messages.start()
                 self.prefix_task = asyncio.create_task(self.discover_member_prefixes())
@@ -767,7 +801,6 @@ class VerificationBot(discord.Client):
     async def close(self):
         if self.refresh_messages.is_running():
             self.refresh_messages.cancel()
-        self.events.close()
         self.incident_broadcast.close()
         if self.prefix_task and not self.prefix_task.done():
             self.prefix_task.cancel()
