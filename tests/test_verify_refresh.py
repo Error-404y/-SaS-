@@ -74,6 +74,12 @@ class VerificationRefreshBotTests(BotFixture, unittest.IsolatedAsyncioTestCase):
             self.member.roles = [role for role in self.member.roles if role.id not in removed]
         self.refresh_remove_roles = remove_roles
         self.member.remove_roles.side_effect = remove_roles
+        async def add_roles(*role_values, **kwargs):
+            existing = {role.id for role in self.member.roles}
+            for role in role_values:
+                if role.id not in existing:
+                    self.member.roles.append(role)
+        self.member.add_roles.side_effect = add_roles
         async def all_members(limit=None):
             yield self.member
         self.bot.guild.fetch_members = all_members
