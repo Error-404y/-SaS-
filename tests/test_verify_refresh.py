@@ -69,6 +69,11 @@ class VerificationRefreshBotTests(BotFixture, unittest.IsolatedAsyncioTestCase):
                  for role_id in (ids['MEMBER_ROLE_ID'], ids['ALLIES_ROLE_ID'], ids['PROGRESS_ROLE_ID'])}
         self.bot.guild.get_role.side_effect = lambda role_id: roles[role_id]
         self.member.roles = [roles[ids['MEMBER_ROLE_ID']], roles[ids['ALLIES_ROLE_ID']], MagicMock(id=888)]
+        async def remove_roles(*role_values, **kwargs):
+            removed = {role.id for role in role_values}
+            self.member.roles = [role for role in self.member.roles if role.id not in removed]
+        self.refresh_remove_roles = remove_roles
+        self.member.remove_roles.side_effect = remove_roles
         async def all_members(limit=None):
             yield self.member
         self.bot.guild.fetch_members = all_members
@@ -105,7 +110,7 @@ class VerificationRefreshBotTests(BotFixture, unittest.IsolatedAsyncioTestCase):
             await self.bot.refresh_verification_roles()
         self.assertTrue(self.bot.db.data['verification_refresh']['pending'])
         self.assertFalse(self.bot.db.claim_refresh_notice())
-        self.member.remove_roles.side_effect = self.remove_role
+        self.member.remove_roles.side_effect = self.refresh_remove_roles
         await self.bot.refresh_verification_roles()
         await self.bot.notify_verification_refresh()
         self.bot.verify_channel.send.assert_awaited_once()
